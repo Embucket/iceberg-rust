@@ -398,6 +398,7 @@ async fn table_scan(
                         range: None,
                         statistics: Some(manifest_statistics),
                         extensions: None,
+                        metadata_size_hint: None
                     };
                     match manifest.data_file().content() {
                         Content::Data => {
@@ -460,6 +461,7 @@ async fn table_scan(
                     range: None,
                     statistics: Some(manifest_statistics),
                     extensions: None,
+                    metadata_size_hint: None
                 };
                 match manifest.data_file().content() {
                     Content::Data => {
