@@ -25,13 +25,13 @@ chrono = { version = "0.4", default-features = false, features = ["serde", "cloc
 arrow = "53.3.0"
 arrow-schema = "53.3.0"
 
-datafusion = { git="https://github.com/Embucket/datafusion.git", branch = "icehut" }
-datafusion-sql = { git="https://github.com/Embucket/datafusion.git", branch = "icehut" }
-datafusion-expr = { git="https://github.com/Embucket/datafusion.git", branch = "icehut" }
-datafusion-common = { git="https://github.com/Embucket/datafusion.git", branch = "icehut" }
-datafusion-execution = { git="https://github.com/Embucket/datafusion.git", branch = "icehut" }
-datafusion-functions = { git="https://github.com/Embucket/datafusion.git", branch = "icehut", features = ["crypto_expressions"] }
-datafusion-functions-aggregate = { git="https://github.com/Embucket/datafusion.git", branch = "icehut" }
+datafusion = { git="https://github.com/Embucket/datafusion.git", rev = "073a3b110852f97ccb7085ce4bfd19473b8a3f4f" }
+datafusion-sql = { git="https://github.com/Embucket/datafusion.git", rev = "073a3b110852f97ccb7085ce4bfd19473b8a3f4f" }
+datafusion-expr = { git="https://github.com/Embucket/datafusion.git", rev = "073a3b110852f97ccb7085ce4bfd19473b8a3f4f" }
+datafusion-common = { git="https://github.com/Embucket/datafusion.git", rev = "073a3b110852f97ccb7085ce4bfd19473b8a3f4f" }
+datafusion-execution = { git="https://github.com/Embucket/datafusion.git", rev = "073a3b110852f97ccb7085ce4bfd19473b8a3f4f" }
+datafusion-functions = { git="https://github.com/Embucket/datafusion.git", rev = "073a3b110852f97ccb7085ce4bfd19473b8a3f4f", features = ["crypto_expressions"] }
+datafusion-functions-aggregate = { git="https://github.com/Embucket/datafusion.git", rev = "073a3b110852f97ccb7085ce4bfd19473b8a3f4f" }
 parquet = { version = "53.3.0", features = ["async", "object_store"] }
 sqlparser = { version = "0.51.0", features = ["visitor"] }
 thiserror = "2"
