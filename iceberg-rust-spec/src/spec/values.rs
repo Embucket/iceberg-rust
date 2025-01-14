@@ -438,9 +438,8 @@ impl Value {
                 PrimitiveType::Fixed(len) => Ok(Value::Fixed(*len as usize, Vec::from(bytes))),
                 PrimitiveType::Binary => Ok(Value::Binary(Vec::from(bytes))),
                 PrimitiveType::Decimal { .. } => {
-                    let i128_value = i128::from_be_bytes(bytes.try_into()?);
                     Ok(Value::Decimal(Decimal::from_i128_with_scale(
-                        i128_value, 0u32,
+                        i128::from_be_bytes(bytes.try_into()?), 0u32,
                     )))
                 }
                 _ => Err(Error::Type(primitive.to_string(), "bytes".to_string())),
