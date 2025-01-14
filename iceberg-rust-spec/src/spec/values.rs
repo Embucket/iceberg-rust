@@ -437,7 +437,13 @@ impl Value {
                 )))),
                 PrimitiveType::Fixed(len) => Ok(Value::Fixed(*len as usize, Vec::from(bytes))),
                 PrimitiveType::Binary => Ok(Value::Binary(Vec::from(bytes))),
-                _ => Err(Error::Type("decimal".to_string(), "bytes".to_string())),
+                PrimitiveType::Decimal { .. } => {
+                    let i128_value = i128::from_be_bytes(bytes.try_into()?);
+                    Ok(Value::Decimal(Decimal::from_i128_with_scale(
+                        i128_value, 0u32,
+                    )))
+                }
+                _ => Err(Error::Type(primitive.to_string(), "bytes".to_string())),
             },
             _ => Err(Error::NotSupported("Complex types as bytes".to_string())),
         }
@@ -1181,6 +1187,18 @@ mod tests {
             &Type::Primitive(PrimitiveType::String),
         );
     }
+
+    #[test]
+    fn avro_bytes_decimal() {
+        let bytes = 1000i128.to_be_bytes().to_vec();
+
+        check_avro_bytes_serde(
+            bytes,
+            Value::Decimal(Decimal::new(1000, 0)),
+            &Type::Primitive(PrimitiveType::Decimal { precision: 38, scale: 0 }),
+        );
+    }
+
 
     #[test]
     fn test_transform_identity() {
