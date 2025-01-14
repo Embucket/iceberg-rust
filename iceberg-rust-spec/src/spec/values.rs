@@ -437,9 +437,9 @@ impl Value {
                 )))),
                 PrimitiveType::Fixed(len) => Ok(Value::Fixed(*len as usize, Vec::from(bytes))),
                 PrimitiveType::Binary => Ok(Value::Binary(Vec::from(bytes))),
-                PrimitiveType::Decimal { .. } => {
+                PrimitiveType::Decimal { precision, scale } => {
                     Ok(Value::Decimal(Decimal::from_i128_with_scale(
-                        i128::from_be_bytes(bytes.try_into()?), 0u32,
+                        i128::from_be_bytes(bytes.try_into()?), scale.clone(),
                     )))
                 }
                 _ => Err(Error::Type(primitive.to_string(), "bytes".to_string())),
@@ -1193,8 +1193,8 @@ mod tests {
 
         check_avro_bytes_serde(
             bytes,
-            Value::Decimal(Decimal::new(1000, 0)),
-            &Type::Primitive(PrimitiveType::Decimal { precision: 38, scale: 0 }),
+            Value::Decimal(Decimal::new(1000, 2)),
+            &Type::Primitive(PrimitiveType::Decimal { precision: 38, scale: 2 }),
         );
     }
 
