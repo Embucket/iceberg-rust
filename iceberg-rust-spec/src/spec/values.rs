@@ -17,6 +17,7 @@ use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, 
 use itertools::Itertools;
 use ordered_float::OrderedFloat;
 use rust_decimal::Decimal;
+use rust_decimal::prelude::ToPrimitive;
 use serde::{
     de::{MapAccess, Visitor},
     ser::SerializeStruct,
@@ -105,6 +106,10 @@ impl From<Value> for ByteBuf {
             Value::UUID(val) => ByteBuf::from(val.as_u128().to_be_bytes()),
             Value::Fixed(_, val) => ByteBuf::from(val),
             Value::Binary(val) => ByteBuf::from(val),
+            Value::Decimal(val) => match val.to_i128() {
+                Some(v) => ByteBuf::from(v.to_be_bytes()),
+                None => ByteBuf::from([]),
+            },
             _ => todo!(),
         }
     }
@@ -439,7 +444,7 @@ impl Value {
                 PrimitiveType::Binary => Ok(Value::Binary(Vec::from(bytes))),
                 PrimitiveType::Decimal { precision, scale } => {
                     Ok(Value::Decimal(Decimal::from_i128_with_scale(
-                        i128::from_be_bytes(bytes.try_into()?), scale.clone(),
+                        i128::from_be_bytes(bytes.try_into()?), *scale,
                     )))
                 }
                 _ => Err(Error::Type(primitive.to_string(), "bytes".to_string())),
