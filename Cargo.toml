@@ -25,13 +25,13 @@ chrono = { version = "0.4", default-features = false, features = ["serde", "cloc
 arrow = "53.3.0"
 arrow-schema = "53.3.0"
 
-datafusion = { git="https://github.com/Embucket/datafusion.git", rev = "4930757e1108fbe33704b29d1aa222a3d6214584" }
-datafusion-sql = { git="https://github.com/Embucket/datafusion.git", rev = "4930757e1108fbe33704b29d1aa222a3d6214584" }
-datafusion-expr = { git="https://github.com/Embucket/datafusion.git", rev = "4930757e1108fbe33704b29d1aa222a3d6214584" }
-datafusion-common = { git="https://github.com/Embucket/datafusion.git", rev = "4930757e1108fbe33704b29d1aa222a3d6214584" }
-datafusion-execution = { git="https://github.com/Embucket/datafusion.git", rev = "4930757e1108fbe33704b29d1aa222a3d6214584" }
-datafusion-functions = { git="https://github.com/Embucket/datafusion.git", rev = "4930757e1108fbe33704b29d1aa222a3d6214584", features = ["crypto_expressions"] }
-datafusion-functions-aggregate = { git="https://github.com/Embucket/datafusion.git", rev = "4930757e1108fbe33704b29d1aa222a3d6214584" }
+datafusion = { git="https://github.com/Embucket/datafusion.git", rev = "818728a8aeea971546241aa19af35c74bc361d50" }
+datafusion-sql = { git="https://github.com/Embucket/datafusion.git", rev = "818728a8aeea971546241aa19af35c74bc361d50" }
+datafusion-expr = { git="https://github.com/Embucket/datafusion.git", rev = "818728a8aeea971546241aa19af35c74bc361d50" }
+datafusion-common = { git="https://github.com/Embucket/datafusion.git", rev = "818728a8aeea971546241aa19af35c74bc361d50" }
+datafusion-execution = { git="https://github.com/Embucket/datafusion.git", rev = "818728a8aeea971546241aa19af35c74bc361d50" }
+datafusion-functions = { git="https://github.com/Embucket/datafusion.git", rev = "818728a8aeea971546241aa19af35c74bc361d50", features = ["crypto_expressions"] }
+datafusion-functions-aggregate = { git="https://github.com/Embucket/datafusion.git", rev = "818728a8aeea971546241aa19af35c74bc361d50" }
 parquet = { version = "53.3.0", features = ["async", "object_store"] }
 sqlparser = { version = "0.51.0", features = ["visitor"] }
 thiserror = "2"
