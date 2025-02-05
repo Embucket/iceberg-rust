@@ -15,15 +15,15 @@ resolver = "2"
 
 [workspace.dependencies]
 apache-avro = "0.17.0"
-object_store = { version = "0.11.1", features = ["aws", "gcp"] }
+object_store = { version = "0.11.2", features = ["aws", "gcp"] }
 serde = "^1.0"
 serde_derive = "^1.0"
 serde_json = "^1.0"
 futures = "0.3.30"
 async-trait = "0.1"
-chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
-arrow = "53.3.0"
-arrow-schema = "53.3.0"
+chrono = { version = "0.4.39", default-features = false, features = ["serde", "clock"] }
+arrow = "54.1.0"
+arrow-schema = "54.1.0"
 
 datafusion = { git="https://github.com/Embucket/datafusion.git", rev = "155bc7347cf2866b67525c411d4a7089ddb8d67e" }
 datafusion-sql = { git="https://github.com/Embucket/datafusion.git", rev = "155bc7347cf2866b67525c411d4a7089ddb8d67e" }
