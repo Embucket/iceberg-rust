@@ -25,13 +25,13 @@ chrono = { version = "0.4.39", default-features = false, features = ["serde", "c
 arrow = "54.1.0"
 arrow-schema = "54.1.0"
 
-datafusion = { git="https://github.com/Embucket/datafusion.git", rev = "155bc7347cf2866b67525c411d4a7089ddb8d67e" }
-datafusion-sql = { git="https://github.com/Embucket/datafusion.git", rev = "155bc7347cf2866b67525c411d4a7089ddb8d67e" }
-datafusion-expr = { git="https://github.com/Embucket/datafusion.git", rev = "155bc7347cf2866b67525c411d4a7089ddb8d67e" }
-datafusion-common = { git="https://github.com/Embucket/datafusion.git", rev = "155bc7347cf2866b67525c411d4a7089ddb8d67e" }
-datafusion-execution = { git="https://github.com/Embucket/datafusion.git", rev = "155bc7347cf2866b67525c411d4a7089ddb8d67e" }
-datafusion-functions = { git="https://github.com/Embucket/datafusion.git", rev = "155bc7347cf2866b67525c411d4a7089ddb8d67e", features = ["crypto_expressions"] }
-datafusion-functions-aggregate = { git="https://github.com/Embucket/datafusion.git", rev = "155bc7347cf2866b67525c411d4a7089ddb8d67e" }
+datafusion = { git="https://github.com/Embucket/datafusion.git", rev = "a4c5f3f065b551afdf845000e3630012af27dc17" }
+datafusion-sql = { git="https://github.com/Embucket/datafusion.git", rev = "a4c5f3f065b551afdf845000e3630012af27dc17" }
+datafusion-expr = { git="https://github.com/Embucket/datafusion.git", rev = "a4c5f3f065b551afdf845000e3630012af27dc17" }
+datafusion-common = { git="https://github.com/Embucket/datafusion.git", rev = "a4c5f3f065b551afdf845000e3630012af27dc17" }
+datafusion-execution = { git="https://github.com/Embucket/datafusion.git", rev = "a4c5f3f065b551afdf845000e3630012af27dc17" }
+datafusion-functions = { git="https://github.com/Embucket/datafusion.git", rev = "a4c5f3f065b551afdf845000e3630012af27dc17", features = ["crypto_expressions"] }
+datafusion-functions-aggregate = { git="https://github.com/Embucket/datafusion.git", rev = "a4c5f3f065b551afdf845000e3630012af27dc17" }
 parquet = { version = "54.1.0", features = ["async", "object_store"] }
 sqlparser = { git = "https://github.com/Embucket/datafusion-sqlparser-rs.git", rev = "53c291e3e95f176daea954f614409e5f674ec561", features = [
   "visitor",
