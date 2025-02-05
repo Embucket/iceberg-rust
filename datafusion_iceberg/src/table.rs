@@ -244,7 +244,6 @@ impl TableProvider for DataFusionTable {
         Ok(Arc::new(DataSinkExec::new(
             input,
             Arc::new(self.clone().into_data_sink()),
-            self.schema.clone(),
             None,
         )))
     }
@@ -537,6 +536,7 @@ async fn table_scan(
         object_store_url,
         file_schema,
         file_groups: data_file_groups.into_values().collect(),
+        constraints: Default::default(),
         statistics,
         projection: projection.cloned(),
         limit,
@@ -613,6 +613,10 @@ impl DataSink for IcebergDataSink {
     }
     fn metrics(&self) -> Option<MetricsSet> {
         None
+    }
+
+    fn schema(&self) -> &SchemaRef {
+        &self.0.schema
     }
 }
 

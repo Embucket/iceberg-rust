@@ -49,6 +49,7 @@ pub(crate) async fn table_statistics(
                         null_count: Precision::Absent,
                         max_value: Precision::Absent,
                         min_value: Precision::Absent,
+                        sum_value: Precision::Absent,
                         distinct_count: Precision::Absent
                     };
                     schema.fields().len()
@@ -71,6 +72,7 @@ pub(crate) async fn table_statistics(
                             null_count: acc.null_count.add(&x.null_count),
                             max_value: acc.max_value.max(&x.max_value),
                             min_value: acc.min_value.min(&x.min_value),
+                            sum_value: acc.sum_value.add(&x.sum_value),
                             distinct_count: acc.distinct_count.add(&x.distinct_count),
                         })
                         .collect(),
@@ -114,6 +116,7 @@ fn column_statistics<'a>(
                     ))
                 })
                 .unwrap_or(Precision::Absent),
+            sum_value: Precision::Absent,
             distinct_count: data_file
                 .distinct_counts()
                 .as_ref()

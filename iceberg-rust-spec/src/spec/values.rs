@@ -442,12 +442,11 @@ impl Value {
                 )))),
                 PrimitiveType::Fixed(len) => Ok(Value::Fixed(*len as usize, Vec::from(bytes))),
                 PrimitiveType::Binary => Ok(Value::Binary(Vec::from(bytes))),
-                PrimitiveType::Decimal { precision, scale } => {
+                PrimitiveType::Decimal { scale, .. } => {
                     Ok(Value::Decimal(Decimal::from_i128_with_scale(
                         i128::from_be_bytes(bytes.try_into()?), *scale,
                     )))
                 }
-                _ => Err(Error::Type(primitive.to_string(), "bytes".to_string())),
             },
             _ => Err(Error::NotSupported("Complex types as bytes".to_string())),
         }
