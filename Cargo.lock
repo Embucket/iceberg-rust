@@ -1538,7 +1538,7 @@ checksum = "e8566979429cf69b49a5c740c60791108e86440e8be149bbea4fe54d2c32d6e2"
 [[package]]
 name = "datafusion"
 version = "45.0.0"
-source = "git+https://github.com/Embucket/datafusion.git?rev=2950e0be59f81fbd6593f7457f1f03e63a292820#2950e0be59f81fbd6593f7457f1f03e63a292820"
+source = "git+https://github.com/Embucket/datafusion.git?rev=314a72634dc4f15242345fd17dc32df6c3ae04e8#314a72634dc4f15242345fd17dc32df6c3ae04e8"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -1588,7 +1588,7 @@ dependencies = [
 [[package]]
 name = "datafusion-catalog"
 version = "45.0.0"
-source = "git+https://github.com/Embucket/datafusion.git?rev=2950e0be59f81fbd6593f7457f1f03e63a292820#2950e0be59f81fbd6593f7457f1f03e63a292820"
+source = "git+https://github.com/Embucket/datafusion.git?rev=314a72634dc4f15242345fd17dc32df6c3ae04e8#314a72634dc4f15242345fd17dc32df6c3ae04e8"
 dependencies = [
  "arrow",
  "async-trait",
@@ -1608,7 +1608,7 @@ dependencies = [
 [[package]]
 name = "datafusion-common"
 version = "45.0.0"
-source = "git+https://github.com/Embucket/datafusion.git?rev=2950e0be59f81fbd6593f7457f1f03e63a292820#2950e0be59f81fbd6593f7457f1f03e63a292820"
+source = "git+https://github.com/Embucket/datafusion.git?rev=314a72634dc4f15242345fd17dc32df6c3ae04e8#314a72634dc4f15242345fd17dc32df6c3ae04e8"
 dependencies = [
  "ahash 0.8.11",
  "arrow",
@@ -1634,7 +1634,7 @@ dependencies = [
 [[package]]
 name = "datafusion-common-runtime"
 version = "45.0.0"
-source = "git+https://github.com/Embucket/datafusion.git?rev=2950e0be59f81fbd6593f7457f1f03e63a292820#2950e0be59f81fbd6593f7457f1f03e63a292820"
+source = "git+https://github.com/Embucket/datafusion.git?rev=314a72634dc4f15242345fd17dc32df6c3ae04e8#314a72634dc4f15242345fd17dc32df6c3ae04e8"
 dependencies = [
  "log",
  "tokio",
@@ -1643,12 +1643,12 @@ dependencies = [
 [[package]]
 name = "datafusion-doc"
 version = "45.0.0"
-source = "git+https://github.com/Embucket/datafusion.git?rev=2950e0be59f81fbd6593f7457f1f03e63a292820#2950e0be59f81fbd6593f7457f1f03e63a292820"
+source = "git+https://github.com/Embucket/datafusion.git?rev=314a72634dc4f15242345fd17dc32df6c3ae04e8#314a72634dc4f15242345fd17dc32df6c3ae04e8"
 
 [[package]]
 name = "datafusion-execution"
 version = "45.0.0"
-source = "git+https://github.com/Embucket/datafusion.git?rev=2950e0be59f81fbd6593f7457f1f03e63a292820#2950e0be59f81fbd6593f7457f1f03e63a292820"
+source = "git+https://github.com/Embucket/datafusion.git?rev=314a72634dc4f15242345fd17dc32df6c3ae04e8#314a72634dc4f15242345fd17dc32df6c3ae04e8"
 dependencies = [
  "arrow",
  "dashmap 6.1.0",
@@ -1666,7 +1666,7 @@ dependencies = [
 [[package]]
 name = "datafusion-expr"
 version = "45.0.0"
-source = "git+https://github.com/Embucket/datafusion.git?rev=2950e0be59f81fbd6593f7457f1f03e63a292820#2950e0be59f81fbd6593f7457f1f03e63a292820"
+source = "git+https://github.com/Embucket/datafusion.git?rev=314a72634dc4f15242345fd17dc32df6c3ae04e8#314a72634dc4f15242345fd17dc32df6c3ae04e8"
 dependencies = [
  "arrow",
  "chrono",
@@ -1686,7 +1686,7 @@ dependencies = [
 [[package]]
 name = "datafusion-expr-common"
 version = "45.0.0"
-source = "git+https://github.com/Embucket/datafusion.git?rev=2950e0be59f81fbd6593f7457f1f03e63a292820#2950e0be59f81fbd6593f7457f1f03e63a292820"
+source = "git+https://github.com/Embucket/datafusion.git?rev=314a72634dc4f15242345fd17dc32df6c3ae04e8#314a72634dc4f15242345fd17dc32df6c3ae04e8"
 dependencies = [
  "arrow",
  "datafusion-common",
@@ -1697,7 +1697,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions"
 version = "45.0.0"
-source = "git+https://github.com/Embucket/datafusion.git?rev=2950e0be59f81fbd6593f7457f1f03e63a292820#2950e0be59f81fbd6593f7457f1f03e63a292820"
+source = "git+https://github.com/Embucket/datafusion.git?rev=314a72634dc4f15242345fd17dc32df6c3ae04e8#314a72634dc4f15242345fd17dc32df6c3ae04e8"
 dependencies = [
  "arrow",
  "arrow-buffer",
@@ -1726,7 +1726,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-aggregate"
 version = "45.0.0"
-source = "git+https://github.com/Embucket/datafusion.git?rev=2950e0be59f81fbd6593f7457f1f03e63a292820#2950e0be59f81fbd6593f7457f1f03e63a292820"
+source = "git+https://github.com/Embucket/datafusion.git?rev=314a72634dc4f15242345fd17dc32df6c3ae04e8#314a72634dc4f15242345fd17dc32df6c3ae04e8"
 dependencies = [
  "ahash 0.8.11",
  "arrow",
@@ -1748,7 +1748,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-aggregate-common"
 version = "45.0.0"
-source = "git+https://github.com/Embucket/datafusion.git?rev=2950e0be59f81fbd6593f7457f1f03e63a292820#2950e0be59f81fbd6593f7457f1f03e63a292820"
+source = "git+https://github.com/Embucket/datafusion.git?rev=314a72634dc4f15242345fd17dc32df6c3ae04e8#314a72634dc4f15242345fd17dc32df6c3ae04e8"
 dependencies = [
  "ahash 0.8.11",
  "arrow",
@@ -1760,7 +1760,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-nested"
 version = "45.0.0"
-source = "git+https://github.com/Embucket/datafusion.git?rev=2950e0be59f81fbd6593f7457f1f03e63a292820#2950e0be59f81fbd6593f7457f1f03e63a292820"
+source = "git+https://github.com/Embucket/datafusion.git?rev=314a72634dc4f15242345fd17dc32df6c3ae04e8#314a72634dc4f15242345fd17dc32df6c3ae04e8"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -1783,7 +1783,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-table"
 version = "45.0.0"
-source = "git+https://github.com/Embucket/datafusion.git?rev=2950e0be59f81fbd6593f7457f1f03e63a292820#2950e0be59f81fbd6593f7457f1f03e63a292820"
+source = "git+https://github.com/Embucket/datafusion.git?rev=314a72634dc4f15242345fd17dc32df6c3ae04e8#314a72634dc4f15242345fd17dc32df6c3ae04e8"
 dependencies = [
  "arrow",
  "async-trait",
@@ -1798,7 +1798,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-window"
 version = "45.0.0"
-source = "git+https://github.com/Embucket/datafusion.git?rev=2950e0be59f81fbd6593f7457f1f03e63a292820#2950e0be59f81fbd6593f7457f1f03e63a292820"
+source = "git+https://github.com/Embucket/datafusion.git?rev=314a72634dc4f15242345fd17dc32df6c3ae04e8#314a72634dc4f15242345fd17dc32df6c3ae04e8"
 dependencies = [
  "datafusion-common",
  "datafusion-doc",
@@ -1814,7 +1814,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-window-common"
 version = "45.0.0"
-source = "git+https://github.com/Embucket/datafusion.git?rev=2950e0be59f81fbd6593f7457f1f03e63a292820#2950e0be59f81fbd6593f7457f1f03e63a292820"
+source = "git+https://github.com/Embucket/datafusion.git?rev=314a72634dc4f15242345fd17dc32df6c3ae04e8#314a72634dc4f15242345fd17dc32df6c3ae04e8"
 dependencies = [
  "datafusion-common",
  "datafusion-physical-expr-common",
@@ -1837,7 +1837,7 @@ dependencies = [
 [[package]]
 name = "datafusion-macros"
 version = "45.0.0"
-source = "git+https://github.com/Embucket/datafusion.git?rev=2950e0be59f81fbd6593f7457f1f03e63a292820#2950e0be59f81fbd6593f7457f1f03e63a292820"
+source = "git+https://github.com/Embucket/datafusion.git?rev=314a72634dc4f15242345fd17dc32df6c3ae04e8#314a72634dc4f15242345fd17dc32df6c3ae04e8"
 dependencies = [
  "datafusion-expr",
  "quote",
@@ -1847,7 +1847,7 @@ dependencies = [
 [[package]]
 name = "datafusion-optimizer"
 version = "45.0.0"
-source = "git+https://github.com/Embucket/datafusion.git?rev=2950e0be59f81fbd6593f7457f1f03e63a292820#2950e0be59f81fbd6593f7457f1f03e63a292820"
+source = "git+https://github.com/Embucket/datafusion.git?rev=314a72634dc4f15242345fd17dc32df6c3ae04e8#314a72634dc4f15242345fd17dc32df6c3ae04e8"
 dependencies = [
  "arrow",
  "chrono",
@@ -1865,7 +1865,7 @@ dependencies = [
 [[package]]
 name = "datafusion-physical-expr"
 version = "45.0.0"
-source = "git+https://github.com/Embucket/datafusion.git?rev=2950e0be59f81fbd6593f7457f1f03e63a292820#2950e0be59f81fbd6593f7457f1f03e63a292820"
+source = "git+https://github.com/Embucket/datafusion.git?rev=314a72634dc4f15242345fd17dc32df6c3ae04e8#314a72634dc4f15242345fd17dc32df6c3ae04e8"
 dependencies = [
  "ahash 0.8.11",
  "arrow",
@@ -1889,7 +1889,7 @@ dependencies = [
 [[package]]
 name = "datafusion-physical-expr-common"
 version = "45.0.0"
-source = "git+https://github.com/Embucket/datafusion.git?rev=2950e0be59f81fbd6593f7457f1f03e63a292820#2950e0be59f81fbd6593f7457f1f03e63a292820"
+source = "git+https://github.com/Embucket/datafusion.git?rev=314a72634dc4f15242345fd17dc32df6c3ae04e8#314a72634dc4f15242345fd17dc32df6c3ae04e8"
 dependencies = [
  "ahash 0.8.11",
  "arrow",
@@ -1903,7 +1903,7 @@ dependencies = [
 [[package]]
 name = "datafusion-physical-optimizer"
 version = "45.0.0"
-source = "git+https://github.com/Embucket/datafusion.git?rev=2950e0be59f81fbd6593f7457f1f03e63a292820#2950e0be59f81fbd6593f7457f1f03e63a292820"
+source = "git+https://github.com/Embucket/datafusion.git?rev=314a72634dc4f15242345fd17dc32df6c3ae04e8#314a72634dc4f15242345fd17dc32df6c3ae04e8"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -1924,7 +1924,7 @@ dependencies = [
 [[package]]
 name = "datafusion-physical-plan"
 version = "45.0.0"
-source = "git+https://github.com/Embucket/datafusion.git?rev=2950e0be59f81fbd6593f7457f1f03e63a292820#2950e0be59f81fbd6593f7457f1f03e63a292820"
+source = "git+https://github.com/Embucket/datafusion.git?rev=314a72634dc4f15242345fd17dc32df6c3ae04e8#314a72634dc4f15242345fd17dc32df6c3ae04e8"
 dependencies = [
  "ahash 0.8.11",
  "arrow",
@@ -1955,7 +1955,7 @@ dependencies = [
 [[package]]
 name = "datafusion-sql"
 version = "45.0.0"
-source = "git+https://github.com/Embucket/datafusion.git?rev=2950e0be59f81fbd6593f7457f1f03e63a292820#2950e0be59f81fbd6593f7457f1f03e63a292820"
+source = "git+https://github.com/Embucket/datafusion.git?rev=314a72634dc4f15242345fd17dc32df6c3ae04e8#314a72634dc4f15242345fd17dc32df6c3ae04e8"
 dependencies = [
  "arrow",
  "arrow-array",
