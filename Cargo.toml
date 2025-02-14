@@ -25,13 +25,14 @@ chrono = { version = "0.4.39", default-features = false, features = ["serde", "c
 arrow = "54.1.0"
 arrow-schema = "54.1.0"
 
-datafusion = { git="https://github.com/Embucket/datafusion.git", rev = "314a72634dc4f15242345fd17dc32df6c3ae04e8" }
-datafusion-sql = { git="https://github.com/Embucket/datafusion.git", rev = "314a72634dc4f15242345fd17dc32df6c3ae04e8" }
-datafusion-expr = { git="https://github.com/Embucket/datafusion.git", rev = "314a72634dc4f15242345fd17dc32df6c3ae04e8" }
-datafusion-common = { git="https://github.com/Embucket/datafusion.git", rev = "314a72634dc4f15242345fd17dc32df6c3ae04e8" }
-datafusion-execution = { git="https://github.com/Embucket/datafusion.git", rev = "314a72634dc4f15242345fd17dc32df6c3ae04e8" }
-datafusion-functions = { git="https://github.com/Embucket/datafusion.git", rev = "314a72634dc4f15242345fd17dc32df6c3ae04e8", features = ["crypto_expressions"] }
-datafusion-functions-aggregate = { git="https://github.com/Embucket/datafusion.git", rev = "314a72634dc4f15242345fd17dc32df6c3ae04e8" }
+datafusion = { version="45.0.0" }
+datafusion-sql = { version="45.0.0" }
+datafusion-expr = { version="45.0.0" }
+datafusion-common = { version="45.0.0" }
+datafusion-execution = { version="45.0.0" }
+datafusion-functions = { version="45.0.0" }
+datafusion-functions-aggregate = { version="45.0.0" }
+
 parquet = { version = "54.1.0", features = ["async", "object_store"] }
 sqlparser = { git = "https://github.com/Embucket/datafusion-sqlparser-rs.git", rev = "53c291e3e95f176daea954f614409e5f674ec561", features = [
   "visitor",
