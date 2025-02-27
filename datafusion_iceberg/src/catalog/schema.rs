@@ -16,7 +16,7 @@ pub struct IcebergSchema {
 }
 
 impl IcebergSchema {
-    pub(crate) fn new(schema: Namespace, catalog: Arc<Mirror>) -> Self {
+    pub fn new(schema: Namespace, catalog: Arc<Mirror>) -> Self {
         IcebergSchema { schema, catalog }
     }
 }
