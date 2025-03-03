@@ -29,13 +29,13 @@ use iceberg_rust::spec::{
     schema::Schema,
 };
 
-pub(crate) struct PruneManifests<'table, 'manifests> {
+pub struct PruneManifests<'table, 'manifests> {
     partition_fields: &'table [BoundPartitionField<'table>],
     files: &'manifests [ManifestListEntry],
 }
 
 impl<'table, 'manifests> PruneManifests<'table, 'manifests> {
-    pub(crate) fn new(
+    pub fn new(
         partition_fields: &'table [BoundPartitionField<'table>],
         files: &'manifests [ManifestListEntry],
     ) -> Self {
@@ -126,14 +126,14 @@ impl PruningStatistics for PruneManifests<'_, '_> {
     }
 }
 
-pub(crate) struct PruneDataFiles<'table, 'manifests> {
+pub struct PruneDataFiles<'table, 'manifests> {
     schema: &'table Schema,
     arrow_schema: &'table ArrowSchema,
     files: &'manifests [ManifestEntry],
 }
 
 impl<'table, 'manifests> PruneDataFiles<'table, 'manifests> {
-    pub(crate) fn new(
+    pub fn new(
         schema: &'table Schema,
         arrow_schema: &'table ArrowSchema,
         files: &'manifests [ManifestEntry],
