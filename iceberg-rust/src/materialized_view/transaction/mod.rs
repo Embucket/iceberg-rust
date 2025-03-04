@@ -13,8 +13,8 @@ use crate::{
     catalog::commit::{CommitTable, CommitView},
     error::Error,
     table::{
-        delete_files,
-        transaction::{operation::Operation as TableOperation, REWRITE_KEY},
+        delete_all_table_files,
+        transaction::{operation::Operation as TableOperation, APPEND_KEY, REPLACE_KEY},
     },
     view::transaction::operation::Operation as ViewOperation,
 };
@@ -70,9 +70,9 @@ impl<'view> Transaction<'view> {
     ) -> Result<Self, Error> {
         let refresh_state = serde_json::to_string(&refresh_state)?;
         self.storage_table_operations
-            .entry(REWRITE_KEY.to_owned())
+            .entry(REPLACE_KEY.to_owned())
             .and_modify(|mut x| {
-                if let TableOperation::Overwrite {
+                if let TableOperation::Replace {
                     branch: _,
                     files: old,
                     additional_summary: old_lineage,
@@ -85,9 +85,81 @@ impl<'view> Transaction<'view> {
                     )]));
                 }
             })
-            .or_insert(TableOperation::Overwrite {
+            .or_insert(TableOperation::Replace {
                 branch: self.branch.clone(),
                 files,
+                additional_summary: Some(HashMap::from_iter(vec![(
+                    REFRESH_STATE.to_owned(),
+                    refresh_state,
+                )])),
+            });
+        Ok(self)
+    }
+
+    /// Append files to the storage table
+    pub fn append(
+        mut self,
+        files: Vec<DataFile>,
+        refresh_state: RefreshState,
+    ) -> Result<Self, Error> {
+        let refresh_state = serde_json::to_string(&refresh_state)?;
+        self.storage_table_operations
+            .entry(APPEND_KEY.to_owned())
+            .and_modify(|mut x| {
+                if let TableOperation::Append {
+                    branch: _,
+                    data_files: old,
+                    delete_files: _,
+                    additional_summary: old_lineage,
+                } = &mut x
+                {
+                    old.extend_from_slice(&files);
+                    *old_lineage = Some(HashMap::from_iter(vec![(
+                        REFRESH_STATE.to_owned(),
+                        refresh_state.clone(),
+                    )]));
+                }
+            })
+            .or_insert(TableOperation::Append {
+                branch: self.branch.clone(),
+                data_files: files,
+                delete_files: Vec::new(),
+                additional_summary: Some(HashMap::from_iter(vec![(
+                    REFRESH_STATE.to_owned(),
+                    refresh_state,
+                )])),
+            });
+        Ok(self)
+    }
+
+    /// Append files to the storage table
+    pub fn delete(
+        mut self,
+        files: Vec<DataFile>,
+        refresh_state: RefreshState,
+    ) -> Result<Self, Error> {
+        let refresh_state = serde_json::to_string(&refresh_state)?;
+        self.storage_table_operations
+            .entry(APPEND_KEY.to_owned())
+            .and_modify(|mut x| {
+                if let TableOperation::Append {
+                    branch: _,
+                    data_files: _,
+                    delete_files: old,
+                    additional_summary: old_lineage,
+                } = &mut x
+                {
+                    old.extend_from_slice(&files);
+                    *old_lineage = Some(HashMap::from_iter(vec![(
+                        REFRESH_STATE.to_owned(),
+                        refresh_state.clone(),
+                    )]));
+                }
+            })
+            .or_insert(TableOperation::Append {
+                branch: self.branch.clone(),
+                data_files: Vec::new(),
+                delete_files: files,
                 additional_summary: Some(HashMap::from_iter(vec![(
                     REFRESH_STATE.to_owned(),
                     refresh_state,
@@ -111,7 +183,7 @@ impl<'view> Transaction<'view> {
             let delete_data = if self
                 .storage_table_operations
                 .values()
-                .any(|x| matches!(x, TableOperation::Overwrite { .. }))
+                .any(|x| matches!(x, TableOperation::Replace { .. }))
             {
                 Some(storage_table.metadata().clone())
             } else {
@@ -167,7 +239,7 @@ impl<'view> Transaction<'view> {
             .await?;
         // Delete data files in case of a rewrite operation
         if let Some(old_metadata) = delete_data {
-            delete_files(&old_metadata, self.materialized_view.object_store()).await?;
+            delete_all_table_files(&old_metadata, self.materialized_view.object_store()).await?;
         }
         *self.materialized_view = new_matview;
         Ok(())

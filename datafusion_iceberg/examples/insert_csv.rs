@@ -34,7 +34,7 @@ async fn main() {
     let state = SessionStateBuilder::new()
         .with_default_features()
         .with_catalog_list(catalog_list)
-        .with_query_planner(Arc::new(IcebergQueryPlanner {}))
+        .with_query_planner(Arc::new(IcebergQueryPlanner::new()))
         .build();
 
     let ctx = SessionContext::new_with_state(state);
@@ -142,7 +142,7 @@ async fn main() {
                 if product_id.unwrap() == 24027 {
                     assert_eq!(amount.unwrap(), 24.0)
                 } else if product_id.unwrap() == 63700 {
-                    assert_eq!(amount.unwrap(), 8.0)
+                    assert_eq!(amount.unwrap(), 23.0)
                 }
             }
             once = true

@@ -1,78 +1,178 @@
-/*!
- * Functions to write arrow record batches to an iceberg table
-*/
+//! Arrow writing module for converting Arrow record batches to Iceberg data files.
+//!
+//! This module provides functionality to:
+//! - Write Arrow record batches to Parquet files
+//! - Handle partitioned data writing
+//! - Support equality delete files
+//! - Manage file sizes and buffering
+//!
+//! The main entry points are:
+//! - [`write_parquet_partitioned`]: Write regular data files
+//! - [`write_equality_deletes_parquet_partitioned`]: Write equality delete files
+//!
+//! The module handles:
+//! - Automatic file size management and splitting
+//! - Parquet compression and encoding
+//! - Partition path generation
+//! - Object store integration
+//! - Metadata collection for written files
+//!
+//! # Example
+//!
+//! ```no_run
+//! # use arrow::record_batch::RecordBatch;
+//! # use futures::Stream;
+//! # use iceberg_rust::table::Table;
+//! # async fn example(table: &Table, batches: impl Stream<Item = Result<RecordBatch, arrow::error::ArrowError>>) {
+//! let data_files = write_parquet_partitioned(
+//!     table,
+//!     batches,
+//!     None // no specific branch
+//! ).await.unwrap();
+//! # }
+//! ```
 
 use futures::{
-    channel::mpsc::{channel, unbounded, Receiver, Sender},
-    lock::Mutex,
-    SinkExt, StreamExt, TryStreamExt,
+    channel::mpsc::{channel, Receiver, Sender},
+    StreamExt, TryStreamExt,
 };
 use object_store::{buffered::BufWriter, ObjectStore};
 use std::fmt::Write;
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc,
-};
+use std::sync::Arc;
+use tokio::task::JoinSet;
 
 use arrow::{datatypes::Schema as ArrowSchema, error::ArrowError, record_batch::RecordBatch};
 use futures::Stream;
 use iceberg_rust_spec::{
     partition::BoundPartitionField,
-    spec::{manifest::DataFile, schema::Schema, table_metadata::TableMetadata, values::Value},
-    table_metadata::{WRITE_DATA_PATH, WRITE_OBJECT_STORAGE_ENABLED},
+    spec::{manifest::DataFile, schema::Schema, values::Value},
+    table_metadata::{self, WRITE_DATA_PATH, WRITE_OBJECT_STORAGE_ENABLED},
     util::strip_prefix,
 };
 use parquet::{
     arrow::AsyncArrowWriter,
     basic::{Compression, ZstdLevel},
     file::properties::WriterProperties,
+    format::FileMetaData,
 };
 use uuid::Uuid;
 
-use crate::{error::Error, file_format::parquet::parquet_to_datafile, object_store::Bucket};
+use crate::{
+    error::Error, file_format::parquet::parquet_to_datafile, object_store::Bucket, table::Table,
+};
 
-use super::partition::partition_record_batches;
+use super::partition::PartitionStream;
 
 const MAX_PARQUET_SIZE: usize = 512_000_000;
 
 #[inline]
-/// Partitions arrow record batches and writes them to parquet files. Does not perform any operation on an iceberg table.
+/// Writes Arrow record batches as partitioned Parquet files.
+///
+/// This function writes Arrow record batches to Parquet files, partitioning them according
+/// to the table's partition spec.
+///
+/// # Arguments
+/// * `table` - The Iceberg table to write data for
+/// * `batches` - Stream of Arrow record batches to write
+/// * `branch` - Optional branch name to write to
+///
+/// # Returns
+/// * `Result<Vec<DataFile>, ArrowError>` - List of metadata for the written data files
+///
+/// # Errors
+/// Returns an error if:
+/// * The table metadata cannot be accessed
+/// * The schema projection fails
+/// * The object store operations fail
+/// * The Parquet writing fails
+/// * The partition path generation fails
 pub async fn write_parquet_partitioned(
-    metadata: &TableMetadata,
-    batches: impl Stream<Item = Result<RecordBatch, ArrowError>> + Send,
-    object_store: Arc<dyn ObjectStore>,
+    table: &Table,
+    batches: impl Stream<Item = Result<RecordBatch, ArrowError>> + Send + 'static,
     branch: Option<&str>,
 ) -> Result<Vec<DataFile>, ArrowError> {
-    store_parquet_partitioned(metadata, batches, object_store, branch, None).await
+    store_parquet_partitioned(table, batches, branch, None).await
 }
 
 #[inline]
-/// Partitions arrow record batches and writes them to parquet files. Does not perform any operation on an iceberg table.
+/// Writes equality delete records as partitioned Parquet files.
+///
+/// This function writes Arrow record batches containing equality delete records to Parquet files,
+/// partitioning them according to the table's partition spec.
+///
+/// # Arguments
+/// * `table` - The Iceberg table to write delete records for
+/// * `batches` - Stream of Arrow record batches containing the delete records
+/// * `branch` - Optional branch name to write to
+/// * `equality_ids` - Field IDs that define equality deletion
+///
+/// # Returns
+/// * `Result<Vec<DataFile>, ArrowError>` - List of metadata for the written delete files
+///
+/// # Errors
+/// Returns an error if:
+/// * The table metadata cannot be accessed
+/// * The schema projection fails
+/// * The object store operations fail
+/// * The Parquet writing fails
+/// * The partition path generation fails
 pub async fn write_equality_deletes_parquet_partitioned(
-    metadata: &TableMetadata,
-    batches: impl Stream<Item = Result<RecordBatch, ArrowError>> + Send,
-    object_store: Arc<dyn ObjectStore>,
+    table: &Table,
+    batches: impl Stream<Item = Result<RecordBatch, ArrowError>> + Send + 'static,
     branch: Option<&str>,
     equality_ids: &[i32],
 ) -> Result<Vec<DataFile>, ArrowError> {
-    store_parquet_partitioned(metadata, batches, object_store, branch, Some(equality_ids)).await
+    store_parquet_partitioned(table, batches, branch, Some(equality_ids)).await
 }
 
-/// Partitions arrow record batches and writes them to parquet files. Does not perform any operation on an iceberg table.
-pub async fn store_parquet_partitioned(
-    metadata: &TableMetadata,
-    batches: impl Stream<Item = Result<RecordBatch, ArrowError>> + Send,
-    object_store: Arc<dyn ObjectStore>,
+/// Stores Arrow record batches as partitioned Parquet files.
+///
+/// This is an internal function that handles the core storage logic for both regular data files
+/// and equality delete files.
+///
+/// # Arguments
+/// * `table` - The Iceberg table to store data for
+/// * `batches` - Stream of Arrow record batches to write
+/// * `branch` - Optional branch name to write to
+/// * `equality_ids` - Optional list of field IDs for equality deletes
+///
+/// # Returns
+/// * `Result<Vec<DataFile>, ArrowError>` - List of metadata for the written data files
+///
+/// # Errors
+/// Returns an error if:
+/// * The table metadata cannot be accessed
+/// * The schema projection fails
+/// * The object store operations fail
+/// * The Parquet writing fails
+/// * The partition path generation fails
+async fn store_parquet_partitioned(
+    table: &Table,
+    batches: impl Stream<Item = Result<RecordBatch, ArrowError>> + Send + 'static,
     branch: Option<&str>,
     equality_ids: Option<&[i32]>,
 ) -> Result<Vec<DataFile>, ArrowError> {
-    let schema = metadata.current_schema(branch).map_err(Error::from)?;
+    let metadata = table.metadata();
+    let object_store = table.object_store();
+    let schema = Arc::new(
+        metadata
+            .current_schema(branch)
+            .map_err(Error::from)?
+            .clone(),
+    );
     // project the schema on to the equality_ids for equality deletes
     let schema = if let Some(equality_ids) = equality_ids {
-        &schema.project(equality_ids)
+        Arc::new(schema.project(equality_ids))
     } else {
         schema
     };
+
+    let partition_spec = Arc::new(
+        metadata
+            .default_partition_spec()
+            .map_err(Error::from)?
+            .clone(),
+    );
 
     let partition_fields = &metadata
         .current_partition_fields(branch)
@@ -87,8 +187,6 @@ pub async fn store_parquet_partitioned(
     let arrow_schema: Arc<ArrowSchema> =
         Arc::new((schema.fields()).try_into().map_err(Error::from)?);
 
-    let (mut sender, reciever) = unbounded();
-
     if partition_fields.is_empty() {
         let partition_path = if metadata
             .properties
@@ -101,7 +199,7 @@ pub async fn store_parquet_partitioned(
         };
         let files = write_parquet_files(
             data_location,
-            schema,
+            &schema,
             &arrow_schema,
             partition_fields,
             partition_path,
@@ -110,62 +208,90 @@ pub async fn store_parquet_partitioned(
             equality_ids,
         )
         .await?;
-        sender.send(files).await.map_err(Error::from)?;
+        Ok(files)
     } else {
-        let streams = partition_record_batches(batches, partition_fields).await?;
+        let mut streams = PartitionStream::new(Box::pin(batches), partition_fields);
 
-        streams
-            .map(Ok::<_, ArrowError>)
-            .try_for_each_concurrent(None, |(partition_values, batches)| {
+        let mut set = JoinSet::new();
+
+        while let Some(result) = streams.next().await {
+            let (partition_values, batches) = result?;
+            set.spawn({
                 let arrow_schema = arrow_schema.clone();
                 let object_store = object_store.clone();
-                let mut sender = sender.clone();
-                async move {
-                    let partition_path = if metadata
-                        .properties
-                        .get(WRITE_OBJECT_STORAGE_ENABLED)
-                        .is_some_and(|x| x == "true")
-                    {
-                        None
-                    } else {
-                        Some(generate_partition_path(
-                            partition_fields,
-                            &partition_values,
-                        )?)
-                    };
-                    let files = write_parquet_files(
-                        data_location,
-                        schema,
-                        &arrow_schema,
+                let data_location = data_location.clone();
+                let schema = schema.clone();
+                let partition_spec = partition_spec.clone();
+                let equality_ids = equality_ids.map(Vec::from);
+                let partition_path = if metadata
+                    .properties
+                    .get(WRITE_OBJECT_STORAGE_ENABLED)
+                    .is_some_and(|x| x == "true")
+                {
+                    None
+                } else {
+                    Some(generate_partition_path(
                         partition_fields,
+                        &partition_values,
+                    )?)
+                };
+                async move {
+                    let partition_fields =
+                        table_metadata::partition_fields(&partition_spec, &schema)
+                            .map_err(Error::from)?;
+                    let files = write_parquet_files(
+                        &data_location,
+                        &schema,
+                        &arrow_schema,
+                        &partition_fields,
                         partition_path,
                         batches,
                         object_store.clone(),
-                        equality_ids,
+                        equality_ids.as_deref(),
                     )
                     .await?;
-                    sender.send(files).await.map_err(Error::from)?;
-                    Ok(())
+                    Ok::<_, Error>(files)
                 }
-            })
-            .await?;
+            });
+        }
+
+        let mut files = Vec::new();
+
+        while let Some(handle) = set.join_next().await {
+            files.extend(handle.map_err(Error::from)??);
+        }
+
+        Ok(files)
     }
-
-    sender.close_channel();
-
-    Ok(reciever
-        .fold(Vec::new(), |mut acc, x| async move {
-            acc.extend(x);
-            acc
-        })
-        .await)
 }
 
-type SendableAsyncArrowWriter = AsyncArrowWriter<BufWriter>;
-type ArrowSender = Sender<(String, SendableAsyncArrowWriter)>;
-type ArrowReciever = Receiver<(String, SendableAsyncArrowWriter)>;
+type ArrowSender = Sender<(String, FileMetaData)>;
+type ArrowReciever = Receiver<(String, FileMetaData)>;
 
-/// Write arrow record batches to parquet files. Does not perform any operation on an iceberg table.
+/// Writes a stream of Arrow record batches to multiple Parquet files.
+///
+/// This internal function handles the low-level details of writing record batches to Parquet files,
+/// managing file sizes, and collecting metadata.
+///
+/// # Arguments
+/// * `data_location` - Base path where data files should be written
+/// * `schema` - Iceberg schema for the data
+/// * `arrow_schema` - Arrow schema for the record batches
+/// * `partition_fields` - List of partition fields if data is partitioned
+/// * `partition_path` - Optional partition path component
+/// * `batches` - Stream of record batches to write
+/// * `object_store` - Object store to write files to
+/// * `equality_ids` - Optional list of field IDs for equality deletes
+///
+/// # Returns
+/// * `Result<Vec<DataFile>, ArrowError>` - List of metadata for the written files
+///
+/// # Errors
+/// Returns an error if:
+/// * File creation fails
+/// * Writing record batches fails
+/// * Object store operations fail
+/// * Metadata collection fails
 #[allow(clippy::too_many_arguments)]
 async fn write_parquet_files(
     data_location: &str,
@@ -178,73 +304,90 @@ async fn write_parquet_files(
     equality_ids: Option<&[i32]>,
 ) -> Result<Vec<DataFile>, ArrowError> {
     let bucket = Bucket::from_path(data_location)?;
-    let current_writer = Arc::new(Mutex::new(
-        create_arrow_writer(
-            data_location,
-            partition_path.clone(),
-            arrow_schema,
-            object_store.clone(),
-        )
-        .await?,
-    ));
+    let (mut writer_sender, writer_reciever): (ArrowSender, ArrowReciever) = channel(1);
 
-    let (mut writer_sender, writer_reciever): (ArrowSender, ArrowReciever) = channel(32);
+    // Create initial writer
+    let initial_writer = create_arrow_writer(
+        data_location,
+        partition_path.clone(),
+        arrow_schema,
+        object_store.clone(),
+    )
+    .await?;
 
-    let num_bytes = Arc::new(AtomicUsize::new(0));
+    // Structure to hold writer state
+    struct WriterState {
+        writer: (String, AsyncArrowWriter<BufWriter>),
+        bytes_written: usize,
+    }
 
-    batches
-        .try_for_each_concurrent(None, |batch| {
-            let current_writer = current_writer.clone();
-            let mut writer_sender = writer_sender.clone();
-            let num_bytes = num_bytes.clone();
-            let object_store = object_store.clone();
-            let partition_path = partition_path.clone();
-            async move {
-                let mut current_writer = current_writer.lock().await;
-                let current =
-                    num_bytes.fetch_update(Ordering::Release, Ordering::Acquire, |current| {
-                        if current > MAX_PARQUET_SIZE {
-                            Some(0)
-                        } else {
-                            None
-                        }
-                    });
-                if current.is_ok() {
-                    let finished_writer = std::mem::replace(
-                        &mut *current_writer,
-                        create_arrow_writer(
-                            data_location,
+    let final_state = batches
+        .try_fold(
+            WriterState {
+                writer: initial_writer,
+                bytes_written: 0,
+            },
+            |mut state, batch| {
+                let object_store = object_store.clone();
+                let data_location = data_location.to_owned();
+                let partition_path = partition_path.clone();
+                let arrow_schema = arrow_schema.clone();
+                let mut writer_sender = writer_sender.clone();
+
+                async move {
+                    let batch_size = record_batch_size(&batch);
+                    let new_size = state.bytes_written + batch_size;
+
+                    if new_size > MAX_PARQUET_SIZE {
+                        // Send current writer to channel
+                        let finished_writer = state.writer;
+                        let file = finished_writer.1.close().await?;
+                        writer_sender
+                            .try_send((finished_writer.0, file))
+                            .map_err(|err| ArrowError::ComputeError(err.to_string()))?;
+
+                        // Create new writer
+                        let new_writer = create_arrow_writer(
+                            &data_location,
                             partition_path,
-                            arrow_schema,
+                            &arrow_schema,
                             object_store,
                         )
-                        .await
-                        .unwrap(),
-                    );
-                    writer_sender
-                        .try_send(finished_writer)
-                        .map_err(|err| ArrowError::ComputeError(err.to_string()))?;
+                        .await?;
+
+                        state.writer = new_writer;
+                        state.bytes_written = batch_size;
+                    } else {
+                        state.bytes_written = new_size;
+                        if new_size % 64_000_000 >= 32_000_000 {
+                            state.writer.1.flush().await?;
+                        }
+                    }
+
+                    state.writer.1.write(&batch).await?;
+                    Ok(state)
                 }
-                current_writer.1.write(&batch).await?;
-                let batch_size = record_batch_size(&batch);
-                num_bytes.fetch_add(batch_size, Ordering::AcqRel);
-                Ok(())
-            }
-        })
+            },
+        )
         .await?;
 
-    let last = Arc::try_unwrap(current_writer).unwrap().into_inner();
-
-    writer_sender.try_send(last).unwrap();
-
+    // Handle the last writer
+    let file = final_state.writer.1.close().await?;
+    writer_sender
+        .try_send((final_state.writer.0, file))
+        .map_err(|err| ArrowError::ComputeError(err.to_string()))?;
     writer_sender.close_channel();
+
+    if final_state.bytes_written == 0 {
+        return Ok(Vec::new());
+    }
 
     writer_reciever
         .then(|writer| {
             let object_store = object_store.clone();
             let bucket = bucket.to_string();
             async move {
-                let metadata = writer.1.close().await?;
+                let metadata = writer.1;
                 let size = object_store
                     .head(&writer.0.as_str().into())
                     .await
@@ -264,6 +407,22 @@ async fn write_parquet_files(
         .await
 }
 
+/// Generates a partition path string from partition fields and their values.
+///
+/// Creates a path string in the format "field1=value1/field2=value2/..." for each
+/// partition field and its corresponding value.
+///
+/// # Arguments
+/// * `partition_fields` - List of bound partition fields defining the partitioning
+/// * `partiton_values` - List of values for each partition field
+///
+/// # Returns
+/// * `Result<String, ArrowError>` - The generated partition path string
+///
+/// # Errors
+/// Returns an error if:
+/// * The partition field name cannot be processed
+/// * The partition value cannot be converted to a string
 #[inline]
 fn generate_partition_path(
     partition_fields: &[BoundPartitionField<'_>],
@@ -279,6 +438,25 @@ fn generate_partition_path(
         .collect::<Result<String, ArrowError>>()
 }
 
+/// Creates a new Arrow writer for writing record batches to a Parquet file.
+///
+/// This internal function creates a new buffered writer and configures it with
+/// appropriate Parquet compression settings.
+///
+/// # Arguments
+/// * `data_location` - Base path where data files should be written
+/// * `partition_path` - Optional partition path component
+/// * `schema` - Arrow schema for the record batches
+/// * `object_store` - Object store to write files to
+///
+/// # Returns
+/// * `Result<(String, AsyncArrowWriter<BufWriter>), ArrowError>` - The file path and configured writer
+///
+/// # Errors
+/// Returns an error if:
+/// * Random number generation fails
+/// * The writer properties cannot be configured
+/// * The Arrow writer cannot be created
 async fn create_arrow_writer(
     data_location: &str,
     partition_path: Option<String>,
@@ -286,7 +464,7 @@ async fn create_arrow_writer(
     object_store: Arc<dyn ObjectStore>,
 ) -> Result<(String, AsyncArrowWriter<BufWriter>), ArrowError> {
     let mut rand = [0u8; 6];
-    getrandom::getrandom(&mut rand)
+    getrandom::fill(&mut rand)
         .map_err(|err| ArrowError::ExternalError(Box::new(err)))
         .unwrap();
 
@@ -319,6 +497,16 @@ async fn create_arrow_writer(
     ))
 }
 
+/// Calculates the approximate size in bytes of an Arrow record batch.
+///
+/// This function estimates the memory footprint of a record batch by multiplying
+/// the total size of all fields by the number of rows.
+///
+/// # Arguments
+/// * `batch` - The record batch to calculate size for
+///
+/// # Returns
+/// * `usize` - Estimated size of the record batch in bytes
 #[inline]
 fn record_batch_size(batch: &RecordBatch) -> usize {
     batch
