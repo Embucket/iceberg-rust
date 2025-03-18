@@ -336,19 +336,6 @@ pub fn apply_table_updates(
                 });
                 metadata.last_updated_ms = *snapshot.timestamp_ms();
                 metadata.last_sequence_number = *snapshot.sequence_number();
-
-                metadata.refs
-                    .entry("main".to_string())
-                    .and_modify(|s| {
-                        s.snapshot_id = *snapshot.snapshot_id();
-                    })
-                    .or_insert_with(|| {
-                        SnapshotReference {
-                            snapshot_id: *snapshot.snapshot_id(),
-                            retention: SnapshotRetention::default(),
-                        }
-                    });
-                
                 metadata.snapshots.insert(*snapshot.snapshot_id(), snapshot);
             }
             TableUpdate::SetSnapshotRef {
