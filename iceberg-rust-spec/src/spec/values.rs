@@ -106,10 +106,12 @@ impl From<Value> for ByteBuf {
             Value::UUID(val) => ByteBuf::from(val.as_u128().to_be_bytes()),
             Value::Fixed(_, val) => ByteBuf::from(val),
             Value::Binary(val) => ByteBuf::from(val),
-            Value::Decimal(val) => match val.to_i128() {
-                Some(v) => ByteBuf::from(v.to_be_bytes()),
-                None => ByteBuf::from([]),
-            },
+            Value::Decimal(val) => {
+                // rust_decimal mantissa is 96 bits
+                // so we can remove the first 32 bits of the i128 representation
+                let bytes = val.mantissa().to_be_bytes()[4..].to_vec();
+                ByteBuf::from(bytes)
+            }
             _ => todo!(),
         }
     }
@@ -443,9 +445,12 @@ impl Value {
                 PrimitiveType::Fixed(len) => Ok(Value::Fixed(*len as usize, Vec::from(bytes))),
                 PrimitiveType::Binary => Ok(Value::Binary(Vec::from(bytes))),
                 PrimitiveType::Decimal { scale, .. } => {
-                    Ok(Value::Decimal(Decimal::from_i128_with_scale(
-                        i128::from_be_bytes(bytes.try_into()?), *scale,
-                    )))
+                    let val = if bytes.len() <= 16 {
+                        i128::from_be_bytes(sign_extend_be(bytes))
+                    } else {
+                        return Err(Error::Type("decimal".to_string(), "bytes".to_string()));
+                    };
+                    Ok(Value::Decimal(Decimal::from_i128_with_scale(val, *scale)))
                 }
             },
             _ => Err(Error::NotSupported("Complex types as bytes".to_string())),
@@ -657,6 +662,19 @@ impl Value {
             }
         }
     }
+}
+
+/// Performs big endian sign extension
+/// Copied from arrow-rs repo/parquet crate:
+/// https://github.com/apache/arrow-rs/blob/b25c441745602c9967b1e3cc4a28bc469cfb1311/parquet/src/arrow/buffer/bit_util.rs#L54
+pub fn sign_extend_be<const N: usize>(b: &[u8]) -> [u8; N] {
+    assert!(b.len() <= N, "Array too large, expected less than {N}");
+    let is_negative = (b[0] & 128u8) == 128u8;
+    let mut result = if is_negative { [255u8; N] } else { [0u8; N] };
+    for (d, s) in result.iter_mut().skip(N - b.len()).zip(b) {
+        *d = *s;
+    }
+    result
 }
 
 impl From<&Value> for JsonValue {
