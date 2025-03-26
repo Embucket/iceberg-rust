@@ -39,7 +39,9 @@ pin-project-lite = "0.2"
 serde = "^1.0"
 serde_derive = "^1.0"
 serde_json = "^1.0"
-sqlparser = { version = "0.54.0", features = ["visitor"] }
+sqlparser = { git = "https://github.com/Embucket/datafusion-sqlparser-rs.git", rev = "53c291e3e95f176daea954f614409e5f674ec561", features = [
+  "visitor",
+] }
 thiserror = "2"
 tracing = "0.1"
 tracing-futures = "0.2"
