@@ -279,18 +279,17 @@ impl Operation {
                         (selected_manifest_opt, selected_manifest_bytes_opt)
                     {
                         let manifest_bytes = manifest_bytes.await??;
-                        let manifest_reader = ManifestReader::new(&*manifest_bytes)?
-                            .map(|entry| {
-                                let mut entry = entry?;
-                                *entry.status_mut() = Status::Existing;
-                                if entry.sequence_number().is_none() {
-                                    *entry.sequence_number_mut() = Some(manifest.sequence_number);
-                                }
-                                if entry.snapshot_id().is_none() {
-                                    *entry.snapshot_id_mut() = Some(manifest.added_snapshot_id);
-                                }
-                                Ok(entry)
-                            });
+                        let manifest_reader = ManifestReader::new(&*manifest_bytes)?.map(|entry| {
+                            let mut entry = entry?;
+                            *entry.status_mut() = Status::Existing;
+                            if entry.sequence_number().is_none() {
+                                *entry.sequence_number_mut() = Some(manifest.sequence_number);
+                            }
+                            if entry.snapshot_id().is_none() {
+                                *entry.snapshot_id_mut() = Some(manifest.added_snapshot_id);
+                            }
+                            Ok(entry)
+                        });
 
                         split_datafiles(
                             new_datafile_iter.chain(manifest_reader),
@@ -459,7 +458,8 @@ impl Operation {
                     let bounding_partition_values = files
                         .iter()
                         .try_fold(None, |acc, x| {
-                            let node = partition_struct_to_vec(x.partition(), &partition_column_names)?;
+                            let node =
+                                partition_struct_to_vec(x.partition(), &partition_column_names)?;
                             let Some(mut acc) = acc else {
                                 return Ok::<_, Error>(Some(Rectangle::new(node.clone(), node)));
                             };
