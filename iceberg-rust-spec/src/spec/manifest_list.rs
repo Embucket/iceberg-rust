@@ -1,16 +1,6 @@
-//! Manifest list handling and management for Iceberg tables.
-//!
-//! This module provides the core types and implementations for working with manifest lists,
-//! which track all manifest files in a table snapshot. Key components include:
-//!
-//! - [`ManifestListEntry`] - Entries describing manifest files and their contents
-//! - [`Content`] - Types of content tracked by manifests (data vs deletes)
-//! - [`FieldSummary`] - Statistics and metadata about partition fields
-//!
-//! Manifest lists are a critical part of Iceberg's metadata hierarchy, providing an
-//! index of all manifest files and enabling efficient manifest pruning during scans.
-//! They include summary statistics that can be used to skip reading manifests that
-//! don't contain relevant data for a query.
+/*!
+ * Manifest lists
+*/
 
 use std::sync::OnceLock;
 
@@ -690,7 +680,7 @@ mod tests {
         partition::{PartitionField, PartitionSpec, Transform},
         schema::Schema,
         table_metadata::TableMetadataBuilder,
-        types::{PrimitiveType, StructField},
+        types::{PrimitiveType, StructField, StructType},
     };
 
     #[test]
@@ -702,13 +692,18 @@ mod tests {
                 1,
                 Schema::builder()
                     .with_schema_id(1)
-                    .with_struct_field(StructField {
-                        id: 0,
-                        name: "date".to_string(),
-                        required: true,
-                        field_type: Type::Primitive(PrimitiveType::Date),
-                        doc: None,
-                    })
+                    .with_fields(
+                        StructType::builder()
+                            .with_struct_field(StructField {
+                                id: 0,
+                                name: "date".to_string(),
+                                required: true,
+                                field_type: Type::Primitive(PrimitiveType::Date),
+                                doc: None,
+                            })
+                            .build()
+                            .unwrap(),
+                    )
                     .build()
                     .unwrap(),
             )]))
@@ -777,13 +772,18 @@ mod tests {
                 1,
                 Schema::builder()
                     .with_schema_id(1)
-                    .with_struct_field(StructField {
-                        id: 0,
-                        name: "date".to_string(),
-                        required: true,
-                        field_type: Type::Primitive(PrimitiveType::Date),
-                        doc: None,
-                    })
+                    .with_fields(
+                        StructType::builder()
+                            .with_struct_field(StructField {
+                                id: 0,
+                                name: "date".to_string(),
+                                required: true,
+                                field_type: Type::Primitive(PrimitiveType::Date),
+                                doc: None,
+                            })
+                            .build()
+                            .unwrap(),
+                    )
                     .build()
                     .unwrap(),
             )]))

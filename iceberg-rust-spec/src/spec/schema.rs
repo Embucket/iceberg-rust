@@ -1,38 +1,29 @@
 /*!
- * Schema definition and management for Iceberg tables
- *
- * This module provides the core schema functionality for Iceberg tables, including:
- * - Schema versioning and evolution
- * - Field definitions with unique IDs
- * - Required vs optional field specifications
- * - Schema builder patterns for constructing complex schemas
- * - Schema projection for selecting subsets of fields
- *
- * The schema system is fundamental to Iceberg's data model, providing:
- * - Type safety and validation
- * - Schema evolution capabilities
- * - Efficient field access via ID-based lookups
- * - Support for nested data structures
- */
-
+ * Schemas
+*/
 use std::{fmt, ops::Deref, str};
 
-use super::types::{StructField, StructType, StructTypeBuilder};
+use derive_builder::Builder;
 use derive_getters::Getters;
 use serde::{Deserialize, Serialize};
 
 use crate::error::Error;
 
+use super::types::StructType;
+
 pub static DEFAULT_SCHEMA_ID: i32 = 0;
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone, Getters)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone, Builder, Getters)]
 #[serde(rename_all = "kebab-case")]
+#[builder(setter(prefix = "with"))]
 /// Names and types of fields in a table.
 pub struct Schema {
     /// Identifier of the schema
+    #[builder(default = "DEFAULT_SCHEMA_ID")]
     schema_id: i32,
     /// Set of primitive fields that identify rows in a table.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(into, strip_option), default)]
     identifier_field_ids: Option<Vec<i32>>,
 
     #[serde(flatten)]
@@ -48,46 +39,10 @@ impl Deref for Schema {
 }
 
 impl Schema {
-    /// Creates a new SchemaBuilder to construct a Schema using the builder pattern
-    ///
-    /// # Returns
-    /// * A SchemaBuilder instance configured with default values
-    ///
-    /// This is the recommended way to construct Schema instances when you need
-    /// to add fields incrementally or set optional parameters.
     pub fn builder() -> SchemaBuilder {
         SchemaBuilder::default()
     }
 
-    /// Creates a new Schema from a StructType and associated metadata
-    ///
-    /// # Arguments
-    /// * `fields` - The StructType containing the schema's fields
-    /// * `schema_id` - Unique identifier for this schema
-    /// * `identifier_field_ids` - Optional list of field IDs that identify rows in the table
-    ///
-    /// # Returns
-    /// * A new Schema instance with the provided fields and metadata
-    pub fn from_struct_type(
-        fields: StructType,
-        schema_id: i32,
-        identifier_field_ids: Option<Vec<i32>>,
-    ) -> Self {
-        Schema {
-            schema_id,
-            identifier_field_ids,
-            fields,
-        }
-    }
-
-    /// Creates a new Schema containing only the specified field IDs
-    ///
-    /// # Arguments
-    /// * `ids` - Array of field IDs to include in the projected schema
-    ///
-    /// # Returns
-    /// * A new Schema containing only the specified fields, maintaining the original
-    ///   schema ID and any identifier fields that were included in the projection
     pub fn project(&self, ids: &[i32]) -> Schema {
         Schema {
             schema_id: self.schema_id,
@@ -122,66 +77,6 @@ impl str::FromStr for Schema {
     type Err = Error;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         serde_json::from_str(s).map_err(Error::from)
-    }
-}
-
-#[derive(Default)]
-pub struct SchemaBuilder {
-    schema_id: Option<i32>,
-    identifier_field_ids: Option<Vec<i32>>,
-    fields: StructTypeBuilder,
-}
-
-impl SchemaBuilder {
-    /// Sets the schema ID for this schema
-    ///
-    /// # Arguments
-    /// * `schema_id` - The unique identifier for this schema
-    ///
-    /// # Returns
-    /// * A mutable reference to self for method chaining
-    pub fn with_schema_id(&mut self, schema_id: i32) -> &mut Self {
-        self.schema_id = Some(schema_id);
-        self
-    }
-
-    /// Sets the identifier field IDs for this schema
-    ///
-    /// # Arguments
-    /// * `ids` - Collection of field IDs that identify rows in the table
-    ///
-    /// # Returns
-    /// * A mutable reference to self for method chaining
-    pub fn with_identifier_field_ids(&mut self, ids: impl Into<Vec<i32>>) -> &mut Self {
-        self.identifier_field_ids = Some(ids.into());
-        self
-    }
-
-    /// Adds a struct field to this schema
-    ///
-    /// # Arguments
-    /// * `field` - The StructField to add to the schema
-    ///
-    /// # Returns
-    /// * A mutable reference to self for method chaining
-    pub fn with_struct_field(&mut self, field: StructField) -> &mut Self {
-        self.fields.with_struct_field(field);
-        self
-    }
-
-    /// Builds and returns a new Schema from this builder's configuration
-    ///
-    /// # Returns
-    /// * `Ok(Schema)` - A new Schema instance with the configured fields and metadata
-    /// * `Err(Error)` - If there was an error building the schema
-    pub fn build(&mut self) -> Result<Schema, Error> {
-        let fields = self.fields.build()?;
-
-        Ok(Schema {
-            schema_id: self.schema_id.unwrap_or(DEFAULT_SCHEMA_ID),
-            identifier_field_ids: self.identifier_field_ids.take(),
-            fields,
-        })
     }
 }
 

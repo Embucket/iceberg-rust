@@ -176,7 +176,7 @@ impl TableMetadata {
     pub fn snapshot_by_id(&self, snapshot_id: i64) -> Option<&Snapshot> {
         self.snapshots.get(&snapshot_id)
     }
-
+    
     /// Get the snapshot for a reference
     /// Returns an option if the `ref_name` is not found
     #[inline]
@@ -186,7 +186,7 @@ impl TableMetadata {
                 .unwrap_or_else(|| panic!("Snapshot id of ref {} doesn't exist", ref_name))
         })
     }
-
+    
     /// Get partition fields
     pub fn current_partition_fields(
         &self,

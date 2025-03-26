@@ -397,7 +397,7 @@ async fn table_scan(
                         range: None,
                         statistics: Some(manifest_statistics),
                         extensions: None,
-                        metadata_size_hint: None,
+                        metadata_size_hint: None
                     };
                     match manifest.data_file().content() {
                         Content::Data => {
@@ -460,7 +460,7 @@ async fn table_scan(
                     range: None,
                     statistics: Some(manifest_statistics),
                     extensions: None,
-                    metadata_size_hint: None,
+                    metadata_size_hint: None
                 };
                 match manifest.data_file().content() {
                     Content::Data => {
@@ -602,10 +602,7 @@ impl DataSink for IcebergDataSink {
         )
         .await?;
 
-        let count = metadata_files
-            .iter()
-            .map(|x| x.record_count())
-            .fold(0, |acc, x| acc + x);
+        let count = metadata_files.iter().map(|x|x.record_count()).fold(0, |acc, x| acc+ x);
 
         table
             .new_transaction(self.0.branch.as_deref())
@@ -958,21 +955,20 @@ mod tests {
 
         ctx.register_table("orders", table.clone()).unwrap();
 
-        let res = ctx
-            .sql(
-                "INSERT INTO orders (id, customer_id, product_id, date, amount) VALUES 
+        let res = ctx.sql(
+            "INSERT INTO orders (id, customer_id, product_id, date, amount) VALUES 
                 (1, 1, 1, '2020-01-01', 1),
                 (2, 2, 1, '2020-01-01', 1),
                 (3, 3, 1, '2020-01-01', 3),
                 (4, 1, 2, '2020-02-02', 1),
                 (5, 1, 1, '2020-02-02', 2),
                 (6, 3, 3, '2020-02-02', 3);",
-            )
-            .await
-            .expect("Failed to create query plan for insert")
-            .collect()
-            .await
-            .expect("Failed to insert values into table");
+        )
+        .await
+        .expect("Failed to create query plan for insert")
+        .collect()
+        .await
+        .expect("Failed to insert values into table");
 
         let count = res[0]
             .column(0)

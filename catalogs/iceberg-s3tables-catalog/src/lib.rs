@@ -6,7 +6,10 @@ use std::{
 use async_trait::async_trait;
 use aws_config::SdkConfig;
 
-use aws_sdk_s3tables::{types::OpenTableFormat, Client};
+use aws_sdk_s3tables::{
+    types::OpenTableFormat,
+    Client,
+};
 use iceberg_rust::{
     catalog::{
         commit::{
