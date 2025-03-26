@@ -20,13 +20,13 @@ arrow-schema = "54"
 async-trait = "0.1"
 bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
-datafusion = { git="https://github.com/Embucket/datafusion.git", rev = "073a3b110852f97ccb7085ce4bfd19473b8a3f4f" }
-datafusion-sql = { git="https://github.com/Embucket/datafusion.git", rev = "073a3b110852f97ccb7085ce4bfd19473b8a3f4f" }
-datafusion-expr = { git="https://github.com/Embucket/datafusion.git", rev = "073a3b110852f97ccb7085ce4bfd19473b8a3f4f" }
-datafusion-common = { git="https://github.com/Embucket/datafusion.git", rev = "073a3b110852f97ccb7085ce4bfd19473b8a3f4f" }
-datafusion-execution = { git="https://github.com/Embucket/datafusion.git", rev = "073a3b110852f97ccb7085ce4bfd19473b8a3f4f" }
-datafusion-functions = { git="https://github.com/Embucket/datafusion.git", rev = "073a3b110852f97ccb7085ce4bfd19473b8a3f4f", features = ["crypto_expressions"] }
-datafusion-functions-aggregate = { git="https://github.com/Embucket/datafusion.git", rev = "073a3b110852f97ccb7085ce4bfd19473b8a3f4f" }
+datafusion = { git="https://github.com/Embucket/datafusion.git", rev = "eecc47ec20fec83158bd71611e799cb7d373646f" }
+datafusion-sql = { git="https://github.com/Embucket/datafusion.git", rev = "eecc47ec20fec83158bd71611e799cb7d373646f" }
+datafusion-expr = { git="https://github.com/Embucket/datafusion.git", rev = "eecc47ec20fec83158bd71611e799cb7d373646f" }
+datafusion-common = { git="https://github.com/Embucket/datafusion.git", rev = "eecc47ec20fec83158bd71611e799cb7d373646f" }
+datafusion-execution = { git="https://github.com/Embucket/datafusion.git", rev = "eecc47ec20fec83158bd71611e799cb7d373646f" }
+datafusion-functions = { git="https://github.com/Embucket/datafusion.git", rev = "eecc47ec20fec83158bd71611e799cb7d373646f", features = ["crypto_expressions"] }
+datafusion-functions-aggregate = { git="https://github.com/Embucket/datafusion.git", rev = "eecc47ec20fec83158bd71611e799cb7d373646f" }
 derive-getters = "0.5.0"
 derive_builder = "0.20"
 futures = "0.3.31"
