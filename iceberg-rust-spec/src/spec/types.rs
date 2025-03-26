@@ -1,6 +1,20 @@
 /*!
- * Data Types
-*/
+ * Iceberg type system implementation
+ *
+ * This module implements Iceberg's type system, which includes:
+ *
+ * - Primitive types: boolean, numeric types, strings, binary, etc.
+ * - Complex types: structs, lists, and maps
+ * - Type conversion and validation logic
+ * - Serialization/deserialization support
+ *
+ * The type system is used throughout the Iceberg format to:
+ * - Define table schemas
+ * - Validate data values
+ * - Support schema evolution
+ * - Enable efficient data access patterns
+ */
+
 use std::{collections::HashMap, fmt, ops::Index, slice::Iter};
 
 use derive_builder::Builder;
@@ -114,7 +128,8 @@ where
     D: Deserializer<'de>,
 {
     let s = String::deserialize(deserializer)?;
-    let (precision, scale) = s
+    let binding = s.replace(" ", "");
+    let (precision, scale) = binding
         .trim_start_matches(r"decimal(")
         .trim_end_matches(')')
         .split_once(',')
@@ -244,7 +259,13 @@ impl<'de> Deserialize<'de> for StructType {
 }
 
 impl StructType {
-    /// Create new struct type
+    /// Creates a new StructType with the given fields
+    ///
+    /// # Arguments
+    /// * `fields` - Vector of StructField that define the structure
+    ///
+    /// The method automatically builds a lookup table mapping field IDs to their position
+    /// in the fields vector for efficient field access by ID.
     pub fn new(fields: Vec<StructField>) -> Self {
         let lookup = fields
             .iter()
@@ -254,29 +275,88 @@ impl StructType {
         StructType { fields, lookup }
     }
 
+    /// Creates a new StructTypeBuilder to construct a StructType using the builder pattern
+    ///
+    /// This is the recommended way to construct complex StructType instances
+    /// when you need to add fields incrementally or conditionally.
     pub fn builder() -> StructTypeBuilder {
         StructTypeBuilder::default()
     }
 
-    /// Get structfield with certain id
+    /// Gets a reference to the StructField at the given index
+    ///
+    /// # Arguments
+    /// * `index` - The index of the field to retrieve
+    ///
+    /// # Returns
+    /// * `Some(&StructField)` if a field exists at that index
+    /// * `None` if no field exists at that index
     pub fn get(&self, index: usize) -> Option<&StructField> {
         self.lookup
             .get(&(index as i32))
             .map(|idx| &self.fields[*idx])
     }
-    /// Get structfield with certain name
+
+    /// Gets a reference to the StructField with the given name
+    ///
+    /// # Arguments
+    /// * `name` - The name of the field to retrieve
+    ///
+    /// # Returns
+    /// * `Some(&StructField)` if a field with the given name exists
+    /// * `None` if no field with that name exists
     pub fn get_name(&self, name: &str) -> Option<&StructField> {
-        self.fields.iter().find(|field| field.name == name)
+        let res = self.fields.iter().find(|field| field.name == name);
+        if res.is_some() {
+            return res;
+        }
+        let parts: Vec<&str> = name.split('.').collect();
+        let mut current_struct = self;
+        let mut current_field = None;
+
+        for (i, part) in parts.iter().enumerate() {
+            current_field = current_struct
+                .fields
+                .iter()
+                .find(|field| field.name == *part);
+
+            if i == parts.len() - 1 || current_field.is_none() {
+                return current_field;
+            }
+
+            if let Some(field) = current_field {
+                if let Type::Struct(struct_type) = &field.field_type {
+                    current_struct = struct_type;
+                } else {
+                    return None;
+                }
+            }
+        }
+
+        current_field
     }
 
+    /// Returns the number of fields in this struct
+    ///
+    /// # Returns
+    /// * The total count of StructFields contained in this struct
     pub fn len(&self) -> usize {
         self.fields.len()
     }
 
+    /// Returns true if the struct contains no fields
+    ///
+    /// # Returns
+    /// * `true` if this struct has no fields
+    /// * `false` if this struct has at least one field
     pub fn is_empty(&self) -> bool {
         self.fields.is_empty()
     }
 
+    /// Returns an iterator over all fields in this struct
+    ///
+    /// # Returns
+    /// * An iterator yielding references to each StructField in order
     pub fn iter(&self) -> Iter<'_, StructField> {
         self.fields.iter()
     }
@@ -310,6 +390,14 @@ pub struct StructField {
 }
 
 impl StructField {
+    /// Creates a new StructField with the given parameters
+    ///
+    /// # Arguments
+    /// * `id` - Unique identifier for this field within the table schema
+    /// * `name` - Name of the field
+    /// * `required` - Whether this field is required (true) or optional (false)
+    /// * `field_type` - The data type of this field
+    /// * `doc` - Optional documentation string for this field
     pub fn new(id: i32, name: &str, required: bool, field_type: Type, doc: Option<String>) -> Self {
         Self {
             id,
