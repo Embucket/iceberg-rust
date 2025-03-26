@@ -137,7 +137,7 @@ where
 
     Ok(PrimitiveType::Decimal {
         precision: precision.parse().map_err(D::Error::custom)?,
-        scale: scale.trim().parse().map_err(D::Error::custom)?,
+        scale: scale.parse().map_err(D::Error::custom)?,
     })
 }
 
