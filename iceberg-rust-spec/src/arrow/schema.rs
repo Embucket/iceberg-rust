@@ -149,7 +149,7 @@ impl TryFrom<&DataType> for Type {
             DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::UInt32 => {
                 Ok(Type::Primitive(PrimitiveType::Int))
             }
-            DataType::Int64 | DataType::UInt64=> Ok(Type::Primitive(PrimitiveType::Long)),
+            DataType::Int64 | DataType::UInt64 => Ok(Type::Primitive(PrimitiveType::Long)),
             DataType::Float32 => Ok(Type::Primitive(PrimitiveType::Float)),
             DataType::Float64 => Ok(Type::Primitive(PrimitiveType::Double)),
             DataType::Decimal128(precision, scale) => Ok(Type::Primitive(PrimitiveType::Decimal {

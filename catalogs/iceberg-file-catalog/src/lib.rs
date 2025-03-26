@@ -130,7 +130,6 @@ impl Catalog for FileCatalog {
             .into_iter()
             .map(|x| self.namespace(x.as_ref()))
             .collect::<Result<_, IcebergError>>()
-            .map_err(IcebergError::from)
     }
     async fn tabular_exists(&self, identifier: &Identifier) -> Result<bool, IcebergError> {
         self.metadata_location(identifier)
@@ -172,7 +171,13 @@ impl Catalog for FileCatalog {
 
         match metadata {
             TabularMetadata::Table(metadata) => Ok(Tabular::Table(
-                Table::new(identifier.clone(), self.clone(), metadata).await?,
+                Table::new(
+                    identifier.clone(),
+                    self.clone(),
+                    object_store.clone(),
+                    metadata,
+                )
+                .await?,
             )),
             TabularMetadata::View(metadata) => Ok(Tabular::View(
                 View::new(identifier.clone(), self.clone(), metadata).await?,
@@ -201,7 +206,7 @@ impl Catalog for FileCatalog {
 
         // Write metadata to object_store
         let bucket = Bucket::from_path(&location)?;
-        let object_store = self.object_store(bucket);
+        let object_store = self.default_object_store(bucket);
 
         let metadata_location = location + "/metadata/v0.metadata.json";
 
@@ -215,7 +220,13 @@ impl Catalog for FileCatalog {
             identifier.clone(),
             (metadata_location.clone(), metadata.clone().into()),
         );
-        Ok(Table::new(identifier.clone(), self.clone(), metadata).await?)
+        Ok(Table::new(
+            identifier.clone(),
+            self.clone(),
+            object_store.clone(),
+            metadata,
+        )
+        .await?)
     }
 
     async fn create_view(
@@ -237,7 +248,7 @@ impl Catalog for FileCatalog {
 
         // Write metadata to object_store
         let bucket = Bucket::from_path(&location)?;
-        let object_store = self.object_store(bucket);
+        let object_store = self.default_object_store(bucket);
 
         let metadata_location = location + "/metadata/v0.metadata.json";
 
@@ -280,7 +291,7 @@ impl Catalog for FileCatalog {
 
         // Write metadata to object_store
         let bucket = Bucket::from_path(&location)?;
-        let object_store = self.object_store(bucket);
+        let object_store = self.default_object_store(bucket);
 
         let metadata_location = location + "/metadata/v0.metadata.json";
 
@@ -346,8 +357,8 @@ impl Catalog for FileCatalog {
 
         object_store
             .copy_if_not_exists(
-                &temp_metadata_location.into(),
-                &metadata_location.as_str().into(),
+                &strip_prefix(&temp_metadata_location).into(),
+                &strip_prefix(&metadata_location).into(),
             )
             .await?;
 
@@ -358,7 +369,13 @@ impl Catalog for FileCatalog {
             (metadata_location.clone(), metadata.clone().into()),
         );
 
-        Ok(Table::new(identifier.clone(), self.clone(), metadata).await?)
+        Ok(Table::new(
+            identifier.clone(),
+            self.clone(),
+            object_store.clone(),
+            metadata,
+        )
+        .await?)
     }
 
     async fn update_view(
@@ -396,8 +413,8 @@ impl Catalog for FileCatalog {
 
                 object_store
                     .copy_if_not_exists(
-                        &temp_metadata_location.into(),
-                        &metadata_location.as_str().into(),
+                        &strip_prefix(&temp_metadata_location).into(),
+                        &strip_prefix(&metadata_location).into(),
                     )
                     .await?;
 
@@ -457,8 +474,8 @@ impl Catalog for FileCatalog {
 
                 object_store
                     .copy_if_not_exists(
-                        &temp_metadata_location.into(),
-                        &metadata_location.as_str().into(),
+                        &strip_prefix(&temp_metadata_location).into(),
+                        &strip_prefix(&metadata_location).into(),
                     )
                     .await?;
 
@@ -491,13 +508,12 @@ impl Catalog for FileCatalog {
     ) -> Result<Table, IcebergError> {
         unimplemented!()
     }
-
-    fn object_store(&self, bucket: Bucket) -> Arc<dyn object_store::ObjectStore> {
-        Arc::new(self.object_store.build(bucket).unwrap())
-    }
 }
 
 impl FileCatalog {
+    fn default_object_store(&self, bucket: Bucket) -> Arc<dyn object_store::ObjectStore> {
+        Arc::new(self.object_store.build(bucket).unwrap())
+    }
     fn namespace_path(&self, namespace: &str) -> String {
         self.path.as_str().trim_end_matches('/').to_owned() + "/" + namespace
     }
@@ -523,7 +539,21 @@ impl FileCatalog {
             .try_collect()
             .await
             .map_err(IcebergError::from)?;
-        files.sort_unstable();
+        files.sort_by(|x, y| {
+            let x = x
+                .trim_start_matches((strip_prefix(&path) + "/v").trim_start_matches("/"))
+                .trim_end_matches("/")
+                .trim_end_matches(".metadata.json")
+                .parse::<usize>()
+                .unwrap();
+            let y = y
+                .trim_start_matches((strip_prefix(&path) + "/v").trim_start_matches("/"))
+                .trim_end_matches("/")
+                .trim_end_matches(".metadata.json")
+                .parse::<usize>()
+                .unwrap();
+            x.cmp(&y)
+        });
         files
             .into_iter()
             .last()
@@ -623,7 +653,6 @@ impl CatalogList for FileCatalogList {
             .into_iter()
             .map(|x| self.parse_catalog(x.as_ref()))
             .collect::<Result<_, IcebergError>>()
-            .map_err(IcebergError::from)
             .unwrap()
     }
 }
@@ -642,9 +671,13 @@ pub mod tests {
     };
     use iceberg_rust::{
         catalog::{namespace::Namespace, Catalog},
-        object_store::ObjectStoreBuilder,
+        object_store::{Bucket, ObjectStoreBuilder},
+        spec::util::strip_prefix,
     };
-    use std::sync::Arc;
+    use std::{sync::Arc, time::Duration};
+    use testcontainers::{core::ExecCommand, runners::AsyncRunner, ImageExt};
+    use testcontainers_modules::localstack::LocalStack;
+    use tokio::time::sleep;
     // use testcontainers::{core::ExecCommand, runners::AsyncRunner, ImageExt};
     // use testcontainers_modules::localstack::LocalStack;
 
@@ -652,41 +685,48 @@ pub mod tests {
 
     #[tokio::test]
     async fn test_create_update_drop_table() {
-        // let localstack = LocalStack::default()
-        //     .with_env_var("SERVICES", "s3")
-        //     .with_env_var("AWS_ACCESS_KEY_ID", "user")
-        //     .with_env_var("AWS_SECRET_ACCESS_KEY", "password")
-        //     .start()
-        //     .await
-        //     .unwrap();
+        let localstack = LocalStack::default()
+            .with_env_var("SERVICES", "s3")
+            .with_env_var("AWS_ACCESS_KEY_ID", "user")
+            .with_env_var("AWS_SECRET_ACCESS_KEY", "password")
+            .start()
+            .await
+            .unwrap();
 
-        // localstack
-        //     .exec(ExecCommand::new(vec![
-        //         "awslocal",
-        //         "s3api",
-        //         "create-bucket",
-        //         "--bucket",
-        //         "warehouse",
-        //     ]))
-        //     .await
-        //     .unwrap();
+        let command = localstack
+            .exec(ExecCommand::new(vec![
+                "awslocal",
+                "s3api",
+                "create-bucket",
+                "--bucket",
+                "warehouse",
+            ]))
+            .await
+            .unwrap();
 
-        // let localstack_host = localstack.get_host().await.unwrap();
-        // let localstack_port = localstack.get_host_port_ipv4(4566).await.unwrap();
+        while command.exit_code().await.unwrap().is_none() {
+            sleep(Duration::from_millis(100)).await;
+        }
 
-        // let object_store = ObjectStoreBuilder::aws()
-        //     .with_config("aws_access_key_id".parse().unwrap(), "user")
-        //     .with_config("aws_secret_access_key".parse().unwrap(), "password")
-        //     .with_config(
-        //         "endpoint".parse().unwrap(),
-        //         format!("http://{}:{}", localstack_host, localstack_port),
-        //     )
-        //     .with_config("region".parse().unwrap(), "us-east-1")
-        //     .with_config("allow_http".parse().unwrap(), "true");
-        let object_store = ObjectStoreBuilder::memory();
+        let localstack_host = localstack.get_host().await.unwrap();
+        let localstack_port = localstack.get_host_port_ipv4(4566).await.unwrap();
 
-        let iceberg_catalog: Arc<dyn Catalog> =
-            Arc::new(FileCatalog::new("/warehouse", object_store).await.unwrap());
+        let object_store = ObjectStoreBuilder::s3()
+            .with_config("aws_access_key_id".parse().unwrap(), "user")
+            .with_config("aws_secret_access_key".parse().unwrap(), "password")
+            .with_config(
+                "endpoint".parse().unwrap(),
+                format!("http://{}:{}", localstack_host, localstack_port),
+            )
+            .with_config("region".parse().unwrap(), "us-east-1")
+            .with_config("allow_http".parse().unwrap(), "true");
+        // let object_store = ObjectStoreBuilder::memory();
+
+        let iceberg_catalog: Arc<dyn Catalog> = Arc::new(
+            FileCatalog::new("s3://warehouse", object_store.clone())
+                .await
+                .unwrap(),
+        );
 
         let catalog = Arc::new(
             IcebergCatalog::new(iceberg_catalog.clone(), None)
@@ -696,7 +736,7 @@ pub mod tests {
 
         let state = SessionStateBuilder::new()
             .with_default_features()
-            .with_query_planner(Arc::new(IcebergQueryPlanner {}))
+            .with_query_planner(Arc::new(IcebergQueryPlanner::new()))
             .build();
 
         let ctx = SessionContext::new_with_state(state);
@@ -748,7 +788,7 @@ pub mod tests {
     L_RECEIPTDATE DATE NOT NULL, 
     L_SHIPINSTRUCT VARCHAR NOT NULL, 
     L_SHIPMODE VARCHAR NOT NULL, 
-    L_COMMENT VARCHAR NOT NULL ) STORED AS ICEBERG LOCATION '/warehouse/tpch/lineitem' PARTITIONED BY ( \"month(L_SHIPDATE)\" );";
+    L_COMMENT VARCHAR NOT NULL ) STORED AS ICEBERG LOCATION 's3://warehouse/tpch/lineitem' PARTITIONED BY ( \"month(L_SHIPDATE)\" );";
 
         let plan = ctx.state().create_logical_plan(sql).await.unwrap();
 
@@ -811,7 +851,7 @@ pub mod tests {
                     if product_id.unwrap() == 24027 {
                         assert_eq!(amount.unwrap(), 24.0)
                     } else if product_id.unwrap() == 63700 {
-                        assert_eq!(amount.unwrap(), 8.0)
+                        assert_eq!(amount.unwrap(), 23.0)
                     }
                 }
                 once = true
@@ -820,10 +860,12 @@ pub mod tests {
 
         assert!(once);
 
-        let object_store = iceberg_catalog.object_store(iceberg_rust::object_store::Bucket::Local);
+        let object_store = object_store
+            .build(Bucket::from_path("s3://warehouse").unwrap())
+            .unwrap();
 
         let version_hint = object_store
-            .get(&"/warehouse/tpch/lineitem/metadata/version-hint.text".into())
+            .get(&strip_prefix("s3://warehouse/tpch/lineitem/metadata/version-hint.text").into())
             .await
             .unwrap()
             .bytes()
@@ -832,7 +874,7 @@ pub mod tests {
 
         assert_eq!(
             std::str::from_utf8(&version_hint).unwrap(),
-            "/warehouse/tpch/lineitem/metadata/v1.metadata.json"
+            "s3://warehouse/tpch/lineitem/metadata/v1.metadata.json"
         );
     }
 

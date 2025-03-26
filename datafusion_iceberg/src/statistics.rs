@@ -12,6 +12,7 @@ use iceberg_rust::spec::{
     values::Value,
 };
 use iceberg_rust::{catalog::tabular::Tabular, error::Error, table::Table};
+use itertools::Itertools;
 
 use super::table::DataFusionTable;
 
@@ -21,7 +22,7 @@ impl DataFusionTable {
             Tabular::Table(table) => table_statistics(table, &self.snapshot_range).await,
             Tabular::View(_) => Err(Error::NotSupported("Statistics for views".to_string())),
             Tabular::MaterializedView(mv) => {
-                let table = mv.storage_table().await.map_err(Error::from)?;
+                let table = mv.storage_table().await?;
                 table_statistics(&table, &self.snapshot_range).await
             }
         }
@@ -36,8 +37,17 @@ pub async fn table_statistics(
         .1
         .and_then(|snapshot_id| table.metadata().schema(snapshot_id).ok().cloned())
         .unwrap_or_else(|| table.current_schema(None).unwrap().clone());
+
+    let sequence_number_range = [snapshot_range.0, snapshot_range.1]
+        .iter()
+        .map(|x| x.and_then(|y| table.metadata().sequence_number(y)))
+        .collect_tuple::<(Option<i64>, Option<i64>)>()
+        .unwrap();
+
     let manifests = table.manifests(snapshot_range.0, snapshot_range.1).await?;
-    let datafiles = table.datafiles(&manifests, None).await?;
+    let datafiles = table
+        .datafiles(&manifests, None, sequence_number_range)
+        .await?;
     datafiles
         .try_filter(|manifest| future::ready(!matches!(manifest.status(), Status::Deleted)))
         .try_fold(
@@ -49,8 +59,8 @@ pub async fn table_statistics(
                         null_count: Precision::Absent,
                         max_value: Precision::Absent,
                         min_value: Precision::Absent,
+                        distinct_count: Precision::Absent,
                         sum_value: Precision::Absent,
-                        distinct_count: Precision::Absent
                     };
                     schema.fields().len()
                 ],
@@ -72,8 +82,8 @@ pub async fn table_statistics(
                             null_count: acc.null_count.add(&x.null_count),
                             max_value: acc.max_value.max(&x.max_value),
                             min_value: acc.min_value.min(&x.min_value),
-                            sum_value: acc.sum_value.add(&x.sum_value),
                             distinct_count: acc.distinct_count.add(&x.distinct_count),
+                            sum_value: acc.sum_value.add(&x.sum_value),
                         })
                         .collect(),
                 })
@@ -116,13 +126,13 @@ fn column_statistics<'a>(
                     ))
                 })
                 .unwrap_or(Precision::Absent),
-            sum_value: Precision::Absent,
             distinct_count: data_file
                 .distinct_counts()
                 .as_ref()
                 .and_then(|x| x.get(&id))
                 .map(|x| Precision::Exact(*x as usize))
                 .unwrap_or(Precision::Absent),
+            sum_value: Precision::Absent,
         }
     })
 }

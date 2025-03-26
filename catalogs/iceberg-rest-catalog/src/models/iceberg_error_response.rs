@@ -9,19 +9,18 @@
  */
 
 use crate::models;
+use serde::{Deserialize, Serialize};
 
 /// IcebergErrorResponse : JSON wrapper for all error responses (non-2xx)
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
 pub struct IcebergErrorResponse {
     #[serde(rename = "error")]
-    pub error: Box<models::ErrorModel>,
+    pub error: models::ErrorModel,
 }
 
 impl IcebergErrorResponse {
     /// JSON wrapper for all error responses (non-2xx)
     pub fn new(error: models::ErrorModel) -> IcebergErrorResponse {
-        IcebergErrorResponse {
-            error: Box::new(error),
-        }
+        IcebergErrorResponse { error }
     }
 }

@@ -9,6 +9,7 @@
  */
 
 use crate::models;
+use serde::{Deserialize, Serialize};
 
 /// ErrorModel : JSON error payload returned in a response with further details on the error
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]

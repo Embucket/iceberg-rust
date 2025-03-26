@@ -9,6 +9,7 @@
  */
 
 use crate::models;
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
 pub struct GetNamespaceResponse {
@@ -16,11 +17,7 @@ pub struct GetNamespaceResponse {
     #[serde(rename = "namespace")]
     pub namespace: Vec<String>,
     /// Properties stored on the namespace, if supported by the server. If the server does not support namespace properties, it should return null for this field. If namespace properties are supported, but none are set, it should return an empty object.
-    #[serde(
-        rename = "properties",
-        default,
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "properties", skip_serializing_if = "Option::is_none")]
     pub properties: Option<std::collections::HashMap<String, String>>,
 }
 

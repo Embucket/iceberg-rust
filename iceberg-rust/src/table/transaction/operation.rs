@@ -4,7 +4,11 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use iceberg_rust_spec::manifest_list::{manifest_list_schema_v1, manifest_list_schema_v2};
+use bytes::Bytes;
+use iceberg_rust_spec::manifest_list::{
+    manifest_list_schema_v1, manifest_list_schema_v2, ManifestListEntry,
+};
+use iceberg_rust_spec::snapshot::{Operation as SnapshotOperation, Snapshot};
 use iceberg_rust_spec::spec::table_metadata::TableMetadata;
 use iceberg_rust_spec::spec::{
     manifest::{partition_value_schema, DataFile, ManifestEntry, Status},
@@ -17,6 +21,7 @@ use iceberg_rust_spec::table_metadata::FormatVersion;
 use iceberg_rust_spec::util::strip_prefix;
 use object_store::ObjectStore;
 use smallvec::SmallVec;
+use tokio::task::JoinHandle;
 
 use crate::table::manifest::{ManifestReader, ManifestWriter};
 use crate::table::manifest_list::ManifestListReader;
@@ -51,7 +56,8 @@ pub enum Operation {
     /// Append new files to the table
     Append {
         branch: Option<String>,
-        files: Vec<DataFile>,
+        data_files: Vec<DataFile>,
+        delete_files: Vec<DataFile>,
         additional_summary: Option<HashMap<String, String>>,
     },
     // /// Quickly append new files to the table
@@ -60,7 +66,7 @@ pub enum Operation {
     //     partition_values: Vec<Struct>,
     // },
     // /// Replace files in the table and commit
-    Overwrite {
+    Replace {
         branch: Option<String>,
         files: Vec<DataFile>,
         additional_summary: Option<HashMap<String, String>>,
@@ -90,7 +96,8 @@ impl Operation {
         match self {
             Operation::Append {
                 branch,
-                files: new_files,
+                data_files,
+                delete_files,
                 additional_summary,
             } => {
                 let partition_fields =
@@ -98,13 +105,26 @@ impl Operation {
                 let schema = table_metadata.current_schema(branch.as_deref())?;
                 let old_snapshot = table_metadata.current_snapshot(branch.as_deref())?;
 
+                let snapshot_operation = match (data_files.len(), delete_files.len()) {
+                    (0, 0) => Err(Error::InvalidFormat(
+                        "Empty data and delete files".to_string(),
+                    )),
+                    (_, 0) => Ok(SnapshotOperation::Append),
+                    (0, _) => Ok(SnapshotOperation::Delete),
+                    (_, _) => Ok(SnapshotOperation::Overwrite),
+                }?;
+
+                let old_manifest_list_bytes_opt =
+                    prefetch_manifest_list(old_snapshot, &object_store);
+
                 let partition_column_names = partition_fields
                     .iter()
                     .map(|x| x.name())
                     .collect::<SmallVec<[_; 4]>>();
 
-                let bounding_partition_values = new_files
+                let bounding_partition_values = delete_files
                     .iter()
+                    .chain(data_files.iter())
                     .try_fold(None, |acc, x| {
                         let node = partition_struct_to_vec(x.partition(), &partition_column_names)?;
                         let Some(mut acc) = acc else {
@@ -123,18 +143,12 @@ impl Operation {
                 let mut manifest_list_writer =
                     apache_avro::Writer::new(manifest_list_schema, Vec::new());
 
-                let old_manifest_list_location = old_snapshot.map(|x| x.manifest_list()).cloned();
-
                 // Find a manifest to add the new datafiles
                 let mut existing_file_count = 0;
-                let selected_manifest_opt = if let Some(old_manifest_list_location) =
-                    &old_manifest_list_location
+                let selected_manifest_opt = if let Some(old_manifest_list_bytes) =
+                    old_manifest_list_bytes_opt
                 {
-                    let old_manifest_list_bytes = object_store
-                        .get(&strip_prefix(old_manifest_list_location).as_str().into())
-                        .await?
-                        .bytes()
-                        .await?;
+                    let old_manifest_list_bytes = old_manifest_list_bytes.await??;
 
                     let manifest_list_reader =
                         ManifestListReader::new(old_manifest_list_bytes.as_ref(), table_metadata)?;
@@ -161,6 +175,9 @@ impl Operation {
                     None
                 };
 
+                let selected_manifest_bytes_opt =
+                    prefetch_manifest(&selected_manifest_opt, &object_store);
+
                 let selected_manifest_file_count = selected_manifest_opt
                     .as_ref()
                     .and_then(|selected_manifest| {
@@ -178,7 +195,7 @@ impl Operation {
 
                 let n_splits = compute_n_splits(
                     existing_file_count,
-                    new_files.len(),
+                    delete_files.len() + data_files.len(),
                     selected_manifest_file_count,
                 );
 
@@ -196,16 +213,19 @@ impl Operation {
                 let snapshot_id = generate_snapshot_id();
                 let commit_uuid = &uuid::Uuid::new_v4().to_string();
 
-                let new_datafile_iter = new_files.into_iter().map(|data_file| {
-                    ManifestEntry::builder()
-                        .with_format_version(table_metadata.format_version)
-                        .with_status(Status::Added)
-                        .with_snapshot_id(snapshot_id)
-                        .with_data_file(data_file)
-                        .build()
-                        .map_err(crate::spec::error::Error::from)
-                        .map_err(Error::from)
-                });
+                let new_datafile_iter =
+                    delete_files
+                        .into_iter()
+                        .chain(data_files.into_iter())
+                        .map(|data_file| {
+                            ManifestEntry::builder()
+                                .with_format_version(table_metadata.format_version)
+                                .with_status(Status::Added)
+                                .with_data_file(data_file)
+                                .build()
+                                .map_err(crate::spec::error::Error::from)
+                                .map_err(Error::from)
+                        });
 
                 let manifest_schema = ManifestEntry::schema(
                     &partition_value_schema(&partition_fields)?,
@@ -222,14 +242,10 @@ impl Operation {
                 // Write manifest files
                 // Split manifest file if limit is exceeded
                 if n_splits == 0 {
-                    let mut manifest_writer = if let Some(manifest) = selected_manifest_opt {
-                        let manifest_bytes: Vec<u8> = object_store
-                            .get(&strip_prefix(&manifest.manifest_path).as_str().into())
-                            .await?
-                            .bytes()
-                            .await?
-                            .into();
-
+                    let mut manifest_writer = if let (Some(manifest), Some(manifest_bytes)) =
+                        (selected_manifest_opt, selected_manifest_bytes_opt)
+                    {
+                        let manifest_bytes = manifest_bytes.await??;
                         ManifestWriter::from_existing(
                             &manifest_bytes,
                             manifest,
@@ -259,29 +275,21 @@ impl Operation {
                     manifest_list_writer.append_ser(manifest)?;
                 } else {
                     // Split datafiles
-                    let splits = if let Some(manifest) = selected_manifest_opt {
-                        let manifest_bytes: Vec<u8> = object_store
-                            .get(&strip_prefix(&manifest.manifest_path).as_str().into())
-                            .await?
-                            .bytes()
-                            .await?
-                            .into();
-
-                        let manifest_reader = ManifestReader::new(&*manifest_bytes)?
-                            .map(|x| x.map_err(Error::from))
-                            .map(|entry| {
-                                let mut entry = entry?;
-                                *entry.status_mut() = Status::Existing;
-                                if entry.sequence_number().is_none() {
-                                    *entry.sequence_number_mut() =
-                                        table_metadata.sequence_number(entry.snapshot_id().ok_or(
-                                            apache_avro::Error::DeserializeValue(
-                                                "Snapshot_id missing in Manifest Entry.".to_owned(),
-                                            ),
-                                        )?);
-                                }
-                                Ok(entry)
-                            });
+                    let splits = if let (Some(manifest), Some(manifest_bytes)) =
+                        (selected_manifest_opt, selected_manifest_bytes_opt)
+                    {
+                        let manifest_bytes = manifest_bytes.await??;
+                        let manifest_reader = ManifestReader::new(&*manifest_bytes)?.map(|entry| {
+                            let mut entry = entry?;
+                            *entry.status_mut() = Status::Existing;
+                            if entry.sequence_number().is_none() {
+                                *entry.sequence_number_mut() = Some(manifest.sequence_number);
+                            }
+                            if entry.snapshot_id().is_none() {
+                                *entry.snapshot_id_mut() = Some(manifest.added_snapshot_id);
+                            }
+                            Ok(entry)
+                        });
 
                         split_datafiles(
                             new_datafile_iter.chain(manifest_reader),
@@ -298,24 +306,32 @@ impl Operation {
                         )?
                     };
 
-                    for (i, entries) in splits.into_iter().enumerate() {
-                        let manifest_location =
-                            new_manifest_location(&table_metadata.location, commit_uuid, i);
+                    let manifest_futures = splits
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, entries)| {
+                            let manifest_location =
+                                new_manifest_location(&table_metadata.location, commit_uuid, i);
 
-                        let mut manifest_writer = ManifestWriter::new(
-                            &manifest_location,
-                            snapshot_id,
-                            &manifest_schema,
-                            table_metadata,
-                            branch.as_deref(),
-                        )?;
+                            let mut manifest_writer = ManifestWriter::new(
+                                &manifest_location,
+                                snapshot_id,
+                                &manifest_schema,
+                                table_metadata,
+                                branch.as_deref(),
+                            )?;
 
-                        for manifest_entry in entries {
-                            manifest_writer.append(manifest_entry)?;
-                        }
+                            for manifest_entry in entries {
+                                manifest_writer.append(manifest_entry)?;
+                            }
 
-                        let manifest = manifest_writer.finish(object_store.clone()).await?;
+                            Ok::<_, Error>(manifest_writer.finish(object_store.clone()))
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
 
+                    let manifests = futures::future::try_join_all(manifest_futures).await?;
+
+                    for manifest in manifests {
                         manifest_list_writer.append_ser(manifest)?;
                     }
                 };
@@ -333,13 +349,9 @@ impl Operation {
                 snapshot_builder
                     .with_snapshot_id(snapshot_id)
                     .with_manifest_list(new_manifest_list_location)
-                    .with_sequence_number(
-                        old_snapshot
-                            .map(|x| *x.sequence_number() + 1)
-                            .unwrap_or_default(),
-                    )
+                    .with_sequence_number(table_metadata.last_sequence_number + 1)
                     .with_summary(Summary {
-                        operation: iceberg_rust_spec::spec::snapshot::Operation::Append,
+                        operation: snapshot_operation,
                         other: additional_summary.unwrap_or_default(),
                     })
                     .with_schema_id(*schema.schema_id());
@@ -367,7 +379,7 @@ impl Operation {
                     ],
                 ))
             }
-            Operation::Overwrite {
+            Operation::Replace {
                 branch,
                 files,
                 additional_summary,
@@ -382,18 +394,6 @@ impl Operation {
                     .map(|x| x.name())
                     .collect::<SmallVec<[_; 4]>>();
 
-                let bounding_partition_values = files
-                    .iter()
-                    .try_fold(None, |acc, x| {
-                        let node = partition_struct_to_vec(x.partition(), &partition_column_names)?;
-                        let Some(mut acc) = acc else {
-                            return Ok::<_, Error>(Some(Rectangle::new(node.clone(), node)));
-                        };
-                        acc.expand_with_node(node);
-                        Ok(Some(acc))
-                    })?
-                    .ok_or(Error::NotFound("Bounding partition values".to_owned()))?;
-
                 let manifest_list_schema = match table_metadata.format_version {
                     FormatVersion::V1 => manifest_list_schema_v1(),
                     FormatVersion::V2 => manifest_list_schema_v2(),
@@ -407,13 +407,13 @@ impl Operation {
                 let snapshot_id = generate_snapshot_id();
                 let sequence_number = table_metadata.last_sequence_number + 1;
 
-                let new_datafile_iter = files.into_iter().map(|data_file| {
+                let new_datafile_iter = files.iter().map(|data_file| {
                     ManifestEntry::builder()
                         .with_format_version(table_metadata.format_version)
                         .with_status(Status::Added)
                         .with_snapshot_id(snapshot_id)
                         .with_sequence_number(sequence_number)
-                        .with_data_file(data_file)
+                        .with_data_file(data_file.clone())
                         .build()
                         .map_err(crate::spec::error::Error::from)
                         .map_err(Error::from)
@@ -455,6 +455,19 @@ impl Operation {
 
                     manifest_list_writer.append_ser(manifest)?;
                 } else {
+                    let bounding_partition_values = files
+                        .iter()
+                        .try_fold(None, |acc, x| {
+                            let node =
+                                partition_struct_to_vec(x.partition(), &partition_column_names)?;
+                            let Some(mut acc) = acc else {
+                                return Ok::<_, Error>(Some(Rectangle::new(node.clone(), node)));
+                            };
+                            acc.expand_with_node(node);
+                            Ok(Some(acc))
+                        })?
+                        .ok_or(Error::NotFound("Bounding partition values".to_owned()))?;
+
                     // Split datafiles
                     let splits = split_datafiles(
                         new_datafile_iter,
@@ -565,6 +578,48 @@ impl Operation {
             }
         }
     }
+}
+
+fn prefetch_manifest(
+    selected_manifest_opt: &Option<ManifestListEntry>,
+    object_store: &Arc<dyn ObjectStore>,
+) -> Option<JoinHandle<Result<Bytes, object_store::Error>>> {
+    selected_manifest_opt.as_ref().map(|selected_manifest| {
+        tokio::task::spawn({
+            let object_store = object_store.clone();
+            let path = selected_manifest.manifest_path.clone();
+            async move {
+                object_store
+                    .get(&strip_prefix(&path).as_str().into())
+                    .await?
+                    .bytes()
+                    .await
+            }
+        })
+    })
+}
+
+fn prefetch_manifest_list(
+    old_snapshot: Option<&Snapshot>,
+    object_store: &Arc<dyn ObjectStore>,
+) -> Option<JoinHandle<Result<Bytes, object_store::Error>>> {
+    old_snapshot
+        .map(|x| x.manifest_list())
+        .cloned()
+        .as_ref()
+        .map(|old_manifest_list_location| {
+            tokio::task::spawn({
+                let object_store = object_store.clone();
+                let old_manifest_list_location = old_manifest_list_location.clone();
+                async move {
+                    object_store
+                        .get(&strip_prefix(&old_manifest_list_location).as_str().into())
+                        .await?
+                        .bytes()
+                        .await
+                }
+            })
+        })
 }
 
 fn new_manifest_location(table_metadata_location: &str, commit_uuid: &String, i: usize) -> String {

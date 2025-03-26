@@ -4,9 +4,9 @@
 
 use async_trait::async_trait;
 use chrono::DateTime;
-use core::panic;
-use datafusion_expr::{dml::InsertOp, utils::conjunction};
-use futures::TryStreamExt;
+use datafusion_expr::{dml::InsertOp, utils::conjunction, JoinType};
+use futures::{stream, StreamExt, TryStreamExt};
+use itertools::Itertools;
 use object_store::ObjectMeta;
 use std::{
     any::Any,
@@ -18,14 +18,14 @@ use std::{
 use tokio::sync::{RwLock, RwLockWriteGuard};
 
 use datafusion::{
-    arrow::datatypes::{Field, SchemaRef},
+    arrow::datatypes::{Field, Schema as ArrowSchema, SchemaRef},
     catalog::Session,
     common::{not_impl_err, plan_err, DataFusionError, SchemaExt},
     datasource::{
         file_format::{parquet::ParquetFormat, FileFormat},
         listing::PartitionedFile,
         object_store::ObjectStoreUrl,
-        physical_plan::FileScanConfig,
+        physical_plan::{parquet::source::ParquetSource, FileScanConfig},
         TableProvider, ViewTable,
     },
     execution::{context::SessionState, TaskContext},
@@ -33,30 +33,33 @@ use datafusion::{
     physical_expr::create_physical_expr,
     physical_optimizer::pruning::PruningPredicate,
     physical_plan::{
+        expressions::Column,
         insert::{DataSink, DataSinkExec},
+        joins::{HashJoinExec, PartitionMode},
         metrics::MetricsSet,
-        DisplayAs, DisplayFormatType, ExecutionPlan, SendableRecordBatchStream, Statistics,
+        projection::ProjectionExec,
+        union::UnionExec,
+        DisplayAs, DisplayFormatType, ExecutionPlan, PhysicalExpr, SendableRecordBatchStream,
+        Statistics,
     },
     prelude::Expr,
     scalar::ScalarValue,
-    sql::parser::DFParser,
+    sql::parser::DFParserBuilder,
 };
 
 use crate::{
     error::Error as DataFusionIcebergError,
-    pruning_statistics::{PruneDataFiles, PruneManifests},
+    pruning_statistics::{transform_predicate, PruneDataFiles, PruneManifests},
     statistics::manifest_statistics,
 };
 
 use iceberg_rust::spec::{
+    arrow::schema::PARQUET_FIELD_ID_META_KEY,
     manifest::{Content, ManifestEntry, Status},
     util,
+    values::{Struct, Value},
 };
-use iceberg_rust::spec::{
-    schema::Schema,
-    types::{StructField, StructType},
-    view_metadata::ViewRepresentation,
-};
+use iceberg_rust::spec::{schema::Schema, view_metadata::ViewRepresentation};
 use iceberg_rust::{
     arrow::write::write_parquet_partitioned, catalog::tabular::Tabular, error::Error,
     materialized_view::MaterializedView, table::Table, view::View,
@@ -148,7 +151,7 @@ impl DataFusionTable {
 #[async_trait]
 impl TableProvider for DataFusionTable {
     fn as_any(&self) -> &dyn Any {
-        &self.tabular
+        self
     }
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
@@ -179,7 +182,7 @@ impl TableProvider for DataFusionTable {
                 let sql = match &version.representations[0] {
                     ViewRepresentation::Sql { sql, .. } => sql,
                 };
-                let statement = DFParser::new(sql)?.parse_statement()?;
+                let statement = DFParserBuilder::new(sql).build()?.parse_statement()?;
                 let logical_plan = session_state.statement_to_plan(statement).await?;
                 ViewTable::try_new(logical_plan, Some(sql.clone()))?
                     .scan(session, projection, filters, limit)
@@ -281,22 +284,16 @@ async fn table_scan(
         .runtime_env()
         .register_object_store(object_store_url.as_ref(), table.object_store());
 
-    // All files have to be grouped according to their partition values. This is done by using a HashMap with the partition values as the key.
-    // This way data files with the same partition value are mapped to the same vector.
-    let mut data_file_groups: HashMap<Vec<ScalarValue>, Vec<PartitionedFile>> = HashMap::new();
-    let mut equality_delete_file_groups: HashMap<Vec<ScalarValue>, Vec<PartitionedFile>> =
-        HashMap::new();
-
     let partition_fields = &snapshot_range
         .1
         .and_then(|snapshot_id| table.metadata().partition_fields(snapshot_id).ok())
         .unwrap_or_else(|| table.metadata().current_partition_fields(None).unwrap());
 
-    let partition_column_names = partition_fields
+    let sequence_number_range = [snapshot_range.0, snapshot_range.1]
         .iter()
-        .map(|field| Ok(field.source_name().to_owned()))
-        .collect::<Result<HashSet<_>, Error>>()
-        .map_err(DataFusionIcebergError::from)?;
+        .map(|x| x.and_then(|y| table.metadata().sequence_number(y)))
+        .collect_tuple::<(Option<i64>, Option<i64>)>()
+        .unwrap();
 
     // If there is a filter expression the manifests to read are pruned based on the pruning statistics available in the manifest_list file.
     let physical_predicate = if let Some(predicate) = conjunction(filters.iter().cloned()) {
@@ -308,7 +305,43 @@ async fn table_scan(
     } else {
         None
     };
+
+    // Get all partition columns
+    let table_partition_cols: Vec<Field> = partition_fields
+        .iter()
+        .map(|partition_field| {
+            Ok(Field::new(
+                partition_field.name().to_owned(),
+                (&partition_field
+                    .field_type()
+                    .tranform(partition_field.transform())
+                    .map_err(DataFusionIcebergError::from)?)
+                    .try_into()
+                    .map_err(DataFusionIcebergError::from)?,
+                !partition_field.required(),
+            )
+            .with_metadata(HashMap::from_iter(vec![(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                partition_field.field_id().to_string(),
+            )])))
+        })
+        .collect::<Result<Vec<_>, DataFusionError>>()
+        .map_err(DataFusionIcebergError::from)?;
+
+    // All files have to be grouped according to their partition values. This is done by using a HashMap with the partition values as the key.
+    // This way data files with the same partition value are mapped to the same vector.
+    let mut data_file_groups: HashMap<Struct, Vec<ManifestEntry>> = HashMap::new();
+    let mut equality_delete_file_groups: HashMap<Struct, Vec<ManifestEntry>> = HashMap::new();
+
+    // Prune data & delete file and insert them into the according map
     if let Some(physical_predicate) = physical_predicate.clone() {
+        let partition_schema = Arc::new(ArrowSchema::new(table_partition_cols.clone()));
+        let partition_column_names = partition_fields
+            .iter()
+            .map(|field| Ok(field.source_name().to_owned()))
+            .collect::<Result<HashSet<_>, Error>>()
+            .map_err(DataFusionIcebergError::from)?;
+
         let partition_predicates = conjunction(
             filters
                 .iter()
@@ -320,29 +353,29 @@ async fn table_scan(
                         .collect();
                     set.is_subset(&partition_column_names)
                 })
-                .cloned(),
+                .cloned()
+                .map(|x| transform_predicate(x, partition_fields).unwrap()),
         );
 
         let manifests = table
             .manifests(snapshot_range.0, snapshot_range.1)
             .await
-            .map_err(Into::<Error>::into)
             .map_err(DataFusionIcebergError::from)?;
 
         // If there is a filter expression on the partition column, the manifest files to read are pruned.
         let data_files: Vec<ManifestEntry> = if let Some(predicate) = partition_predicates {
             let physical_partition_predicate = create_physical_expr(
                 &predicate,
-                &arrow_schema.as_ref().clone().try_into()?,
+                &partition_schema.clone().try_into()?,
                 session.execution_props(),
             )?;
             let pruning_predicate =
-                PruningPredicate::try_new(physical_partition_predicate, arrow_schema.clone())?;
+                PruningPredicate::try_new(physical_partition_predicate, partition_schema.clone())?;
             let manifests_to_prune =
                 pruning_predicate.prune(&PruneManifests::new(partition_fields, &manifests))?;
 
             table
-                .datafiles(&manifests, Some(manifests_to_prune))
+                .datafiles(&manifests, Some(manifests_to_prune), sequence_number_range)
                 .await
                 .map_err(DataFusionIcebergError::from)?
                 .try_collect()
@@ -350,7 +383,7 @@ async fn table_scan(
                 .map_err(DataFusionIcebergError::from)?
         } else {
             table
-                .datafiles(&manifests, None)
+                .datafiles(&manifests, None, sequence_number_range)
                 .await
                 .map_err(DataFusionIcebergError::from)?
                 .try_collect()
@@ -361,56 +394,29 @@ async fn table_scan(
         let pruning_predicate =
             PruningPredicate::try_new(physical_predicate, arrow_schema.clone())?;
         // After the first pruning stage the data_files are pruned again based on the pruning statistics in the manifest files.
-        let files_to_prune =
-            pruning_predicate.prune(&PruneDataFiles::new(&schema, &arrow_schema, &data_files))?;
+        let files_to_prune = pruning_predicate.prune(&PruneDataFiles::new(
+            &schema,
+            &partition_schema,
+            &data_files,
+        ))?;
 
         data_files
             .into_iter()
             .zip(files_to_prune.into_iter())
             .for_each(|(manifest, prune_file)| {
                 if prune_file && *manifest.status() != Status::Deleted {
-                    let partition_values = manifest
-                        .data_file()
-                        .partition()
-                        .iter()
-                        .map(|value| match value {
-                            Some(v) => ScalarValue::Utf8(Some(serde_json::to_string(v).unwrap())),
-                            None => ScalarValue::Null,
-                        })
-                        .collect::<Vec<ScalarValue>>();
-                    let object_meta = ObjectMeta {
-                        location: util::strip_prefix(manifest.data_file().file_path()).into(),
-                        size: *manifest.data_file().file_size_in_bytes() as usize,
-                        last_modified: {
-                            let last_updated_ms = table.metadata().last_updated_ms;
-                            let secs = last_updated_ms / 1000;
-                            let nsecs = (last_updated_ms % 1000) as u32 * 1000000;
-                            DateTime::from_timestamp(secs, nsecs).unwrap()
-                        },
-                        e_tag: None,
-                        version: None,
-                    };
-                    let manifest_statistics = manifest_statistics(&schema, &manifest);
-                    let file = PartitionedFile {
-                        object_meta,
-                        partition_values,
-                        range: None,
-                        statistics: Some(manifest_statistics),
-                        extensions: None,
-                        metadata_size_hint: None,
-                    };
                     match manifest.data_file().content() {
                         Content::Data => {
                             data_file_groups
-                                .entry(file.partition_values.clone())
+                                .entry(manifest.data_file().partition().clone())
                                 .or_default()
-                                .push(file);
+                                .push(manifest);
                         }
                         Content::EqualityDeletes => {
                             equality_delete_file_groups
-                                .entry(file.partition_values.clone())
+                                .entry(manifest.data_file().partition().clone())
                                 .or_default()
-                                .push(file);
+                                .push(manifest);
                         }
                         Content::PositionDeletes => {
                             panic!("Position deletes not supported.")
@@ -424,7 +430,7 @@ async fn table_scan(
             .await
             .map_err(DataFusionIcebergError::from)?;
         let data_files: Vec<ManifestEntry> = table
-            .datafiles(&manifests, None)
+            .datafiles(&manifests, None, sequence_number_range)
             .await
             .map_err(DataFusionIcebergError::from)?
             .try_collect()
@@ -432,48 +438,18 @@ async fn table_scan(
             .map_err(DataFusionIcebergError::from)?;
         data_files.into_iter().for_each(|manifest| {
             if *manifest.status() != Status::Deleted {
-                let partition_values = manifest
-                    .data_file()
-                    .partition()
-                    .iter()
-                    .map(|value| match value {
-                        Some(v) => ScalarValue::Utf8(Some(serde_json::to_string(v).unwrap())),
-                        None => ScalarValue::Null,
-                    })
-                    .collect::<Vec<ScalarValue>>();
-                let object_meta = ObjectMeta {
-                    location: util::strip_prefix(manifest.data_file().file_path()).into(),
-                    size: *manifest.data_file().file_size_in_bytes() as usize,
-                    last_modified: {
-                        let last_updated_ms = table.metadata().last_updated_ms;
-                        let secs = last_updated_ms / 1000;
-                        let nsecs = (last_updated_ms % 1000) as u32 * 1000000;
-                        DateTime::from_timestamp(secs, nsecs).unwrap()
-                    },
-                    e_tag: None,
-                    version: None,
-                };
-                let manifest_statistics = manifest_statistics(&schema, &manifest);
-                let file = PartitionedFile {
-                    object_meta,
-                    partition_values,
-                    range: None,
-                    statistics: Some(manifest_statistics),
-                    extensions: None,
-                    metadata_size_hint: None,
-                };
                 match manifest.data_file().content() {
                     Content::Data => {
                         data_file_groups
-                            .entry(file.partition_values.clone())
+                            .entry(manifest.data_file().partition().clone())
                             .or_default()
-                            .push(file);
+                            .push(manifest);
                     }
                     Content::EqualityDeletes => {
                         equality_delete_file_groups
-                            .entry(file.partition_values.clone())
+                            .entry(manifest.data_file().partition().clone())
                             .or_default()
-                            .push(file);
+                            .push(manifest);
                     }
                     Content::PositionDeletes => {
                         panic!("Position deletes not supported.")
@@ -483,70 +459,286 @@ async fn table_scan(
         });
     };
 
-    // Get all partition columns
-    let table_partition_cols: Vec<Field> = partition_fields
-        .iter()
-        .map(|partition_field| {
-            Ok(Field::new(
-                partition_field.name().to_owned() + "__partition",
-                (&partition_field
-                    .field_type()
-                    .tranform(partition_field.transform())
-                    .map_err(DataFusionIcebergError::from)?)
-                    .try_into()
-                    .map_err(DataFusionIcebergError::from)?,
-                !partition_field.required(),
-            ))
+    let file_schema: SchemaRef = Arc::new((schema.fields()).try_into().unwrap());
+
+    let projection = projection
+        .cloned()
+        .or_else(|| Some(schema.iter().enumerate().map(|(i, _)| i).collect()));
+
+    let projection_expr: Option<Vec<_>> = projection.as_ref().map(|projection| {
+        projection
+            .iter()
+            .enumerate()
+            .map(|(i, id)| {
+                let name = file_schema.fields[*id].name();
+                (
+                    Arc::new(Column::new(name, i)) as Arc<dyn PhysicalExpr>,
+                    name.to_owned(),
+                )
+            })
+            .collect()
+    });
+
+    let file_source = Arc::new(
+        if let Some(physical_predicate) = physical_predicate.clone() {
+            ParquetSource::default()
+                .with_predicate(Arc::clone(&file_schema), physical_predicate)
+                .with_pushdown_filters(true)
+        } else {
+            ParquetSource::default()
+        },
+    );
+
+    // Create plan for every partition with delete files
+    let mut plans = stream::iter(equality_delete_file_groups.into_iter())
+        .then(|(partition_value, mut delete_files)| {
+            let object_store_url = object_store_url.clone();
+            let table_partition_cols = table_partition_cols.clone();
+            let statistics = statistics.clone();
+            let physical_predicate = physical_predicate.clone();
+            let schema = &schema;
+            let file_schema = file_schema.clone();
+            let file_source = file_source.clone();
+            let projection_expr = projection_expr.clone();
+            let projection = &projection;
+            let mut data_files = data_file_groups
+                .remove(&partition_value)
+                .unwrap_or_default();
+
+            async move {
+                // Sort data & delete files by sequence_number
+                delete_files.sort_by(|x, y| {
+                    x.sequence_number()
+                        .unwrap()
+                        .cmp(&y.sequence_number().unwrap())
+                });
+                data_files.sort_by(|x, y| {
+                    x.sequence_number()
+                        .unwrap()
+                        .cmp(&y.sequence_number().unwrap())
+                });
+
+                let mut data_file_iter = data_files.into_iter().peekable();
+
+                let mut plan = stream::iter(delete_files.iter())
+                    .map(Ok::<_, DataFusionError>)
+                    .try_fold(None, |acc, delete_manifest| {
+                        let object_store_url = object_store_url.clone();
+                        let table_partition_cols = table_partition_cols.clone();
+                        let statistics = statistics.clone();
+                        let physical_predicate = physical_predicate.clone();
+                        let schema = &schema;
+                        let file_schema: Arc<ArrowSchema> = file_schema.clone();
+                        let file_source = file_source.clone();
+                        let mut data_files = Vec::new();
+                        while let Some(data_manifest) = data_file_iter.next_if(|x| {
+                            x.sequence_number().unwrap()
+                                < delete_manifest.sequence_number().unwrap()
+                        }) {
+                            let last_updated_ms = table.metadata().last_updated_ms;
+                            let data_file =
+                                generate_partitioned_file(schema, &data_manifest, last_updated_ms)
+                                    .unwrap();
+                            data_files.push(data_file);
+                        }
+                        async move {
+                            let delete_schema = schema.project(
+                                delete_manifest.data_file().equality_ids().as_ref().unwrap(),
+                            );
+                            let delete_file_schema: SchemaRef =
+                                Arc::new((delete_schema.fields()).try_into().unwrap());
+                            let equality_projection: Option<Vec<usize>> =
+                                match (&projection, delete_manifest.data_file().equality_ids()) {
+                                    (Some(projection), Some(equality_ids)) => {
+                                        let collect: Vec<usize> = schema
+                                            .iter()
+                                            .enumerate()
+                                            .filter_map(|(id, x)| {
+                                                if equality_ids.contains(&x.id)
+                                                    && !projection.contains(&id)
+                                                {
+                                                    Some(id)
+                                                } else {
+                                                    None
+                                                }
+                                            })
+                                            .collect();
+                                        Some([projection.as_slice(), &collect].concat())
+                                    }
+                                    _ => None,
+                                };
+
+                            let last_updated_ms = table.metadata().last_updated_ms;
+                            let delete_file = generate_partitioned_file(
+                                &delete_schema,
+                                delete_manifest,
+                                last_updated_ms,
+                            )?;
+
+                            let delete_file_source = Arc::new(
+                                if let Some(physical_predicate) = physical_predicate.clone() {
+                                    ParquetSource::default()
+                                        .with_predicate(
+                                            Arc::clone(&delete_file_schema),
+                                            physical_predicate,
+                                        )
+                                        .with_pushdown_filters(true)
+                                } else {
+                                    ParquetSource::default()
+                                },
+                            );
+
+                            let delete_file_scan_config = FileScanConfig::new(
+                                object_store_url.clone(),
+                                delete_file_schema,
+                                delete_file_source,
+                            )
+                            .with_file_groups(vec![vec![delete_file]])
+                            .with_statistics(statistics.clone())
+                            .with_limit(limit)
+                            .with_table_partition_cols(table_partition_cols.clone());
+
+                            let left = ParquetFormat::default()
+                                .create_physical_plan(
+                                    session,
+                                    delete_file_scan_config,
+                                    physical_predicate.as_ref(),
+                                )
+                                .await?;
+
+                            let file_scan_config = FileScanConfig::new(
+                                object_store_url,
+                                file_schema.clone(),
+                                file_source.clone(),
+                            )
+                            .with_file_groups(vec![data_files])
+                            .with_statistics(statistics)
+                            .with_projection(equality_projection)
+                            .with_limit(limit)
+                            .with_table_partition_cols(table_partition_cols);
+
+                            let data_files_scan = ParquetFormat::default()
+                                .create_physical_plan(
+                                    session,
+                                    file_scan_config,
+                                    physical_predicate.as_ref(),
+                                )
+                                .await?;
+
+                            let right = if let Some(acc) = acc {
+                                Arc::new(UnionExec::new(vec![acc, data_files_scan]))
+                            } else {
+                                data_files_scan
+                            };
+
+                            let join_on = delete_manifest
+                                .data_file()
+                                .equality_ids()
+                                .as_ref()
+                                .unwrap()
+                                .iter()
+                                .map(|id| {
+                                    let column_name =
+                                        &schema.get(*id as usize).as_ref().unwrap().name;
+                                    let left_column: Arc<dyn PhysicalExpr> = Arc::new(
+                                        Column::new_with_schema(column_name, &left.schema())?,
+                                    );
+                                    let right_column: Arc<dyn PhysicalExpr> = Arc::new(
+                                        Column::new_with_schema(column_name, &right.schema())?,
+                                    );
+                                    Ok((left_column, right_column))
+                                })
+                                .collect::<Result<Vec<_>, DataFusionError>>()?;
+
+                            Ok(Some(Arc::new(HashJoinExec::try_new(
+                                left,
+                                right,
+                                join_on,
+                                None,
+                                &JoinType::RightAnti,
+                                None,
+                                PartitionMode::CollectLeft,
+                                false,
+                            )?)
+                                as Arc<dyn ExecutionPlan>))
+                        }
+                    })
+                    .await
+                    .transpose()
+                    .ok_or(DataFusionError::External(Box::new(Error::InvalidFormat(
+                        "Delete plan".to_owned(),
+                    ))))??;
+
+                let additional_data_files = data_file_iter
+                    .map(|x| {
+                        let last_updated_ms = table.metadata().last_updated_ms;
+                        generate_partitioned_file(schema, &x, last_updated_ms)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+
+                if !additional_data_files.is_empty() {
+                    let file_scan_config =
+                        FileScanConfig::new(object_store_url, file_schema.clone(), file_source)
+                            .with_file_groups(vec![additional_data_files])
+                            .with_statistics(statistics)
+                            .with_projection(projection.as_ref().cloned())
+                            .with_limit(limit)
+                            .with_table_partition_cols(table_partition_cols);
+
+                    let data_files_scan = ParquetFormat::default()
+                        .create_physical_plan(
+                            session,
+                            file_scan_config,
+                            physical_predicate.as_ref(),
+                        )
+                        .await?;
+
+                    plan = Arc::new(UnionExec::new(vec![plan, data_files_scan]));
+                }
+
+                if let Some(projection_expr) = projection_expr {
+                    Ok::<_, DataFusionError>(Arc::new(ProjectionExec::try_new(
+                        projection_expr,
+                        plan,
+                    )?) as Arc<dyn ExecutionPlan>)
+                } else {
+                    Ok(plan)
+                }
+            }
         })
-        .collect::<Result<Vec<_>, DataFusionError>>()
-        .map_err(DataFusionIcebergError::from)?;
+        .try_collect::<Vec<_>>()
+        .await?;
 
-    // Add the partition columns to the table schema
-    let mut schema_builder = StructType::builder();
-    for field in schema.fields().iter() {
-        schema_builder.with_struct_field(field.clone());
-    }
-    for partition_field in partition_fields {
-        schema_builder.with_struct_field(StructField {
-            id: partition_field.field_id(),
-            name: partition_field.name().to_owned() + "__partition",
-            field_type: partition_field
-                .field_type()
-                .tranform(partition_field.transform())
-                .unwrap(),
-            required: true,
-            doc: None,
-        });
-    }
-    let file_schema = Schema::builder()
-        .with_schema_id(*schema.schema_id())
-        .with_fields(
-            schema_builder
-                .build()
-                .map_err(iceberg_rust::spec::error::Error::from)
-                .map_err(DataFusionIcebergError::from)?,
-        )
-        .build()
-        .map_err(iceberg_rust::spec::error::Error::from)
-        .map_err(DataFusionIcebergError::from)?;
+    // Create plan for partitions without delete files
+    let file_groups = data_file_groups
+        .into_values()
+        .map(|x| {
+            x.into_iter()
+                .map(|x| {
+                    let last_updated_ms = table.metadata().last_updated_ms;
+                    generate_partitioned_file(&schema, &x, last_updated_ms).unwrap()
+                })
+                .collect()
+        })
+        .collect();
+    let file_scan_config = FileScanConfig::new(object_store_url, file_schema, file_source)
+        .with_file_groups(file_groups)
+        .with_statistics(statistics)
+        .with_projection(projection)
+        .with_limit(limit)
+        .with_table_partition_cols(table_partition_cols);
 
-    let file_schema: SchemaRef = Arc::new((file_schema.fields()).try_into().unwrap());
-
-    let file_scan_config = FileScanConfig {
-        object_store_url,
-        file_schema,
-        file_groups: data_file_groups.into_values().collect(),
-        constraints: Default::default(),
-        statistics,
-        projection: projection.cloned(),
-        limit,
-        table_partition_cols,
-        output_ordering: vec![],
-    };
-
-    ParquetFormat::default()
+    let other_plan = ParquetFormat::default()
         .create_physical_plan(session, file_scan_config, physical_predicate.as_ref())
-        .await
+        .await?;
+
+    if plans.is_empty() {
+        Ok(other_plan)
+    } else {
+        plans.push(other_plan);
+
+        Ok(Arc::new(UnionExec::new(plans)))
+    }
 }
 
 impl DisplayAs for DataFusionTable {
@@ -592,15 +784,9 @@ impl DataSink for IcebergDataSink {
         }
         .map_err(DataFusionIcebergError::from)?;
 
-        let object_store = table.object_store().clone();
-
-        let metadata_files = write_parquet_partitioned(
-            table.metadata(),
-            data.map_err(Into::into),
-            object_store,
-            self.0.branch.as_deref(),
-        )
-        .await?;
+        let metadata_files =
+            write_parquet_partitioned(table, data.map_err(Into::into), self.0.branch.as_deref())
+                .await?;
 
         let count = metadata_files
             .iter()
@@ -609,7 +795,7 @@ impl DataSink for IcebergDataSink {
 
         table
             .new_transaction(self.0.branch.as_deref())
-            .append(metadata_files)
+            .append_data(metadata_files)
             .commit()
             .await
             .map_err(DataFusionIcebergError::from)?;
@@ -619,9 +805,76 @@ impl DataSink for IcebergDataSink {
     fn metrics(&self) -> Option<MetricsSet> {
         None
     }
-
     fn schema(&self) -> &SchemaRef {
         &self.0.schema
+    }
+}
+
+fn generate_partitioned_file(
+    schema: &Schema,
+    manifest: &ManifestEntry,
+    last_updated_ms: i64,
+) -> Result<PartitionedFile, DataFusionError> {
+    let manifest_statistics = manifest_statistics(schema, manifest);
+    let partition_values = manifest
+        .data_file()
+        .partition()
+        .iter()
+        .map(|x| {
+            x.as_ref()
+                .map(value_to_scalarvalue)
+                .unwrap_or(Ok(ScalarValue::Null))
+        })
+        .collect::<Result<Vec<ScalarValue>, _>>()?;
+    let object_meta = ObjectMeta {
+        location: util::strip_prefix(manifest.data_file().file_path()).into(),
+        size: *manifest.data_file().file_size_in_bytes() as usize,
+        last_modified: {
+            let secs = last_updated_ms / 1000;
+            let nsecs = (last_updated_ms % 1000) as u32 * 1000000;
+            DateTime::from_timestamp(secs, nsecs).unwrap()
+        },
+        e_tag: None,
+        version: None,
+    };
+    let file = PartitionedFile {
+        object_meta,
+        partition_values,
+        range: None,
+        statistics: Some(manifest_statistics),
+        extensions: None,
+        metadata_size_hint: None,
+    };
+    Ok(file)
+}
+
+fn value_to_scalarvalue(value: &Value) -> Result<ScalarValue, DataFusionError> {
+    match value {
+        Value::Boolean(b) => Ok(ScalarValue::Boolean(Some(*b))),
+        Value::Int(i) => Ok(ScalarValue::Int32(Some(*i))),
+        Value::LongInt(l) => Ok(ScalarValue::Int64(Some(*l))),
+        Value::Float(f) => Ok(ScalarValue::Float32(Some(f.into_inner()))),
+        Value::Double(d) => Ok(ScalarValue::Float64(Some(d.into_inner()))),
+        Value::Date(d) => Ok(ScalarValue::Date32(Some(*d))),
+        Value::Time(t) => Ok(ScalarValue::Time64Microsecond(Some(*t))),
+        Value::Timestamp(ts) => Ok(ScalarValue::TimestampMicrosecond(Some(*ts), None)),
+        Value::TimestampTZ(ts) => Ok(ScalarValue::TimestampMicrosecond(
+            Some(*ts),
+            Some("UTC".into()),
+        )),
+        Value::String(s) => Ok(ScalarValue::Utf8(Some(s.clone()))),
+        Value::UUID(u) => Ok(ScalarValue::FixedSizeBinary(
+            16,
+            Some(u.as_bytes().to_vec()),
+        )),
+        Value::Fixed(size, bytes) => Ok(ScalarValue::FixedSizeBinary(
+            *size as i32,
+            Some(bytes.clone()),
+        )),
+        Value::Binary(bytes) => Ok(ScalarValue::Binary(Some(bytes.clone()))),
+        x => Err(DataFusionError::External(Box::new(Error::NotSupported(
+            format!("Conversion from Value {x} to ScalarValue"),
+        )))),
     }
 }
 
@@ -635,7 +888,7 @@ mod tests {
         spec::{
             partition::{PartitionField, Transform},
             schema::Schema,
-            types::{PrimitiveType, StructField, StructType, Type},
+            types::{PrimitiveType, StructField, Type},
         },
     };
     use iceberg_rust::{
@@ -664,46 +917,41 @@ mod tests {
         );
 
         let schema = Schema::builder()
-            .with_fields(
-                StructType::builder()
-                    .with_struct_field(StructField {
-                        id: 1,
-                        name: "id".to_string(),
-                        required: true,
-                        field_type: Type::Primitive(PrimitiveType::Long),
-                        doc: None,
-                    })
-                    .with_struct_field(StructField {
-                        id: 2,
-                        name: "customer_id".to_string(),
-                        required: true,
-                        field_type: Type::Primitive(PrimitiveType::Long),
-                        doc: None,
-                    })
-                    .with_struct_field(StructField {
-                        id: 3,
-                        name: "product_id".to_string(),
-                        required: true,
-                        field_type: Type::Primitive(PrimitiveType::Long),
-                        doc: None,
-                    })
-                    .with_struct_field(StructField {
-                        id: 4,
-                        name: "date".to_string(),
-                        required: true,
-                        field_type: Type::Primitive(PrimitiveType::Date),
-                        doc: None,
-                    })
-                    .with_struct_field(StructField {
-                        id: 5,
-                        name: "amount".to_string(),
-                        required: true,
-                        field_type: Type::Primitive(PrimitiveType::Int),
-                        doc: None,
-                    })
-                    .build()
-                    .unwrap(),
-            )
+            .with_struct_field(StructField {
+                id: 1,
+                name: "id".to_string(),
+                required: true,
+                field_type: Type::Primitive(PrimitiveType::Long),
+                doc: None,
+            })
+            .with_struct_field(StructField {
+                id: 2,
+                name: "customer_id".to_string(),
+                required: true,
+                field_type: Type::Primitive(PrimitiveType::Long),
+                doc: None,
+            })
+            .with_struct_field(StructField {
+                id: 3,
+                name: "product_id".to_string(),
+                required: true,
+                field_type: Type::Primitive(PrimitiveType::Long),
+                doc: None,
+            })
+            .with_struct_field(StructField {
+                id: 4,
+                name: "date".to_string(),
+                required: true,
+                field_type: Type::Primitive(PrimitiveType::Date),
+                doc: None,
+            })
+            .with_struct_field(StructField {
+                id: 5,
+                name: "amount".to_string(),
+                required: true,
+                field_type: Type::Primitive(PrimitiveType::Int),
+                doc: None,
+            })
             .build()
             .unwrap();
 
@@ -895,46 +1143,41 @@ mod tests {
         );
 
         let schema = Schema::builder()
-            .with_fields(
-                StructType::builder()
-                    .with_struct_field(StructField {
-                        id: 1,
-                        name: "id".to_string(),
-                        required: true,
-                        field_type: Type::Primitive(PrimitiveType::Long),
-                        doc: None,
-                    })
-                    .with_struct_field(StructField {
-                        id: 2,
-                        name: "customer_id".to_string(),
-                        required: true,
-                        field_type: Type::Primitive(PrimitiveType::Long),
-                        doc: None,
-                    })
-                    .with_struct_field(StructField {
-                        id: 3,
-                        name: "product_id".to_string(),
-                        required: true,
-                        field_type: Type::Primitive(PrimitiveType::Long),
-                        doc: None,
-                    })
-                    .with_struct_field(StructField {
-                        id: 4,
-                        name: "date".to_string(),
-                        required: true,
-                        field_type: Type::Primitive(PrimitiveType::Date),
-                        doc: None,
-                    })
-                    .with_struct_field(StructField {
-                        id: 5,
-                        name: "amount".to_string(),
-                        required: true,
-                        field_type: Type::Primitive(PrimitiveType::Int),
-                        doc: None,
-                    })
-                    .build()
-                    .unwrap(),
-            )
+            .with_struct_field(StructField {
+                id: 1,
+                name: "id".to_string(),
+                required: true,
+                field_type: Type::Primitive(PrimitiveType::Long),
+                doc: None,
+            })
+            .with_struct_field(StructField {
+                id: 2,
+                name: "customer_id".to_string(),
+                required: true,
+                field_type: Type::Primitive(PrimitiveType::Long),
+                doc: None,
+            })
+            .with_struct_field(StructField {
+                id: 3,
+                name: "product_id".to_string(),
+                required: true,
+                field_type: Type::Primitive(PrimitiveType::Long),
+                doc: None,
+            })
+            .with_struct_field(StructField {
+                id: 4,
+                name: "date".to_string(),
+                required: true,
+                field_type: Type::Primitive(PrimitiveType::Date),
+                doc: None,
+            })
+            .with_struct_field(StructField {
+                id: 5,
+                name: "amount".to_string(),
+                required: true,
+                field_type: Type::Primitive(PrimitiveType::Int),
+                doc: None,
+            })
             .build()
             .unwrap();
 
@@ -960,7 +1203,7 @@ mod tests {
 
         let res = ctx
             .sql(
-                "INSERT INTO orders (id, customer_id, product_id, date, amount) VALUES 
+                "INSERT INTO orders (id, customer_id, product_id, date, amount) VALUES
                 (1, 1, 1, '2020-01-01', 1),
                 (2, 2, 1, '2020-01-01', 1),
                 (3, 3, 1, '2020-01-01', 3),
@@ -1095,46 +1338,41 @@ mod tests {
         );
 
         let schema = Schema::builder()
-            .with_fields(
-                StructType::builder()
-                    .with_struct_field(StructField {
-                        id: 1,
-                        name: "id".to_string(),
-                        required: true,
-                        field_type: Type::Primitive(PrimitiveType::Long),
-                        doc: None,
-                    })
-                    .with_struct_field(StructField {
-                        id: 2,
-                        name: "customer_id".to_string(),
-                        required: true,
-                        field_type: Type::Primitive(PrimitiveType::Long),
-                        doc: None,
-                    })
-                    .with_struct_field(StructField {
-                        id: 3,
-                        name: "product_id".to_string(),
-                        required: true,
-                        field_type: Type::Primitive(PrimitiveType::Long),
-                        doc: None,
-                    })
-                    .with_struct_field(StructField {
-                        id: 4,
-                        name: "date".to_string(),
-                        required: true,
-                        field_type: Type::Primitive(PrimitiveType::Date),
-                        doc: None,
-                    })
-                    .with_struct_field(StructField {
-                        id: 5,
-                        name: "amount".to_string(),
-                        required: true,
-                        field_type: Type::Primitive(PrimitiveType::Int),
-                        doc: None,
-                    })
-                    .build()
-                    .unwrap(),
-            )
+            .with_struct_field(StructField {
+                id: 1,
+                name: "id".to_string(),
+                required: true,
+                field_type: Type::Primitive(PrimitiveType::Long),
+                doc: None,
+            })
+            .with_struct_field(StructField {
+                id: 2,
+                name: "customer_id".to_string(),
+                required: true,
+                field_type: Type::Primitive(PrimitiveType::Long),
+                doc: None,
+            })
+            .with_struct_field(StructField {
+                id: 3,
+                name: "product_id".to_string(),
+                required: true,
+                field_type: Type::Primitive(PrimitiveType::Long),
+                doc: None,
+            })
+            .with_struct_field(StructField {
+                id: 4,
+                name: "date".to_string(),
+                required: true,
+                field_type: Type::Primitive(PrimitiveType::Date),
+                doc: None,
+            })
+            .with_struct_field(StructField {
+                id: 5,
+                name: "amount".to_string(),
+                required: true,
+                field_type: Type::Primitive(PrimitiveType::Int),
+                doc: None,
+            })
             .build()
             .unwrap();
 
@@ -1275,46 +1513,41 @@ mod tests {
         );
 
         let schema = Schema::builder()
-            .with_fields(
-                StructType::builder()
-                    .with_struct_field(StructField {
-                        id: 1,
-                        name: "id".to_string(),
-                        required: true,
-                        field_type: Type::Primitive(PrimitiveType::Long),
-                        doc: None,
-                    })
-                    .with_struct_field(StructField {
-                        id: 2,
-                        name: "customer_id".to_string(),
-                        required: true,
-                        field_type: Type::Primitive(PrimitiveType::Long),
-                        doc: None,
-                    })
-                    .with_struct_field(StructField {
-                        id: 3,
-                        name: "product_id".to_string(),
-                        required: true,
-                        field_type: Type::Primitive(PrimitiveType::Long),
-                        doc: None,
-                    })
-                    .with_struct_field(StructField {
-                        id: 4,
-                        name: "date".to_string(),
-                        required: true,
-                        field_type: Type::Primitive(PrimitiveType::Date),
-                        doc: None,
-                    })
-                    .with_struct_field(StructField {
-                        id: 5,
-                        name: "amount".to_string(),
-                        required: true,
-                        field_type: Type::Primitive(PrimitiveType::Int),
-                        doc: None,
-                    })
-                    .build()
-                    .unwrap(),
-            )
+            .with_struct_field(StructField {
+                id: 1,
+                name: "id".to_string(),
+                required: true,
+                field_type: Type::Primitive(PrimitiveType::Long),
+                doc: None,
+            })
+            .with_struct_field(StructField {
+                id: 2,
+                name: "customer_id".to_string(),
+                required: true,
+                field_type: Type::Primitive(PrimitiveType::Long),
+                doc: None,
+            })
+            .with_struct_field(StructField {
+                id: 3,
+                name: "product_id".to_string(),
+                required: true,
+                field_type: Type::Primitive(PrimitiveType::Long),
+                doc: None,
+            })
+            .with_struct_field(StructField {
+                id: 4,
+                name: "date".to_string(),
+                required: true,
+                field_type: Type::Primitive(PrimitiveType::Date),
+                doc: None,
+            })
+            .with_struct_field(StructField {
+                id: 5,
+                name: "amount".to_string(),
+                required: true,
+                field_type: Type::Primitive(PrimitiveType::Int),
+                doc: None,
+            })
             .build()
             .unwrap();
         let partition_spec = PartitionSpec::builder()
@@ -1356,25 +1589,20 @@ mod tests {
         .expect("Failed to insert values into table");
 
         let view_schema = Schema::builder()
-            .with_fields(
-                StructType::builder()
-                    .with_struct_field(StructField {
-                        id: 3,
-                        name: "product_id".to_string(),
-                        required: true,
-                        field_type: Type::Primitive(PrimitiveType::Long),
-                        doc: None,
-                    })
-                    .with_struct_field(StructField {
-                        id: 5,
-                        name: "amount".to_string(),
-                        required: true,
-                        field_type: Type::Primitive(PrimitiveType::Int),
-                        doc: None,
-                    })
-                    .build()
-                    .unwrap(),
-            )
+            .with_struct_field(StructField {
+                id: 3,
+                name: "product_id".to_string(),
+                required: true,
+                field_type: Type::Primitive(PrimitiveType::Long),
+                doc: None,
+            })
+            .with_struct_field(StructField {
+                id: 5,
+                name: "amount".to_string(),
+                required: true,
+                field_type: Type::Primitive(PrimitiveType::Int),
+                doc: None,
+            })
             .build()
             .unwrap();
 
