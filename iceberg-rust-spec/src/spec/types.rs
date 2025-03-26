@@ -114,7 +114,8 @@ where
     D: Deserializer<'de>,
 {
     let s = String::deserialize(deserializer)?;
-    let (precision, scale) = s
+    let filtered = s.replace(" ", "");
+    let (precision, scale) = filtered
         .trim_start_matches(r"decimal(")
         .trim_end_matches(')')
         .split_once(',')
