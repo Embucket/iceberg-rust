@@ -282,7 +282,7 @@ fn any_iter_to_array(
     }
 }
 
-pub(crate) fn transform_predicate(
+pub fn transform_predicate(
     expr: Expr,
     partition_fields: &[BoundPartitionField],
 ) -> Result<Expr, DataFusionError> {
