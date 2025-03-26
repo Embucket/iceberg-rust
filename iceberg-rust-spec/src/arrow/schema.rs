@@ -146,10 +146,10 @@ impl TryFrom<&DataType> for Type {
     fn try_from(value: &DataType) -> Result<Self, Self::Error> {
         match value {
             DataType::Boolean => Ok(Type::Primitive(PrimitiveType::Boolean)),
-            DataType::Int32 => Ok(Type::Primitive(PrimitiveType::Int)),
+            DataType::Int8 | DataType::Int16 | DataType::Int32 => {
+                Ok(Type::Primitive(PrimitiveType::Int))
+            }
             DataType::Int64 => Ok(Type::Primitive(PrimitiveType::Long)),
-            DataType::UInt32 => Ok(Type::Primitive(PrimitiveType::Int)),
-            DataType::UInt64 => Ok(Type::Primitive(PrimitiveType::Long)),
             DataType::Float32 => Ok(Type::Primitive(PrimitiveType::Float)),
             DataType::Float64 => Ok(Type::Primitive(PrimitiveType::Double)),
             DataType::Decimal128(precision, scale) => Ok(Type::Primitive(PrimitiveType::Decimal {
@@ -538,6 +538,10 @@ mod tests {
                 PARQUET_FIELD_ID_META_KEY.to_string(),
                 "2".to_string(),
             )])),
+            Field::new("field3", DataType::Int16, true).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "3".to_string(),
+            )])),
         ]);
 
         let struct_type: StructType = (&arrow_schema).try_into().unwrap();
@@ -555,6 +559,13 @@ mod tests {
         assert_eq!(
             struct_type[1].field_type,
             Type::Primitive(PrimitiveType::String)
+        );
+        assert_eq!(struct_type[2].id, 3);
+        assert_eq!(struct_type[2].name, "field3");
+        assert!(!struct_type[2].required);
+        assert_eq!(
+            struct_type[2].field_type,
+            Type::Primitive(PrimitiveType::Int)
         );
     }
 
@@ -846,7 +857,7 @@ mod tests {
 
     #[test]
     fn test_arrow_schema_to_struct_type_unsupported_datatype() {
-        let arrow_schema = ArrowSchema::new(vec![Field::new("field1", DataType::Int8, false)
+        let arrow_schema = ArrowSchema::new(vec![Field::new("field1", DataType::UInt8, false)
             .with_metadata(HashMap::from([(
                 PARQUET_FIELD_ID_META_KEY.to_string(),
                 "1".to_string(),
@@ -855,5 +866,32 @@ mod tests {
         let result: Result<StructType, Error> = (&arrow_schema).try_into();
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), Error::NotSupported(_)));
+    }
+
+    #[test]
+    fn test_nested_field_name() {
+        let schema = crate::schema::Schema::builder()
+            .with_schema_id(1)
+            .with_struct_field(StructField::new(
+                1,
+                "nested_object",
+                true,
+                Type::Struct(StructType::new(vec![
+                    StructField::new(
+                        2,
+                        "key1",
+                        true,
+                        Type::Primitive(PrimitiveType::String),
+                        None,
+                    ),
+                    StructField::new(3, "key2", true, Type::Primitive(PrimitiveType::Int), None),
+                ])),
+                None,
+            ))
+            .build()
+            .unwrap();
+
+        let field_name = schema.get_name("nested_object.key1");
+        assert!(field_name.is_some());
     }
 }

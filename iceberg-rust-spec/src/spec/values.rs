@@ -1,5 +1,18 @@
 /*!
- * Value in iceberg
+ * Value types and operations for Iceberg data
+ *
+ * This module implements the runtime value system for Iceberg, including:
+ * - Primitive values (boolean, numeric, string, binary, etc.)
+ * - Complex values (structs, lists, maps)
+ * - Value transformations for partitioning
+ * - Serialization/deserialization to/from various formats
+ * - Value comparison and manipulation operations
+ *
+ * The value system provides:
+ * - Type-safe data representation
+ * - Efficient value storage and access
+ * - Support for partition transforms
+ * - JSON/binary format conversions
  */
 
 use core::panic;
@@ -13,11 +26,14 @@ use std::{
     slice::Iter,
 };
 
-use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Timelike, Utc};
+use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
+use datetime::{
+    date_to_months, date_to_years, datetime_to_days, datetime_to_hours, datetime_to_months,
+    days_to_date, micros_to_datetime,
+};
 use itertools::Itertools;
 use ordered_float::OrderedFloat;
 use rust_decimal::Decimal;
-use rust_decimal::prelude::ToPrimitive;
 use serde::{
     de::{MapAccess, Visitor},
     ser::SerializeStruct,
@@ -34,8 +50,7 @@ use super::{
     types::{PrimitiveType, StructType, Type},
 };
 
-static DAYS_BEFORE_UNIX_EPOCH: i32 = 719163;
-static YEARS_BEFORE_UNIX_EPOCH: i32 = 1970;
+pub static YEARS_BEFORE_UNIX_EPOCH: i32 = 1970;
 
 /// Values present in iceberg type
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -106,10 +121,12 @@ impl From<Value> for ByteBuf {
             Value::UUID(val) => ByteBuf::from(val.as_u128().to_be_bytes()),
             Value::Fixed(_, val) => ByteBuf::from(val),
             Value::Binary(val) => ByteBuf::from(val),
-            Value::Decimal(val) => match val.to_i128() {
-                Some(v) => ByteBuf::from(v.to_be_bytes()),
-                None => ByteBuf::from([]),
-            },
+            Value::Decimal(val) => {
+                // rust_decimal mantissa is 96 bits
+                // so we can remove the first 32 bits of the i128 representation
+                let bytes = val.mantissa().to_be_bytes()[4..].to_vec();
+                ByteBuf::from(bytes)
+            }
             _ => todo!(),
         }
     }
@@ -149,23 +166,57 @@ pub struct Struct {
 }
 
 impl Struct {
-    /// Get reference to partition value
+    /// Gets a reference to the value associated with the given field name
+    ///
+    /// # Arguments
+    /// * `name` - The name of the field to retrieve
+    ///
+    /// # Returns
+    /// * `Some(&Option<Value>)` if the field exists
+    /// * `None` if the field doesn't exist
     pub fn get(&self, name: &str) -> Option<&Option<Value>> {
         self.fields.get(*self.lookup.get(name)?)
     }
-    /// Get mutable reference to partition value
+    /// Gets a mutable reference to the value associated with the given field name
+    ///
+    /// # Arguments
+    /// * `name` - The name of the field to retrieve
+    ///
+    /// # Returns
+    /// * `Some(&mut Option<Value>)` if the field exists
+    /// * `None` if the field doesn't exist
     pub fn get_mut(&mut self, name: &str) -> Option<&mut Option<Value>> {
         self.fields.get_mut(*self.lookup.get(name)?)
     }
 
+    /// Returns an iterator over all field values in this struct
+    ///
+    /// # Returns
+    /// * An iterator yielding references to each optional Value in order
     pub fn iter(&self) -> Iter<'_, Option<Value>> {
         self.fields.iter()
     }
 
+    /// Returns an iterator over all field names in this struct
+    ///
+    /// # Returns
+    /// * An iterator yielding references to each field name in sorted order
     pub fn keys(&self) -> Keys<'_, String, usize> {
         self.lookup.keys()
     }
 
+    /// Casts the struct's values according to a schema and partition specification
+    ///
+    /// # Arguments
+    /// * `schema` - The StructType defining the expected types
+    /// * `partition_spec` - The partition fields specification
+    ///
+    /// # Returns
+    /// * `Ok(Struct)` - A new Struct with values cast to match the schema and partition spec
+    /// * `Err(Error)` - If casting fails or schema references are invalid
+    ///
+    /// This method transforms the struct's values based on the partition specification,
+    /// applying any necessary type conversions to match the target schema.
     pub(crate) fn cast(
         self,
         schema: &StructType,
@@ -295,7 +346,20 @@ impl Hash for Struct {
 }
 
 impl Value {
-    /// Perform a partition transformation for the given value
+    /// Applies a partition transform to the value
+    ///
+    /// # Arguments
+    /// * `transform` - The partition transform to apply
+    ///
+    /// # Returns
+    /// * `Ok(Value)` - The transformed value
+    /// * `Err(Error)` - If the transform cannot be applied to this value type
+    ///
+    /// Supported transforms include:
+    /// * Identity - Returns the value unchanged
+    /// * Bucket - Applies a hash function and returns bucket number
+    /// * Truncate - Truncates numbers or strings
+    /// * Year/Month/Day/Hour - Extracts time components from dates and timestamps
     pub fn transform(&self, transform: &Transform) -> Result<Value, Error> {
         match transform {
             Transform::Identity => Ok(self.clone()),
@@ -317,87 +381,48 @@ impl Value {
                 )),
             },
             Transform::Year => match self {
-                Value::Date(date) => Ok(Value::Int(
-                    NaiveDate::from_num_days_from_ce_opt(*date + DAYS_BEFORE_UNIX_EPOCH)
-                        .ok_or(Error::InvalidFormat("Date".to_owned()))?
-                        .year()
-                        - YEARS_BEFORE_UNIX_EPOCH,
-                )),
+                Value::Date(date) => Ok(Value::Int(date_to_years(&days_to_date(*date)))),
                 Value::Timestamp(time) => Ok(Value::Int(
-                    DateTime::from_timestamp_millis(time / 1000)
-                        .unwrap()
-                        .naive_utc()
-                        .year()
-                        - YEARS_BEFORE_UNIX_EPOCH,
+                    micros_to_datetime(*time).year() - YEARS_BEFORE_UNIX_EPOCH,
                 )),
                 Value::TimestampTZ(time) => Ok(Value::Int(
-                    DateTime::from_timestamp_millis(time / 1000)
-                        .unwrap()
-                        .naive_utc()
-                        .year()
-                        - YEARS_BEFORE_UNIX_EPOCH,
+                    micros_to_datetime(*time).year() - YEARS_BEFORE_UNIX_EPOCH,
                 )),
                 _ => Err(Error::NotSupported(
                     "Datatype for year partition transform.".to_string(),
                 )),
             },
             Transform::Month => match self {
-                Value::Date(date) => Ok(Value::Int(
-                    NaiveDate::from_num_days_from_ce_opt(*date + DAYS_BEFORE_UNIX_EPOCH)
-                        .ok_or(Error::InvalidFormat("Date".to_owned()))?
-                        .month() as i32,
-                )),
-                Value::Timestamp(time) => Ok(Value::Int(
-                    DateTime::from_timestamp_millis(time / 1000)
-                        .unwrap()
-                        .naive_utc()
-                        .month() as i32,
-                )),
-                Value::TimestampTZ(time) => Ok(Value::Int(
-                    DateTime::from_timestamp_millis(time / 1000)
-                        .unwrap()
-                        .naive_utc()
-                        .month() as i32,
-                )),
+                Value::Date(date) => Ok(Value::Int(date_to_months(&days_to_date(*date)))),
+                Value::Timestamp(time) => {
+                    Ok(Value::Int(datetime_to_months(&micros_to_datetime(*time))))
+                }
+                Value::TimestampTZ(time) => {
+                    Ok(Value::Int(datetime_to_months(&micros_to_datetime(*time))))
+                }
                 _ => Err(Error::NotSupported(
                     "Datatype for month partition transform.".to_string(),
                 )),
             },
             Transform::Day => match self {
-                Value::Date(date) => Ok(Value::Int(
-                    NaiveDate::from_num_days_from_ce_opt(*date + DAYS_BEFORE_UNIX_EPOCH)
-                        .ok_or(Error::InvalidFormat("Date".to_owned()))?
-                        .day() as i32,
-                )),
+                Value::Date(date) => Ok(Value::Int(*date)),
                 Value::Timestamp(time) => Ok(Value::Int(
-                    DateTime::from_timestamp_millis(time / 1000)
-                        .unwrap()
-                        .naive_utc()
-                        .day() as i32,
+                    datetime_to_days(&micros_to_datetime(*time)) as i32,
                 )),
-                Value::TimestampTZ(time) => Ok(Value::Int(
-                    DateTime::from_timestamp_millis(time / 1000)
-                        .unwrap()
-                        .naive_utc()
-                        .day() as i32,
-                )),
+                Value::TimestampTZ(time) => Ok(Value::Int(datetime_to_days(&micros_to_datetime(
+                    *time,
+                )) as i32)),
                 _ => Err(Error::NotSupported(
                     "Datatype for day partition transform.".to_string(),
                 )),
             },
             Transform::Hour => match self {
-                Value::Timestamp(time) => Ok(Value::Int(
-                    DateTime::from_timestamp_millis(time / 1000)
-                        .unwrap()
-                        .naive_utc()
-                        .hour() as i32,
-                )),
-                Value::TimestampTZ(time) => Ok(Value::Int(
-                    DateTime::from_timestamp_millis(time / 1000)
-                        .unwrap()
-                        .naive_utc()
-                        .hour() as i32,
-                )),
+                Value::Timestamp(time) => Ok(Value::Int(datetime_to_hours(&micros_to_datetime(
+                    *time,
+                )) as i32)),
+                Value::TimestampTZ(time) => Ok(Value::Int(datetime_to_hours(&micros_to_datetime(
+                    *time,
+                )) as i32)),
                 _ => Err(Error::NotSupported(
                     "Datatype for hour partition transform.".to_string(),
                 )),
@@ -408,8 +433,20 @@ impl Value {
         }
     }
 
+    /// Attempts to create a Value from raw bytes according to a specified type
+    ///
+    /// # Arguments
+    /// * `bytes` - The raw byte slice to parse
+    /// * `data_type` - The expected type of the value
+    ///
+    /// # Returns
+    /// * `Ok(Value)` - Successfully parsed value of the specified type
+    /// * `Err(Error)` - If the bytes cannot be parsed as the specified type
+    ///
+    /// # Note
+    /// Currently only supports primitive types. Complex types like structs, lists,
+    /// and maps are not supported and will return an error.
     #[inline]
-    /// Create iceberg value from bytes
     pub fn try_from_bytes(bytes: &[u8], data_type: &Type) -> Result<Self, Error> {
         match data_type {
             Type::Primitive(primitive) => match primitive {
@@ -443,16 +480,32 @@ impl Value {
                 PrimitiveType::Fixed(len) => Ok(Value::Fixed(*len as usize, Vec::from(bytes))),
                 PrimitiveType::Binary => Ok(Value::Binary(Vec::from(bytes))),
                 PrimitiveType::Decimal { scale, .. } => {
-                    Ok(Value::Decimal(Decimal::from_i128_with_scale(
-                        i128::from_be_bytes(bytes.try_into()?), *scale,
-                    )))
+                    let val = if bytes.len() <= 16 {
+                        i128::from_be_bytes(sign_extend_be(bytes))
+                    } else {
+                        return Err(Error::Type("decimal".to_string(), "bytes".to_string()));
+                    };
+                    Ok(Value::Decimal(Decimal::from_i128_with_scale(val, *scale)))
                 }
             },
             _ => Err(Error::NotSupported("Complex types as bytes".to_string())),
         }
     }
 
-    /// Create iceberg value from a json value
+    /// Attempts to create a Value from a JSON value according to a specified type
+    ///
+    /// # Arguments
+    /// * `value` - The JSON value to parse
+    /// * `data_type` - The expected Iceberg type
+    ///
+    /// # Returns
+    /// * `Ok(Some(Value))` - Successfully parsed value of the specified type
+    /// * `Ok(None)` - If the JSON value is null
+    /// * `Err(Error)` - If the JSON value cannot be parsed as the specified type
+    ///
+    /// # Note
+    /// Handles all primitive types as well as complex types like structs, lists and maps.
+    /// For complex types, recursively parses their contents according to their type specifications.
     pub fn try_from_json(value: JsonValue, data_type: &Type) -> Result<Option<Self>, Error> {
         match data_type {
             Type::Primitive(primitive) => match (primitive, value) {
@@ -489,12 +542,12 @@ impl Value {
                     datetime::time_to_microseconds(&NaiveTime::parse_from_str(&s, "%H:%M:%S%.f")?),
                 ))),
                 (PrimitiveType::Timestamp, JsonValue::String(s)) => {
-                    Ok(Some(Value::Timestamp(datetime::datetime_to_microseconds(
+                    Ok(Some(Value::Timestamp(datetime::datetime_to_micros(
                         &NaiveDateTime::parse_from_str(&s, "%Y-%m-%dT%H:%M:%S%.f")?,
                     ))))
                 }
                 (PrimitiveType::Timestamptz, JsonValue::String(s)) => Ok(Some(Value::TimestampTZ(
-                    datetime::datetimetz_to_microseconds(&Utc.from_utc_datetime(
+                    datetime::datetimetz_to_micros(&Utc.from_utc_datetime(
                         &NaiveDateTime::parse_from_str(&s, "%Y-%m-%dT%H:%M:%S%.f+00:00")?,
                     )),
                 ))),
@@ -590,7 +643,14 @@ impl Value {
         }
     }
 
-    /// Get datatype of value
+    /// Returns the Iceberg Type that corresponds to this Value
+    ///
+    /// # Returns
+    /// * The Type (primitive or complex) that matches this Value's variant
+    ///
+    /// # Note
+    /// Currently only implemented for primitive types. Complex types like
+    /// structs, lists, and maps will cause a panic.
     pub fn datatype(&self) -> Type {
         match self {
             Value::Boolean(_) => Type::Primitive(PrimitiveType::Boolean),
@@ -614,7 +674,14 @@ impl Value {
         }
     }
 
-    /// Convert Value to the any type
+    /// Converts this Value into a boxed Any trait object
+    ///
+    /// # Returns
+    /// * `Box<dyn Any>` containing the underlying value
+    ///
+    /// # Note
+    /// Currently only implemented for primitive types. Complex types like
+    /// structs, lists, and maps will panic with unimplemented!()
     pub fn into_any(self) -> Box<dyn Any> {
         match self {
             Value::Boolean(any) => Box::new(any),
@@ -634,7 +701,20 @@ impl Value {
             _ => unimplemented!(),
         }
     }
-    /// Cast value to different type
+
+    /// Attempts to cast this Value to a different Type
+    ///
+    /// # Arguments
+    /// * `data_type` - The target Type to cast to
+    ///
+    /// # Returns
+    /// * `Ok(Value)` - Successfully cast Value of the target type
+    /// * `Err(Error)` - If the value cannot be cast to the target type
+    ///
+    /// # Note
+    /// Currently supports casting between numeric types (Int -> Long, Int -> Date, etc)
+    /// and temporal types (Long -> Time/Timestamp/TimestampTZ).
+    /// Returns the original value if the target type matches the current type.
     pub fn cast(self, data_type: &Type) -> Result<Self, Error> {
         if self.datatype() == *data_type {
             Ok(self)
@@ -659,6 +739,19 @@ impl Value {
     }
 }
 
+/// Performs big endian sign extension
+/// Copied from arrow-rs repo/parquet crate:
+/// https://github.com/apache/arrow-rs/blob/b25c441745602c9967b1e3cc4a28bc469cfb1311/parquet/src/arrow/buffer/bit_util.rs#L54
+pub fn sign_extend_be<const N: usize>(b: &[u8]) -> [u8; N] {
+    assert!(b.len() <= N, "Array too large, expected less than {N}");
+    let is_negative = (b[0] & 128u8) == 128u8;
+    let mut result = if is_negative { [255u8; N] } else { [0u8; N] };
+    for (d, s) in result.iter_mut().skip(N - b.len()).zip(b) {
+        *d = *s;
+    }
+    result
+}
+
 impl From<&Value> for JsonValue {
     fn from(value: &Value) -> Self {
         match value {
@@ -674,14 +767,14 @@ impl From<&Value> for JsonValue {
                 None => JsonValue::Null,
             },
             Value::Date(val) => JsonValue::String(datetime::days_to_date(*val).to_string()),
-            Value::Time(val) => JsonValue::String(datetime::microseconds_to_time(*val).to_string()),
+            Value::Time(val) => JsonValue::String(datetime::micros_to_time(*val).to_string()),
             Value::Timestamp(val) => JsonValue::String(
-                datetime::microseconds_to_datetime(*val)
+                datetime::micros_to_datetime(*val)
                     .format("%Y-%m-%dT%H:%M:%S%.f")
                     .to_string(),
             ),
             Value::TimestampTZ(val) => JsonValue::String(
-                datetime::microseconds_to_datetimetz(*val)
+                datetime::micros_to_datetimetz(*val)
                     .format("%Y-%m-%dT%H:%M:%S%.f+00:00")
                     .to_string(),
             ),
@@ -745,6 +838,35 @@ impl From<&Value> for JsonValue {
 }
 
 mod datetime {
+    #[inline]
+    pub(crate) fn date_to_years(date: &NaiveDate) -> i32 {
+        date.years_since(
+            // This is always the same and shouldn't fail
+            NaiveDate::from_ymd_opt(YEARS_BEFORE_UNIX_EPOCH, 1, 1).unwrap(),
+        )
+        .unwrap() as i32
+    }
+
+    #[inline]
+    pub(crate) fn date_to_months(date: &NaiveDate) -> i32 {
+        let years = date
+            .years_since(
+                // This is always the same and shouldn't fail
+                NaiveDate::from_ymd_opt(YEARS_BEFORE_UNIX_EPOCH, 1, 1).unwrap(),
+            )
+            .unwrap() as i32;
+        let months = date.month();
+        years * 12 + months as i32
+    }
+
+    #[inline]
+    pub(crate) fn datetime_to_months(date: &NaiveDateTime) -> i32 {
+        let years = date.year() - YEARS_BEFORE_UNIX_EPOCH;
+        let months = date.month();
+        years * 12 + months as i32
+    }
+
+    #[inline]
     pub(crate) fn date_to_days(date: &NaiveDate) -> i32 {
         date.signed_duration_since(
             // This is always the same and shouldn't fail
@@ -753,6 +875,7 @@ mod datetime {
         .num_days() as i32
     }
 
+    #[inline]
     pub(crate) fn days_to_date(days: i32) -> NaiveDate {
         // This shouldn't fail until the year 262000
         DateTime::from_timestamp(days as i64 * 86_400, 0)
@@ -761,6 +884,7 @@ mod datetime {
             .date()
     }
 
+    #[inline]
     pub(crate) fn time_to_microseconds(time: &NaiveTime) -> i64 {
         time.signed_duration_since(
             // This is always the same and shouldn't fail
@@ -770,32 +894,52 @@ mod datetime {
         .unwrap()
     }
 
-    pub(crate) fn microseconds_to_time(micros: i64) -> NaiveTime {
+    #[inline]
+    pub(crate) fn micros_to_time(micros: i64) -> NaiveTime {
         let (secs, rem) = (micros / 1_000_000, micros % 1_000_000);
 
         NaiveTime::from_num_seconds_from_midnight_opt(secs as u32, rem as u32 * 1_000).unwrap()
     }
 
-    pub(crate) fn datetime_to_microseconds(time: &NaiveDateTime) -> i64 {
+    #[inline]
+    pub(crate) fn datetime_to_micros(time: &NaiveDateTime) -> i64 {
         time.and_utc().timestamp_micros()
     }
 
-    pub(crate) fn microseconds_to_datetime(micros: i64) -> NaiveDateTime {
-        let (secs, rem) = (micros / 1_000_000, micros % 1_000_000);
-
-        // This shouldn't fail until the year 262000
-        DateTime::from_timestamp(secs, rem as u32 * 1_000)
-            .unwrap()
-            .naive_utc()
+    #[inline]
+    pub(crate) fn micros_to_datetime(time: i64) -> NaiveDateTime {
+        DateTime::from_timestamp_micros(time).unwrap().naive_utc()
     }
 
-    use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
+    #[inline]
+    pub(crate) fn datetime_to_days(time: &NaiveDateTime) -> i64 {
+        time.signed_duration_since(
+            // This is always the same and shouldn't fail
+            DateTime::from_timestamp_micros(0).unwrap().naive_utc(),
+        )
+        .num_days()
+    }
 
-    pub(crate) fn datetimetz_to_microseconds(time: &DateTime<Utc>) -> i64 {
+    #[inline]
+    pub(crate) fn datetime_to_hours(time: &NaiveDateTime) -> i64 {
+        time.signed_duration_since(
+            // This is always the same and shouldn't fail
+            DateTime::from_timestamp_micros(0).unwrap().naive_utc(),
+        )
+        .num_hours()
+    }
+
+    use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
+
+    use super::YEARS_BEFORE_UNIX_EPOCH;
+
+    #[inline]
+    pub(crate) fn datetimetz_to_micros(time: &DateTime<Utc>) -> i64 {
         time.timestamp_micros()
     }
 
-    pub(crate) fn microseconds_to_datetimetz(micros: i64) -> DateTime<Utc> {
+    #[inline]
+    pub(crate) fn micros_to_datetimetz(micros: i64) -> DateTime<Utc> {
         let (secs, rem) = (micros / 1_000_000, micros % 1_000_000);
 
         Utc.from_utc_datetime(
@@ -807,6 +951,13 @@ mod datetime {
     }
 }
 
+/// A trait for types that support fallible subtraction
+///
+/// This trait is similar to the standard `Sub` trait, but returns a `Result`
+/// to handle cases where subtraction might fail.
+///
+/// # Type Parameters
+/// * `Sized` - Required to ensure the type can be used by value
 pub trait TrySub: Sized {
     fn try_sub(&self, other: &Self) -> Result<Self, Error>;
 }
@@ -868,6 +1019,18 @@ impl TrySub for Value {
     }
 }
 
+/// Calculates a numeric distance between two strings
+///
+/// # Arguments
+/// * `left` - First string to compare
+/// * `right` - Second string to compare
+///
+/// # Returns
+/// * For strings that can be converted to base-36 numbers, returns sum of squared differences
+/// * For other strings, returns difference of their hash values
+///
+/// First attempts to compare up to 256 characters as base-36 numbers.
+/// Falls back to hash-based comparison if conversion fails.
 fn sub_string(left: &str, right: &str) -> u64 {
     if let Some(distance) = left
         .chars()
@@ -1193,15 +1356,26 @@ mod tests {
 
     #[test]
     fn avro_bytes_decimal() {
-        let bytes = 1000i128.to_be_bytes().to_vec();
+        let value = Value::Decimal(Decimal::from_str_exact("104899.50").unwrap());
 
+        // Test serialization
+        let byte_buf: ByteBuf = value.clone().into();
+        let bytes: Vec<u8> = byte_buf.into_vec();
+        assert_eq!(
+            bytes,
+            vec![0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 160u8, 16u8, 94u8]
+        );
+
+        // Test deserialization
         check_avro_bytes_serde(
             bytes,
-            Value::Decimal(Decimal::new(1000, 2)),
-            &Type::Primitive(PrimitiveType::Decimal { precision: 38, scale: 2 }),
+            value,
+            &Type::Primitive(PrimitiveType::Decimal {
+                precision: 15,
+                scale: 2,
+            }),
         );
     }
-
 
     #[test]
     fn test_transform_identity() {
@@ -1279,30 +1453,30 @@ mod tests {
     fn test_transform_month_date() {
         let value = Value::Date(19478);
         let result = value.transform(&Transform::Month).unwrap();
-        assert_eq!(result, Value::Int(5)); // 0-based month index
+        assert_eq!(result, Value::Int(641)); // 0-based month index
 
         let value = Value::Date(19523);
         let result = value.transform(&Transform::Month).unwrap();
-        assert_eq!(result, Value::Int(6)); // 0-based month index
+        assert_eq!(result, Value::Int(642)); // 0-based month index
 
         let value = Value::Date(19723);
         let result = value.transform(&Transform::Month).unwrap();
-        assert_eq!(result, Value::Int(1)); // 0-based month index
+        assert_eq!(result, Value::Int(649)); // 0-based month index
     }
 
     #[test]
     fn test_transform_month_timestamp() {
         let value = Value::Timestamp(1682937000000000);
         let result = value.transform(&Transform::Month).unwrap();
-        assert_eq!(result, Value::Int(5)); // 0-based month index
+        assert_eq!(result, Value::Int(641)); // 0-based month index
 
         let value = Value::Timestamp(1686840330000000);
         let result = value.transform(&Transform::Month).unwrap();
-        assert_eq!(result, Value::Int(6)); // 0-based month index
+        assert_eq!(result, Value::Int(642)); // 0-based month index
 
         let value = Value::Timestamp(1704067200000000);
         let result = value.transform(&Transform::Month).unwrap();
-        assert_eq!(result, Value::Int(1)); // 0-based month index
+        assert_eq!(result, Value::Int(649)); // 0-based month index
     }
 
     #[test]
@@ -1324,30 +1498,30 @@ mod tests {
     fn test_transform_day_date() {
         let value = Value::Date(19478);
         let result = value.transform(&Transform::Day).unwrap();
-        assert_eq!(result, Value::Int(1)); // 0-based day index
+        assert_eq!(result, Value::Int(19478)); // 0-based day index
 
         let value = Value::Date(19523);
         let result = value.transform(&Transform::Day).unwrap();
-        assert_eq!(result, Value::Int(15)); // 0-based day index
+        assert_eq!(result, Value::Int(19523)); // 0-based day index
 
         let value = Value::Date(19723);
         let result = value.transform(&Transform::Day).unwrap();
-        assert_eq!(result, Value::Int(1)); // 0-based day index
+        assert_eq!(result, Value::Int(19723)); // 0-based day index
     }
 
     #[test]
     fn test_transform_day_timestamp() {
         let value = Value::Timestamp(1682937000000000);
         let result = value.transform(&Transform::Day).unwrap();
-        assert_eq!(result, Value::Int(1)); // 0-based day index
+        assert_eq!(result, Value::Int(19478)); // 0-based day index
 
         let value = Value::Timestamp(1686840330000000);
         let result = value.transform(&Transform::Day).unwrap();
-        assert_eq!(result, Value::Int(15)); // 0-based day index
+        assert_eq!(result, Value::Int(19523)); // 0-based day index
 
         let value = Value::Timestamp(1704067200000000);
         let result = value.transform(&Transform::Day).unwrap();
-        assert_eq!(result, Value::Int(1)); // 0-based day index
+        assert_eq!(result, Value::Int(19723)); // 0-based day index
     }
 
     #[test]
@@ -1361,15 +1535,15 @@ mod tests {
     fn test_transform_hour_timestamp() {
         let value = Value::Timestamp(1682937000000000);
         let result = value.transform(&Transform::Hour).unwrap();
-        assert_eq!(result, Value::Int(10)); // Assuming the timestamp is at 12:00 UTC
+        assert_eq!(result, Value::Int(467482)); // Assuming the timestamp is at 12:00 UTC
 
         let value = Value::Timestamp(1686840330000000);
         let result = value.transform(&Transform::Hour).unwrap();
-        assert_eq!(result, Value::Int(14)); // Assuming the timestamp is at 12:00 UTC
+        assert_eq!(result, Value::Int(468566)); // Assuming the timestamp is at 12:00 UTC
 
         let value = Value::Timestamp(1704067200000000);
         let result = value.transform(&Transform::Hour).unwrap();
-        assert_eq!(result, Value::Int(0)); // Assuming the timestamp is at 12:00 UTC
+        assert_eq!(result, Value::Int(473352)); // Assuming the timestamp is at 12:00 UTC
     }
 
     #[test]
