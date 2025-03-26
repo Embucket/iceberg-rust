@@ -12,8 +12,6 @@
 use std::collections::HashMap;
 
 use crate::error::Error;
-use iceberg_rust_spec::snapshot::SnapshotRetention;
-use iceberg_rust_spec::table_metadata::SnapshotLog;
 use iceberg_rust_spec::{
     spec::{
         partition::PartitionSpec,
