@@ -3,9 +3,6 @@ Struct to perform a [CommitTable] or [CommitView] operation
 */
 use std::collections::HashMap;
 
-use crate::error::Error;
-use iceberg_rust_spec::snapshot::SnapshotRetention;
-use iceberg_rust_spec::table_metadata::SnapshotLog;
 use iceberg_rust_spec::{
     spec::{
         partition::PartitionSpec,
@@ -19,6 +16,9 @@ use iceberg_rust_spec::{
 };
 use serde_derive::{Deserialize, Serialize};
 use uuid::Uuid;
+use iceberg_rust_spec::snapshot::SnapshotRetention;
+use iceberg_rust_spec::table_metadata::SnapshotLog;
+use crate::error::Error;
 
 use super::identifier::Identifier;
 
@@ -261,9 +261,7 @@ pub fn check_table_requirements(
         TableRequirement::AssertTableUuid { uuid } => metadata.table_uuid == *uuid,
         TableRequirement::AssertRefSnapshotId { r#ref, snapshot_id } => {
             match (snapshot_id, metadata.snapshot_for_ref(r#ref)) {
-                (Some(snapshot_id), Some(snapshot_ref)) => {
-                    snapshot_ref.snapshot_id() == snapshot_id
-                }
+                (Some(snapshot_id), Some(snapshot_ref)) => snapshot_ref.snapshot_id() == snapshot_id,
                 _ => true,
             }
         }

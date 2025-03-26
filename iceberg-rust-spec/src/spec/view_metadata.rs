@@ -1,13 +1,6 @@
-//! View metadata implementation for Iceberg views
-//!
-//! This module contains the implementation of view metadata for Iceberg views, including:
-//! - View metadata structure and versioning (V1)
-//! - Schema management
-//! - View versions and history
-//! - View representations (SQL)
-//! - Metadata properties and logging
-//!
-//! The view metadata format is defined in the [Iceberg View Spec](https://iceberg.apache.org/spec/#view-metadata)
+/*!
+ * A Struct for the view metadata   
+*/
 
 use std::{
     collections::HashMap,
@@ -76,13 +69,7 @@ pub struct GeneralViewMetadata<T: Materialization> {
 }
 
 impl<T: Materialization> GeneralViewMetadata<T> {
-    /// Gets the current schema for a given branch, or the view's current schema if no branch is specified
-    ///
-    /// # Arguments
-    /// * `branch` - Optional branch name to get the schema for
-    ///
-    /// # Returns
-    /// * `Result<&Schema, Error>` - The current schema, or an error if the schema cannot be found
+    /// Get current schema
     #[inline]
     pub fn current_schema(&self, branch: Option<&str>) -> Result<&Schema, Error> {
         let id = self.current_version(branch)?.schema_id;
@@ -90,14 +77,7 @@ impl<T: Materialization> GeneralViewMetadata<T> {
             .get(&id)
             .ok_or_else(|| Error::InvalidFormat("view metadata".to_string()))
     }
-
-    /// Gets the schema for a specific version ID
-    ///
-    /// # Arguments
-    /// * `version_id` - The ID of the version to get the schema for
-    ///
-    /// # Returns
-    /// * `Result<&Schema, Error>` - The schema for the version, or an error if the schema cannot be found
+    /// Get schema for version
     #[inline]
     pub fn schema(&self, version_id: i64) -> Result<&Schema, Error> {
         let id = self
@@ -109,14 +89,7 @@ impl<T: Materialization> GeneralViewMetadata<T> {
             .get(&id)
             .ok_or_else(|| Error::InvalidFormat("view metadata".to_string()))
     }
-
-    /// Gets the current version for a given reference, or the view's current version if no reference is specified
-    ///
-    /// # Arguments
-    /// * `snapshot_ref` - Optional snapshot reference name to get the version for
-    ///
-    /// # Returns
-    /// * `Result<&Version<T>, Error>` - The current version, or an error if the version cannot be found
+    /// Get current version
     #[inline]
     pub fn current_version(&self, snapshot_ref: Option<&str>) -> Result<&Version<T>, Error> {
         let version_id: i64 = match snapshot_ref {
@@ -131,11 +104,7 @@ impl<T: Materialization> GeneralViewMetadata<T> {
             .get(&version_id)
             .ok_or_else(|| Error::InvalidFormat("view metadata".to_string()))
     }
-
-    /// Adds a new schema to the view metadata
-    ///
-    /// # Arguments
-    /// * `schema` - The schema to add
+    /// Add schema to view metadata
     #[inline]
     pub fn add_schema(&mut self, schema: Schema) {
         self.schemas.insert(*schema.schema_id(), schema);
