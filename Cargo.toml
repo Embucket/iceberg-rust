@@ -43,3 +43,5 @@ sqlparser = { version = "0.54.0", features = ["visitor"] }
 thiserror = "2"
 tracing = "0.1"
 tracing-futures = "0.2"
+url = "^2.5"
+uuid = { version = "1.13.2", features = ["serde", "v4"] }
