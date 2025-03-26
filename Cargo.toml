@@ -20,13 +20,13 @@ arrow-schema = "54"
 async-trait = "0.1"
 bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
-datafusion = "46"
-datafusion-common = "46"
-datafusion-execution = "46"
-datafusion-expr = "46"
-datafusion-functions = { version = "46", features = ["crypto_expressions"] }
-datafusion-functions-aggregate = "46"
-datafusion-sql = "46"
+datafusion = { git="https://github.com/Embucket/datafusion.git", rev = "073a3b110852f97ccb7085ce4bfd19473b8a3f4f" }
+datafusion-sql = { git="https://github.com/Embucket/datafusion.git", rev = "073a3b110852f97ccb7085ce4bfd19473b8a3f4f" }
+datafusion-expr = { git="https://github.com/Embucket/datafusion.git", rev = "073a3b110852f97ccb7085ce4bfd19473b8a3f4f" }
+datafusion-common = { git="https://github.com/Embucket/datafusion.git", rev = "073a3b110852f97ccb7085ce4bfd19473b8a3f4f" }
+datafusion-execution = { git="https://github.com/Embucket/datafusion.git", rev = "073a3b110852f97ccb7085ce4bfd19473b8a3f4f" }
+datafusion-functions = { git="https://github.com/Embucket/datafusion.git", rev = "073a3b110852f97ccb7085ce4bfd19473b8a3f4f", features = ["crypto_expressions"] }
+datafusion-functions-aggregate = { git="https://github.com/Embucket/datafusion.git", rev = "073a3b110852f97ccb7085ce4bfd19473b8a3f4f" }
 derive-getters = "0.5.0"
 derive_builder = "0.20"
 futures = "0.3.31"

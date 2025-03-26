@@ -204,7 +204,7 @@ impl TableProvider for DataFusionTable {
                     filters,
                     limit,
                 )
-                .await
+                    .await
             }
             Tabular::MaterializedView(mv) => {
                 let table = mv
@@ -226,7 +226,7 @@ impl TableProvider for DataFusionTable {
                     filters,
                     limit,
                 )
-                .await
+                    .await
             }
         }
     }
@@ -320,10 +320,10 @@ async fn table_scan(
                     .map_err(DataFusionIcebergError::from)?,
                 !partition_field.required(),
             )
-            .with_metadata(HashMap::from_iter(vec![(
-                PARQUET_FIELD_ID_META_KEY.to_string(),
-                partition_field.field_id().to_string(),
-            )])))
+                .with_metadata(HashMap::from_iter(vec![(
+                    PARQUET_FIELD_ID_META_KEY.to_string(),
+                    partition_field.field_id().to_string(),
+                )])))
         })
         .collect::<Result<Vec<_>, DataFusionError>>()
         .map_err(DataFusionIcebergError::from)?;
@@ -589,10 +589,10 @@ async fn table_scan(
                                 delete_file_schema,
                                 delete_file_source,
                             )
-                            .with_file_groups(vec![vec![delete_file]])
-                            .with_statistics(statistics.clone())
-                            .with_limit(limit)
-                            .with_table_partition_cols(table_partition_cols.clone());
+                                .with_file_groups(vec![vec![delete_file]])
+                                .with_statistics(statistics.clone())
+                                .with_limit(limit)
+                                .with_table_partition_cols(table_partition_cols.clone());
 
                             let left = ParquetFormat::default()
                                 .create_physical_plan(
@@ -607,11 +607,11 @@ async fn table_scan(
                                 file_schema.clone(),
                                 file_source.clone(),
                             )
-                            .with_file_groups(vec![data_files])
-                            .with_statistics(statistics)
-                            .with_projection(equality_projection)
-                            .with_limit(limit)
-                            .with_table_partition_cols(table_partition_cols);
+                                .with_file_groups(vec![data_files])
+                                .with_statistics(statistics)
+                                .with_projection(equality_projection)
+                                .with_limit(limit)
+                                .with_table_partition_cols(table_partition_cols);
 
                             let data_files_scan = ParquetFormat::default()
                                 .create_physical_plan(
@@ -778,7 +778,7 @@ impl DataSink for IcebergDataSink {
         } else {
             Err(Error::InvalidFormat("database entity".to_string()))
         }
-        .map_err(DataFusionIcebergError::from)?;
+            .map_err(DataFusionIcebergError::from)?;
 
         let metadata_files =
             write_parquet_partitioned(table, data.map_err(Into::into), self.0.branch.as_deref())
@@ -1017,11 +1017,11 @@ mod tests {
                 (8, 2, 1, '2020-01-03', 2),
                 (9, 2, 2, '2020-01-03', 1);",
         )
-        .await
-        .expect("Failed to create query plan for insert")
-        .collect()
-        .await
-        .expect("Failed to insert values into table");
+            .await
+            .expect("Failed to create query plan for insert")
+            .collect()
+            .await
+            .expect("Failed to insert values into table");
 
         ctx.sql(
             "INSERT INTO orders (id, customer_id, product_id, date, amount) VALUES 
@@ -1029,11 +1029,11 @@ mod tests {
                 (11, 3, 1, '2020-01-04', 2),
                 (12, 2, 3, '2020-01-04', 1);",
         )
-        .await
-        .expect("Failed to create query plan for insert")
-        .collect()
-        .await
-        .expect("Failed to insert values into table");
+            .await
+            .expect("Failed to create query plan for insert")
+            .collect()
+            .await
+            .expect("Failed to insert values into table");
 
         ctx.sql(
             "INSERT INTO orders (id, customer_id, product_id, date, amount) VALUES 
@@ -1041,11 +1041,11 @@ mod tests {
                 (14, 3, 2, '2020-01-05', 2),
                 (15, 2, 3, '2020-01-05', 3);",
         )
-        .await
-        .expect("Failed to create query plan for insert")
-        .collect()
-        .await
-        .expect("Failed to insert values into table");
+            .await
+            .expect("Failed to create query plan for insert")
+            .collect()
+            .await
+            .expect("Failed to insert values into table");
 
         ctx.sql(
             "INSERT INTO orders (id, customer_id, product_id, date, amount) VALUES 
@@ -1053,11 +1053,11 @@ mod tests {
                 (17, 1, 3, '2020-01-06', 1),
                 (18, 2, 1, '2020-01-06', 2);",
         )
-        .await
-        .expect("Failed to create query plan for insert")
-        .collect()
-        .await
-        .expect("Failed to insert values into table");
+            .await
+            .expect("Failed to create query plan for insert")
+            .collect()
+            .await
+            .expect("Failed to insert values into table");
 
         ctx.sql(
             "INSERT INTO orders (id, customer_id, product_id, date, amount) VALUES 
@@ -1065,11 +1065,11 @@ mod tests {
                 (20, 1, 2, '2020-01-07', 3),
                 (21, 3, 1, '2020-01-07', 2);",
         )
-        .await
-        .expect("Failed to create query plan for insert")
-        .collect()
-        .await
-        .expect("Failed to insert values into table");
+            .await
+            .expect("Failed to create query plan for insert")
+            .collect()
+            .await
+            .expect("Failed to insert values into table");
 
         ctx.sql(
             "INSERT INTO orders (id, customer_id, product_id, date, amount) VALUES 
@@ -1079,11 +1079,11 @@ mod tests {
                 (24, 3, 2, '2020-01-08', 2),
                 (25, 2, 3, '2020-01-08', 3);",
         )
-        .await
-        .expect("Failed to create query plan for insert")
-        .collect()
-        .await
-        .expect("Failed to insert values into table");
+            .await
+            .expect("Failed to create query plan for insert")
+            .collect()
+            .await
+            .expect("Failed to insert values into table");
 
         let batches = ctx
             .sql("select product_id, sum(amount) from orders where customer_id = 1 group by product_id;")
@@ -1201,11 +1201,11 @@ mod tests {
                 (5, 1, 1, '2020-02-02', 2),
                 (6, 3, 3, '2020-02-02', 3);",
         )
-        .await
-        .expect("Failed to create query plan for insert")
-        .collect()
-        .await
-        .expect("Failed to insert values into table");
+            .await
+            .expect("Failed to create query plan for insert")
+            .collect()
+            .await
+            .expect("Failed to insert values into table");
 
         let batches = ctx
             .sql("select product_id, sum(amount) from orders where customer_id = 1 group by product_id;")
@@ -1265,11 +1265,11 @@ mod tests {
                 (24, 3, 2, '2020-01-08', 2),
                 (25, 2, 3, '2020-01-08', 3);",
         )
-        .await
-        .expect("Failed to create query plan for insert")
-        .collect()
-        .await
-        .expect("Failed to insert values into table");
+            .await
+            .expect("Failed to create query plan for insert")
+            .collect()
+            .await
+            .expect("Failed to insert values into table");
 
         let batches = ctx
             .sql("select product_id, sum(amount) from orders where customer_id = 1 group by product_id;")
@@ -1393,11 +1393,11 @@ mod tests {
                 (5, 1, 1, '2020-02-02', 2),
                 (6, 3, 3, '2020-02-02', 3);",
         )
-        .await
-        .expect("Failed to create query plan for insert")
-        .collect()
-        .await
-        .expect("Failed to insert values into table");
+            .await
+            .expect("Failed to create query plan for insert")
+            .collect()
+            .await
+            .expect("Failed to insert values into table");
 
         let batches = ctx
             .sql("select product_id, sum(amount) from iceberg.test.orders group by product_id;")
@@ -1441,11 +1441,11 @@ mod tests {
                 (8, 2, 1, '2020-01-03', 2),
                 (9, 2, 2, '2020-01-03', 1);",
         )
-        .await
-        .expect("Failed to create query plan for insert")
-        .collect()
-        .await
-        .expect("Failed to insert values into table");
+            .await
+            .expect("Failed to create query plan for insert")
+            .collect()
+            .await
+            .expect("Failed to insert values into table");
 
         let batches = ctx
             .sql("select product_id, sum(amount) from iceberg.test.orders group by product_id;")
@@ -1564,11 +1564,11 @@ mod tests {
                 (8, 2, 1, '2020-01-03', 2),
                 (9, 2, 2, '2020-01-03', 1);",
         )
-        .await
-        .expect("Failed to create query plan for insert")
-        .collect()
-        .await
-        .expect("Failed to insert values into table");
+            .await
+            .expect("Failed to create query plan for insert")
+            .collect()
+            .await
+            .expect("Failed to insert values into table");
 
         let view_schema = Schema::builder()
             .with_struct_field(StructField {
