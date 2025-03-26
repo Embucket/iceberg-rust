@@ -788,7 +788,10 @@ impl DataSink for IcebergDataSink {
             write_parquet_partitioned(table, data.map_err(Into::into), self.0.branch.as_deref())
                 .await?;
 
-        let count = metadata_files.iter().map(|x|x.record_count()).fold(0, |acc, x| acc+ x);
+        let count = metadata_files
+            .iter()
+            .map(|x| x.record_count())
+            .fold(0, |acc, x| acc + x);
 
         table
             .new_transaction(self.0.branch.as_deref())
@@ -967,7 +970,7 @@ mod tests {
         ctx.register_table("orders", table.clone()).unwrap();
 
         ctx.sql(
-            "INSERT INTO orders (id, customer_id, product_id, date, amount) VALUES
+            "INSERT INTO orders (id, customer_id, product_id, date, amount) VALUES 
                 (1, 1, 1, '2020-01-01', 1),
                 (2, 2, 1, '2020-01-01', 1),
                 (3, 3, 1, '2020-01-01', 3),
@@ -1018,7 +1021,7 @@ mod tests {
         }
 
         ctx.sql(
-            "INSERT INTO orders (id, customer_id, product_id, date, amount) VALUES
+            "INSERT INTO orders (id, customer_id, product_id, date, amount) VALUES 
                 (7, 1, 3, '2020-01-03', 1),
                 (8, 2, 1, '2020-01-03', 2),
                 (9, 2, 2, '2020-01-03', 1);",
@@ -1030,7 +1033,7 @@ mod tests {
         .expect("Failed to insert values into table");
 
         ctx.sql(
-            "INSERT INTO orders (id, customer_id, product_id, date, amount) VALUES
+            "INSERT INTO orders (id, customer_id, product_id, date, amount) VALUES 
                 (10, 1, 2, '2020-01-04', 3),
                 (11, 3, 1, '2020-01-04', 2),
                 (12, 2, 3, '2020-01-04', 1);",
@@ -1042,7 +1045,7 @@ mod tests {
         .expect("Failed to insert values into table");
 
         ctx.sql(
-            "INSERT INTO orders (id, customer_id, product_id, date, amount) VALUES
+            "INSERT INTO orders (id, customer_id, product_id, date, amount) VALUES 
                 (13, 1, 1, '2020-01-05', 4),
                 (14, 3, 2, '2020-01-05', 2),
                 (15, 2, 3, '2020-01-05', 3);",
@@ -1054,7 +1057,7 @@ mod tests {
         .expect("Failed to insert values into table");
 
         ctx.sql(
-            "INSERT INTO orders (id, customer_id, product_id, date, amount) VALUES
+            "INSERT INTO orders (id, customer_id, product_id, date, amount) VALUES 
                 (16, 2, 3, '2020-01-05', 3),
                 (17, 1, 3, '2020-01-06', 1),
                 (18, 2, 1, '2020-01-06', 2);",
@@ -1066,7 +1069,7 @@ mod tests {
         .expect("Failed to insert values into table");
 
         ctx.sql(
-            "INSERT INTO orders (id, customer_id, product_id, date, amount) VALUES
+            "INSERT INTO orders (id, customer_id, product_id, date, amount) VALUES 
                 (19, 2, 2, '2020-01-06', 1),
                 (20, 1, 2, '2020-01-07', 3),
                 (21, 3, 1, '2020-01-07', 2);",
@@ -1078,7 +1081,7 @@ mod tests {
         .expect("Failed to insert values into table");
 
         ctx.sql(
-            "INSERT INTO orders (id, customer_id, product_id, date, amount) VALUES
+            "INSERT INTO orders (id, customer_id, product_id, date, amount) VALUES 
                 (21, 3, 1, '2020-01-07', 2),
                 (22, 2, 3, '2020-01-07', 1),
                 (23, 1, 1, '2020-01-08', 4),
@@ -1198,20 +1201,21 @@ mod tests {
 
         ctx.register_table("orders", table.clone()).unwrap();
 
-        let res = ctx.sql(
-            "INSERT INTO orders (id, customer_id, product_id, date, amount) VALUES
+        let res = ctx
+            .sql(
+                "INSERT INTO orders (id, customer_id, product_id, date, amount) VALUES
                 (1, 1, 1, '2020-01-01', 1),
                 (2, 2, 1, '2020-01-01', 1),
                 (3, 3, 1, '2020-01-01', 3),
                 (4, 1, 2, '2020-02-02', 1),
                 (5, 1, 1, '2020-02-02', 2),
                 (6, 3, 3, '2020-02-02', 3);",
-        )
-        .await
-        .expect("Failed to create query plan for insert")
-        .collect()
-        .await
-        .expect("Failed to insert values into table");
+            )
+            .await
+            .expect("Failed to create query plan for insert")
+            .collect()
+            .await
+            .expect("Failed to insert values into table");
 
         let count = res[0]
             .column(0)
@@ -1258,7 +1262,7 @@ mod tests {
         }
 
         ctx.sql(
-            "INSERT INTO orders (id, customer_id, product_id, date, amount) VALUES
+            "INSERT INTO orders (id, customer_id, product_id, date, amount) VALUES 
                 (7, 1, 3, '2020-01-03', 1),
                 (8, 2, 1, '2020-01-03', 2),
                 (9, 2, 2, '2020-01-03', 1),
@@ -1399,7 +1403,7 @@ mod tests {
         ctx.register_catalog("iceberg", datafusion_catalog);
 
         ctx.sql(
-            "INSERT INTO iceberg.test.orders (id, customer_id, product_id, date, amount) VALUES
+            "INSERT INTO iceberg.test.orders (id, customer_id, product_id, date, amount) VALUES 
                 (1, 1, 1, '2020-01-01', 1),
                 (2, 2, 1, '2020-01-01', 1),
                 (3, 3, 1, '2020-01-01', 3),
@@ -1450,7 +1454,7 @@ mod tests {
         }
 
         ctx.sql(
-            "INSERT INTO iceberg.test.orders (id, customer_id, product_id, date, amount) VALUES
+            "INSERT INTO iceberg.test.orders (id, customer_id, product_id, date, amount) VALUES 
                 (7, 1, 3, '2020-01-03', 1),
                 (8, 2, 1, '2020-01-03', 2),
                 (9, 2, 2, '2020-01-03', 1);",
@@ -1567,7 +1571,7 @@ mod tests {
         ctx.register_table("orders", table).unwrap();
 
         ctx.sql(
-            "INSERT INTO orders (id, customer_id, product_id, date, amount) VALUES
+            "INSERT INTO orders (id, customer_id, product_id, date, amount) VALUES 
                 (1, 1, 1, '2020-01-01', 1),
                 (2, 2, 1, '2020-01-01', 1),
                 (3, 3, 1, '2020-01-01', 3),

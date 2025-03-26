@@ -350,7 +350,9 @@ pub fn check_table_requirements(
         TableRequirement::AssertTableUuid { uuid } => metadata.table_uuid == *uuid,
         TableRequirement::AssertRefSnapshotId { r#ref, snapshot_id } => {
             match (snapshot_id, metadata.snapshot_for_ref(r#ref)) {
-                (Some(snapshot_id), Some(snapshot_ref)) => snapshot_ref.snapshot_id() == snapshot_id,
+                (Some(snapshot_id), Some(snapshot_ref)) => {
+                    snapshot_ref.snapshot_id() == snapshot_id
+                }
                 _ => true,
             }
         }

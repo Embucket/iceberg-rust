@@ -208,7 +208,7 @@ impl TableMetadata {
                 .unwrap_or_else(|| panic!("Snapshot id of ref {} doesn't exist", ref_name))
         })
     }
-    
+
     /// Gets the current partition fields for a given branch, binding them to their source schema fields
     ///
     /// # Arguments
