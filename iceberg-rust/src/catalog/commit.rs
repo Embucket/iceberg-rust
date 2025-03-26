@@ -25,7 +25,8 @@ use iceberg_rust_spec::{
 };
 use serde_derive::{Deserialize, Serialize};
 use uuid::Uuid;
-
+use iceberg_rust_spec::snapshot::SnapshotRetention;
+use iceberg_rust_spec::table_metadata::SnapshotLog;
 use crate::error::Error;
 
 use super::identifier::Identifier;
@@ -350,9 +351,13 @@ pub fn check_table_requirements(
         TableRequirement::AssertTableUuid { uuid } => metadata.table_uuid == *uuid,
         TableRequirement::AssertRefSnapshotId { r#ref, snapshot_id } => {
             match (snapshot_id, metadata.snapshot_for_ref(r#ref)) {
+<<<<<<< HEAD
                 (Some(snapshot_id), Some(snapshot_ref)) => {
                     snapshot_ref.snapshot_id() == snapshot_id
                 }
+=======
+                (Some(snapshot_id), Some(snapshot_ref)) => snapshot_ref.snapshot_id() == snapshot_id,
+>>>>>>> icehut
                 _ => true,
             }
         }
@@ -457,6 +462,10 @@ pub fn apply_table_updates(
                     snapshot_id: *snapshot.snapshot_id(),
                     timestamp_ms: *snapshot.timestamp_ms(),
                 });
+<<<<<<< HEAD
+=======
+                metadata.last_updated_ms = *snapshot.timestamp_ms();
+>>>>>>> icehut
                 metadata.last_sequence_number = *snapshot.sequence_number();
                 metadata.snapshots.insert(*snapshot.snapshot_id(), snapshot);
             }
