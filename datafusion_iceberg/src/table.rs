@@ -967,7 +967,7 @@ mod tests {
         ctx.register_table("orders", table.clone()).unwrap();
 
         ctx.sql(
-            "INSERT INTO orders (id, customer_id, product_id, date, amount) VALUES 
+            "INSERT INTO orders (id, customer_id, product_id, date, amount) VALUES
                 (1, 1, 1, '2020-01-01', 1),
                 (2, 2, 1, '2020-01-01', 1),
                 (3, 3, 1, '2020-01-01', 3),
@@ -1018,7 +1018,7 @@ mod tests {
         }
 
         ctx.sql(
-            "INSERT INTO orders (id, customer_id, product_id, date, amount) VALUES 
+            "INSERT INTO orders (id, customer_id, product_id, date, amount) VALUES
                 (7, 1, 3, '2020-01-03', 1),
                 (8, 2, 1, '2020-01-03', 2),
                 (9, 2, 2, '2020-01-03', 1);",
@@ -1030,7 +1030,7 @@ mod tests {
         .expect("Failed to insert values into table");
 
         ctx.sql(
-            "INSERT INTO orders (id, customer_id, product_id, date, amount) VALUES 
+            "INSERT INTO orders (id, customer_id, product_id, date, amount) VALUES
                 (10, 1, 2, '2020-01-04', 3),
                 (11, 3, 1, '2020-01-04', 2),
                 (12, 2, 3, '2020-01-04', 1);",
@@ -1042,7 +1042,7 @@ mod tests {
         .expect("Failed to insert values into table");
 
         ctx.sql(
-            "INSERT INTO orders (id, customer_id, product_id, date, amount) VALUES 
+            "INSERT INTO orders (id, customer_id, product_id, date, amount) VALUES
                 (13, 1, 1, '2020-01-05', 4),
                 (14, 3, 2, '2020-01-05', 2),
                 (15, 2, 3, '2020-01-05', 3);",
@@ -1054,7 +1054,7 @@ mod tests {
         .expect("Failed to insert values into table");
 
         ctx.sql(
-            "INSERT INTO orders (id, customer_id, product_id, date, amount) VALUES 
+            "INSERT INTO orders (id, customer_id, product_id, date, amount) VALUES
                 (16, 2, 3, '2020-01-05', 3),
                 (17, 1, 3, '2020-01-06', 1),
                 (18, 2, 1, '2020-01-06', 2);",
@@ -1066,7 +1066,7 @@ mod tests {
         .expect("Failed to insert values into table");
 
         ctx.sql(
-            "INSERT INTO orders (id, customer_id, product_id, date, amount) VALUES 
+            "INSERT INTO orders (id, customer_id, product_id, date, amount) VALUES
                 (19, 2, 2, '2020-01-06', 1),
                 (20, 1, 2, '2020-01-07', 3),
                 (21, 3, 1, '2020-01-07', 2);",
@@ -1078,7 +1078,7 @@ mod tests {
         .expect("Failed to insert values into table");
 
         ctx.sql(
-            "INSERT INTO orders (id, customer_id, product_id, date, amount) VALUES 
+            "INSERT INTO orders (id, customer_id, product_id, date, amount) VALUES
                 (21, 3, 1, '2020-01-07', 2),
                 (22, 2, 3, '2020-01-07', 1),
                 (23, 1, 1, '2020-01-08', 4),
@@ -1199,7 +1199,7 @@ mod tests {
         ctx.register_table("orders", table.clone()).unwrap();
 
         let res = ctx.sql(
-            "INSERT INTO orders (id, customer_id, product_id, date, amount) VALUES 
+            "INSERT INTO orders (id, customer_id, product_id, date, amount) VALUES
                 (1, 1, 1, '2020-01-01', 1),
                 (2, 2, 1, '2020-01-01', 1),
                 (3, 3, 1, '2020-01-01', 3),
@@ -1258,7 +1258,7 @@ mod tests {
         }
 
         ctx.sql(
-            "INSERT INTO orders (id, customer_id, product_id, date, amount) VALUES 
+            "INSERT INTO orders (id, customer_id, product_id, date, amount) VALUES
                 (7, 1, 3, '2020-01-03', 1),
                 (8, 2, 1, '2020-01-03', 2),
                 (9, 2, 2, '2020-01-03', 1),
@@ -1399,7 +1399,7 @@ mod tests {
         ctx.register_catalog("iceberg", datafusion_catalog);
 
         ctx.sql(
-            "INSERT INTO iceberg.test.orders (id, customer_id, product_id, date, amount) VALUES 
+            "INSERT INTO iceberg.test.orders (id, customer_id, product_id, date, amount) VALUES
                 (1, 1, 1, '2020-01-01', 1),
                 (2, 2, 1, '2020-01-01', 1),
                 (3, 3, 1, '2020-01-01', 3),
@@ -1450,7 +1450,7 @@ mod tests {
         }
 
         ctx.sql(
-            "INSERT INTO iceberg.test.orders (id, customer_id, product_id, date, amount) VALUES 
+            "INSERT INTO iceberg.test.orders (id, customer_id, product_id, date, amount) VALUES
                 (7, 1, 3, '2020-01-03', 1),
                 (8, 2, 1, '2020-01-03', 2),
                 (9, 2, 2, '2020-01-03', 1);",
@@ -1567,7 +1567,7 @@ mod tests {
         ctx.register_table("orders", table).unwrap();
 
         ctx.sql(
-            "INSERT INTO orders (id, customer_id, product_id, date, amount) VALUES 
+            "INSERT INTO orders (id, customer_id, product_id, date, amount) VALUES
                 (1, 1, 1, '2020-01-01', 1),
                 (2, 2, 1, '2020-01-01', 1),
                 (3, 3, 1, '2020-01-01', 3),

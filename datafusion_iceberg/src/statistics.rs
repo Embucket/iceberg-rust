@@ -29,7 +29,7 @@ impl DataFusionTable {
     }
 }
 
-pub(crate) async fn table_statistics(
+pub async fn table_statistics(
     table: &Table,
     snapshot_range: &(Option<i64>, Option<i64>),
 ) -> Result<Statistics, Error> {
@@ -137,7 +137,7 @@ fn column_statistics<'a>(
     })
 }
 
-pub(crate) fn manifest_statistics(schema: &Schema, manifest: &ManifestEntry) -> Statistics {
+pub fn manifest_statistics(schema: &Schema, manifest: &ManifestEntry) -> Statistics {
     Statistics {
         num_rows: Precision::Exact(*manifest.data_file().record_count() as usize),
         total_byte_size: Precision::Exact(*manifest.data_file().file_size_in_bytes() as usize),
