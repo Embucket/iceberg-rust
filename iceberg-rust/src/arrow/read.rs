@@ -32,7 +32,7 @@ pub async fn read(
                             .head(&util::strip_prefix(manifest.data_file().file_path()).into())
                             .await?;
 
-                        let object_reader = ParquetObjectReader::new(object_store, object_meta);
+                        let object_reader = ParquetObjectReader::new(object_store, object_meta.location);
                         Ok::<_, Error>(
                             ParquetRecordBatchStreamBuilder::new(object_reader)
                                 .await?

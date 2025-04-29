@@ -25,7 +25,7 @@ impl TableSource for IcebergTableSource {
     fn as_any(&self) -> &dyn Any {
         &self.tabular
     }
-    fn schema(&self) -> SchemaRef {
+    fn schema(&self) -> Arc<datafusion_common::arrow::datatypes::Schema> {
         match &self.tabular {
             Tabular::Table(table) => {
                 let schema = table

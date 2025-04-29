@@ -1,7 +1,7 @@
 use std::ops::ControlFlow;
 
 use datafusion::sql::sqlparser::{
-    ast::{visit_relations_mut, Ident},
+    ast::{visit_relations_mut, Ident, ObjectNamePart},
     dialect::GenericDialect,
     parser::Parser,
 };
@@ -17,11 +17,16 @@ pub(crate) fn transform_relations(sql: &str) -> Result<Vec<String>, Error> {
     let mut statements = Parser::parse_sql(&GenericDialect, sql)?;
 
     visit_relations_mut(&mut statements, |relation| {
-        relation.0 = vec![Ident::new(transform_name(
-            &Itertools::intersperse(relation.0.iter().map(|x| x.value.as_str()), ".")
-                .collect::<String>(),
-        ))];
-        relation.0[0].value = transform_name(&relation.0[0].value);
+        let combined_name = relation.0.iter()
+            .map(|part| match part {
+                ObjectNamePart::Identifier(ident) => ident.value.as_str()
+            })
+            .intersperse(".")
+            .collect::<String>();
+        
+        let transformed_name = transform_name(&combined_name);
+        relation.0 = vec![ObjectNamePart::Identifier(Ident::new(transformed_name))];
+        
         ControlFlow::<()>::Continue(())
     });
 

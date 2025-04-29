@@ -387,7 +387,8 @@ impl ScalarUDFImpl for DateTransform {
         Ok(DataType::Int32)
     }
 
-    fn invoke(&self, args: &[ColumnarValue]) -> datafusion::error::Result<ColumnarValue> {
+    fn invoke_with_args(&self, args: datafusion_expr::ScalarFunctionArgs) -> datafusion::error::Result<ColumnarValue> {
+        let args = &args.args;
         let transform = &args[0];
         let array = &args[1];
         let ColumnarValue::Scalar(ScalarValue::Utf8(Some(transform))) = transform else {

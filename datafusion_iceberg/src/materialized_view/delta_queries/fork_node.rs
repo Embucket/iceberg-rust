@@ -117,10 +117,6 @@ impl UserDefinedLogicalNodeCore for ForkNode {
         write!(f, "ForkNode")
     }
 
-    fn from_template(&self, _exprs: &[Expr], _inputs: &[LogicalPlan]) -> Self {
-        panic!("Creating fork node from template is not allowed");
-    }
-
     fn with_exprs_and_inputs(
         &self,
         exprs: Vec<Expr>,

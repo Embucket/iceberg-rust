@@ -15,31 +15,32 @@ resolver = "2"
 
 [workspace.dependencies]
 apache-avro = "0.17.0"
-arrow = "54.1.0"
-arrow-schema = "54.1.0"
+arrow = "55.0.0"
+arrow-schema = "55.0.0"
 async-trait = "0.1"
 bytes = "1"
-chrono = { version = "0.4.39", default-features = false, features = ["serde", "clock"] }
-datafusion = { version= "46.0.1" }
-datafusion-sql = { version= "46.0.1"  }
-datafusion-expr = { version= "46.0.1"  }
-datafusion-common = { version= "46.0.1"  }
-datafusion-execution = { version= "46.0.1" }
-datafusion-functions = { version= "46.0.1"  }
-datafusion-functions-aggregate = { version = "46.0.1" }
+chrono = { version = "0.4.0", default-features = false, features = ["serde", "clock"] }
+datafusion = { version= "47.0.0" }
+datafusion-sql = { version= "47.0.0" }
+datafusion-expr = { version= "47.0.0" }
+datafusion-common = { version= "47.0.0" }
+datafusion_datasource = { version= "47.0.0" }
+datafusion-execution = { version= "47.0.0" }
+datafusion-functions = { version= "47.0.0" }
+datafusion-functions-aggregate = { version = "47.0.0" }
 derive-getters = "0.5.0"
 derive_builder = "0.20"
 futures = "0.3.31"
 getrandom = { version = "0.3.1", features = ["std"] }
 itertools = "0.14.0"
-object_store = { version = "0.11.2", features = ["aws", "gcp"] }
+object_store = { version = "0.12.0", features = ["aws", "gcp"] }
 once_map = "0.4"
-parquet = { version = "54.1.0", features = ["async", "object_store"] }
+parquet = { version = "55.0.0", features = ["async", "object_store"] }
 pin-project-lite = "0.2"
 serde = "^1.0"
 serde_derive = "^1.0"
 serde_json = "^1.0"
-sqlparser = { git = "https://github.com/Embucket/datafusion-sqlparser-rs.git", rev = "53c291e3e95f176daea954f614409e5f674ec561", features = [
+sqlparser = { git = "https://github.com/Embucket/datafusion-sqlparser-rs.git", rev = "ed416548dcfe4a73a3240bbf625fb9010a4925c8", features = [
   "visitor",
 ] }
 thiserror = "2"

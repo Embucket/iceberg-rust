@@ -798,10 +798,11 @@ impl ScalarUDFImpl for RefreshMaterializedView {
         Ok(DataType::Utf8)
     }
 
-    fn invoke(
+    fn invoke_with_args(
         &self,
-        args: &[datafusion_expr::ColumnarValue],
+        args: datafusion_expr::ScalarFunctionArgs,
     ) -> datafusion::error::Result<datafusion_expr::ColumnarValue> {
+        let args = &args.args;
         let ColumnarValue::Scalar(ScalarValue::Utf8(Some(name))) = &args[0] else {
             return Err(DataFusionError::Execution(
                 "Refresh function only takes a scalar string input.".to_string(),

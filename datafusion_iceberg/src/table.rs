@@ -20,6 +20,7 @@ use tokio::sync::{RwLock, RwLockWriteGuard};
 use datafusion::{
     arrow::datatypes::{Field, Schema as ArrowSchema, SchemaRef},
     catalog::Session,
+
     common::{not_impl_err, plan_err, DataFusionError, SchemaExt},
     datasource::{
         file_format::{parquet::ParquetFormat, FileFormat},
@@ -28,13 +29,13 @@ use datafusion::{
         physical_plan::{parquet::source::ParquetSource, FileScanConfig},
         TableProvider, ViewTable,
     },
+
     execution::{context::SessionState, TaskContext},
     logical_expr::{TableProviderFilterPushDown, TableType},
     physical_expr::create_physical_expr,
     physical_optimizer::pruning::PruningPredicate,
     physical_plan::{
         expressions::Column,
-        insert::{DataSink, DataSinkExec},
         joins::{HashJoinExec, PartitionMode},
         metrics::MetricsSet,
         projection::ProjectionExec,
@@ -45,7 +46,10 @@ use datafusion::{
     prelude::Expr,
     scalar::ScalarValue,
     sql::parser::DFParserBuilder,
+    datasource::sink::{DataSink, DataSinkExec},
 };
+use datafusion::datasource::physical_plan::FileGroup;
+use datafusion::datasource::sink;
 
 use crate::{
     error::Error as DataFusionIcebergError,
@@ -262,6 +266,7 @@ impl TableProvider for DataFusionTable {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(deprecated)]
 async fn table_scan(
     table: &Table,
     snapshot_range: &(Option<i64>, Option<i64>),
@@ -593,7 +598,7 @@ async fn table_scan(
                                 delete_file_schema,
                                 delete_file_source,
                             )
-                            .with_file_groups(vec![vec![delete_file]])
+                            .with_file_groups(vec![FileGroup::new(vec![delete_file])])
                             .with_statistics(statistics.clone())
                             .with_limit(limit)
                             .with_table_partition_cols(table_partition_cols.clone());
@@ -611,7 +616,7 @@ async fn table_scan(
                                 file_schema.clone(),
                                 file_source.clone(),
                             )
-                            .with_file_groups(vec![data_files])
+                            .with_file_groups(vec![FileGroup::new(data_files)])
                             .with_statistics(statistics)
                             .with_projection(equality_projection)
                             .with_limit(limit)
@@ -679,7 +684,7 @@ async fn table_scan(
                 if !additional_data_files.is_empty() {
                     let file_scan_config =
                         FileScanConfig::new(object_store_url, file_schema.clone(), file_source)
-                            .with_file_groups(vec![additional_data_files])
+                            .with_file_groups(vec![FileGroup::new(additional_data_files)])
                             .with_statistics(statistics)
                             .with_projection(projection.as_ref().cloned())
                             .with_limit(limit)
@@ -746,6 +751,10 @@ impl DisplayAs for DataFusionTable {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(f, "IcebergTable")
+            }
+            DisplayFormatType::TreeRender => {
+                // TODO: collect info
+                write!(f, "")
             }
         }
     }
@@ -828,7 +837,7 @@ fn generate_partitioned_file(
         .collect::<Result<Vec<ScalarValue>, _>>()?;
     let object_meta = ObjectMeta {
         location: util::strip_prefix(manifest.data_file().file_path()).into(),
-        size: *manifest.data_file().file_size_in_bytes() as usize,
+        size: *manifest.data_file().file_size_in_bytes() as u64,
         last_modified: {
             let secs = last_updated_ms / 1000;
             let nsecs = (last_updated_ms % 1000) as u32 * 1000000;
@@ -841,7 +850,7 @@ fn generate_partitioned_file(
         object_meta,
         partition_values,
         range: None,
-        statistics: Some(manifest_statistics),
+        statistics: Some(Arc::new(manifest_statistics)),
         extensions: None,
         metadata_size_hint: None,
     };
