@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use iceberg_rust_spec::spec::{manifest::DataFile, schema::Schema, snapshot::SnapshotReference};
 
 use crate::{catalog::commit::CommitTable, error::Error, table::Table};
-
+use crate::table::transaction::append::append_summary;
 use self::operation::Operation;
 
 use super::delete_files;
@@ -53,22 +53,19 @@ impl<'table> TableTransaction<'table> {
     }
     /// Quickly append files to the table
     pub fn append(mut self, files: Vec<DataFile>) -> Self {
+        let summary = append_summary(&files);
+
         self.operations
             .entry(APPEND_KEY.to_owned())
-            .and_modify(|mut x| {
-                if let Operation::Append {
-                    branch: _,
-                    files: old,
-                    additional_summary: None,
-                } = &mut x
-                {
-                    old.extend_from_slice(&files)
+            .and_modify(|x| {
+                if let Operation::Append { files: old, .. } = x {
+                    old.extend_from_slice(&files);
                 }
             })
-            .or_insert(Operation::Append {
+            .or_insert_with(|| Operation::Append {
                 branch: self.branch.clone(),
                 files,
-                additional_summary: None,
+                additional_summary: summary,
             });
         self
     }

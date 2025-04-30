@@ -1,13 +1,13 @@
-use std::cmp::Ordering;
-
-use iceberg_rust_spec::{manifest::ManifestEntry, manifest_list::ManifestListEntry};
-use smallvec::SmallVec;
-
 use crate::{
     error::Error,
     table::manifest_list::ManifestListReader,
     util::{cmp_with_priority, partition_struct_to_vec, summary_to_rectangle, try_sub, Rectangle},
 };
+use iceberg_rust_spec::manifest::{Content, DataFile};
+use iceberg_rust_spec::{manifest::ManifestEntry, manifest_list::ManifestListEntry};
+use smallvec::SmallVec;
+use std::cmp::Ordering;
+use std::collections::HashMap;
 
 /// Split sets of datafiles depending on their partition_values
 #[allow(clippy::type_complexity)]
@@ -188,4 +188,27 @@ pub(crate) fn select_manifest_unpartitioned(
             file_count_all_entries,
         })
         .ok_or(Error::NotFound("Manifest for insert".to_owned()))
+}
+
+pub(crate) fn append_summary(files: &[DataFile]) -> Option<HashMap<String, String>> {
+    if files.is_empty() {
+        return None;
+    }
+
+    let mut added_records = 0i64;
+    let mut added_files_size = 0i64;
+    let mut added_data_files = 0usize;
+
+    for file in files {
+        if *file.content() == Content::Data {
+            added_data_files += 1;
+            added_records += file.record_count();
+            added_files_size += file.file_size_in_bytes();
+        }
+    }
+    Some(HashMap::from([
+        ("added-files-size".to_string(), added_files_size.to_string()),
+        ("added-records".to_string(), added_records.to_string()),
+        ("added-data-files".to_string(), added_data_files.to_string()),
+    ]))
 }
