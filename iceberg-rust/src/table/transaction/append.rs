@@ -191,7 +191,6 @@ pub(crate) fn select_manifest_unpartitioned(
         .ok_or(Error::NotFound("Manifest for insert".to_owned()))
 }
 
-
 pub(crate) fn append_summary(files: &[DataFile]) -> Option<HashMap<String, String>> {
     if files.is_empty() {
         return None;

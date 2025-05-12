@@ -19,6 +19,7 @@ use std::collections::HashMap;
 
 use iceberg_rust_spec::spec::{manifest::DataFile, schema::Schema, snapshot::SnapshotReference};
 
+use crate::table::transaction::append::append_summary;
 use crate::{catalog::commit::CommitTable, error::Error, table::Table};
 use crate::table::transaction::append::append_summary;
 
@@ -122,7 +123,9 @@ impl<'table> TableTransaction<'table> {
         self.operations
             .entry(APPEND_KEY.to_owned())
             .and_modify(|mut x| {
-                if let Operation::Append { data_files: old, ..} = &mut x
+                if let Operation::Append {
+                    data_files: old, ..
+                } = &mut x
                 {
                     old.extend_from_slice(&files)
                 }
