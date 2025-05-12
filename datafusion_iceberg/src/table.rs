@@ -26,7 +26,8 @@ use datafusion::{
         file_format::{parquet::ParquetFormat, FileFormat},
         listing::PartitionedFile,
         object_store::ObjectStoreUrl,
-        physical_plan::{parquet::source::ParquetSource, FileScanConfig},
+        physical_plan::{parquet::source::ParquetSource, FileGroup, FileScanConfigBuilder},
+        sink::{DataSink, DataSinkExec},
         TableProvider, ViewTable,
     },
 
@@ -188,7 +189,7 @@ impl TableProvider for DataFusionTable {
                 };
                 let statement = DFParserBuilder::new(sql).build()?.parse_statement()?;
                 let logical_plan = session_state.statement_to_plan(statement).await?;
-                ViewTable::try_new(logical_plan, Some(sql.clone()))?
+                ViewTable::new(logical_plan, Some(sql.clone()))
                     .scan(session, projection, filters, limit)
                     .await
             }
@@ -593,15 +594,16 @@ async fn table_scan(
                                 },
                             );
 
-                            let delete_file_scan_config = FileScanConfig::new(
+                            let delete_file_scan_config = FileScanConfigBuilder::new(
                                 object_store_url.clone(),
                                 delete_file_schema,
                                 delete_file_source,
                             )
-                            .with_file_groups(vec![FileGroup::new(vec![delete_file])])
+                            .with_file_group(FileGroup::new(vec![delete_file]))
                             .with_statistics(statistics.clone())
                             .with_limit(limit)
-                            .with_table_partition_cols(table_partition_cols.clone());
+                            .with_table_partition_cols(table_partition_cols.clone())
+                            .build();
 
                             let left = ParquetFormat::default()
                                 .create_physical_plan(
@@ -611,16 +613,17 @@ async fn table_scan(
                                 )
                                 .await?;
 
-                            let file_scan_config = FileScanConfig::new(
+                            let file_scan_config = FileScanConfigBuilder::new(
                                 object_store_url,
                                 file_schema.clone(),
                                 file_source.clone(),
                             )
-                            .with_file_groups(vec![FileGroup::new(data_files)])
+                            .with_file_group(FileGroup::new(data_files))
                             .with_statistics(statistics)
                             .with_projection(equality_projection)
                             .with_limit(limit)
-                            .with_table_partition_cols(table_partition_cols);
+                            .with_table_partition_cols(table_partition_cols)
+                            .build();
 
                             let data_files_scan = ParquetFormat::default()
                                 .create_physical_plan(
@@ -682,13 +685,17 @@ async fn table_scan(
                     .collect::<Result<Vec<_>, _>>()?;
 
                 if !additional_data_files.is_empty() {
-                    let file_scan_config =
-                        FileScanConfig::new(object_store_url, file_schema.clone(), file_source)
-                            .with_file_groups(vec![FileGroup::new(additional_data_files)])
-                            .with_statistics(statistics)
-                            .with_projection(projection.as_ref().cloned())
-                            .with_limit(limit)
-                            .with_table_partition_cols(table_partition_cols);
+                    let file_scan_config = FileScanConfigBuilder::new(
+                        object_store_url,
+                        file_schema.clone(),
+                        file_source,
+                    )
+                    .with_file_group(FileGroup::new(additional_data_files))
+                    .with_statistics(statistics)
+                    .with_projection(projection.as_ref().cloned())
+                    .with_limit(limit)
+                    .with_table_partition_cols(table_partition_cols)
+                    .build();
 
                     let data_files_scan = ParquetFormat::default()
                         .create_physical_plan(
@@ -726,12 +733,13 @@ async fn table_scan(
                 .collect()
         })
         .collect();
-    let file_scan_config = FileScanConfig::new(object_store_url, file_schema, file_source)
+    let file_scan_config = FileScanConfigBuilder::new(object_store_url, file_schema, file_source)
         .with_file_groups(file_groups)
         .with_statistics(statistics)
         .with_projection(projection)
         .with_limit(limit)
-        .with_table_partition_cols(table_partition_cols);
+        .with_table_partition_cols(table_partition_cols)
+        .build();
 
     let other_plan = ParquetFormat::default()
         .create_physical_plan(session, file_scan_config, physical_predicate.as_ref())
@@ -749,7 +757,9 @@ async fn table_scan(
 impl DisplayAs for DataFusionTable {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match t {
-            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+            DisplayFormatType::Default
+            | DisplayFormatType::Verbose
+            | DisplayFormatType::TreeRender => {
                 write!(f, "IcebergTable")
             }
             DisplayFormatType::TreeRender => {
@@ -979,7 +989,7 @@ mod tests {
         ctx.register_table("orders", table.clone()).unwrap();
 
         ctx.sql(
-            "INSERT INTO orders (id, customer_id, product_id, date, amount) VALUES 
+            "INSERT INTO orders (id, customer_id, product_id, date, amount) VALUES
                 (1, 1, 1, '2020-01-01', 1),
                 (2, 2, 1, '2020-01-01', 1),
                 (3, 3, 1, '2020-01-01', 3),
@@ -1030,7 +1040,7 @@ mod tests {
         }
 
         ctx.sql(
-            "INSERT INTO orders (id, customer_id, product_id, date, amount) VALUES 
+            "INSERT INTO orders (id, customer_id, product_id, date, amount) VALUES
                 (7, 1, 3, '2020-01-03', 1),
                 (8, 2, 1, '2020-01-03', 2),
                 (9, 2, 2, '2020-01-03', 1);",
@@ -1042,7 +1052,7 @@ mod tests {
         .expect("Failed to insert values into table");
 
         ctx.sql(
-            "INSERT INTO orders (id, customer_id, product_id, date, amount) VALUES 
+            "INSERT INTO orders (id, customer_id, product_id, date, amount) VALUES
                 (10, 1, 2, '2020-01-04', 3),
                 (11, 3, 1, '2020-01-04', 2),
                 (12, 2, 3, '2020-01-04', 1);",
@@ -1054,7 +1064,7 @@ mod tests {
         .expect("Failed to insert values into table");
 
         ctx.sql(
-            "INSERT INTO orders (id, customer_id, product_id, date, amount) VALUES 
+            "INSERT INTO orders (id, customer_id, product_id, date, amount) VALUES
                 (13, 1, 1, '2020-01-05', 4),
                 (14, 3, 2, '2020-01-05', 2),
                 (15, 2, 3, '2020-01-05', 3);",
@@ -1066,7 +1076,7 @@ mod tests {
         .expect("Failed to insert values into table");
 
         ctx.sql(
-            "INSERT INTO orders (id, customer_id, product_id, date, amount) VALUES 
+            "INSERT INTO orders (id, customer_id, product_id, date, amount) VALUES
                 (16, 2, 3, '2020-01-05', 3),
                 (17, 1, 3, '2020-01-06', 1),
                 (18, 2, 1, '2020-01-06', 2);",
@@ -1078,7 +1088,7 @@ mod tests {
         .expect("Failed to insert values into table");
 
         ctx.sql(
-            "INSERT INTO orders (id, customer_id, product_id, date, amount) VALUES 
+            "INSERT INTO orders (id, customer_id, product_id, date, amount) VALUES
                 (19, 2, 2, '2020-01-06', 1),
                 (20, 1, 2, '2020-01-07', 3),
                 (21, 3, 1, '2020-01-07', 2);",
@@ -1090,7 +1100,7 @@ mod tests {
         .expect("Failed to insert values into table");
 
         ctx.sql(
-            "INSERT INTO orders (id, customer_id, product_id, date, amount) VALUES 
+            "INSERT INTO orders (id, customer_id, product_id, date, amount) VALUES
                 (21, 3, 1, '2020-01-07', 2),
                 (22, 2, 3, '2020-01-07', 1),
                 (23, 1, 1, '2020-01-08', 4),
@@ -1271,7 +1281,7 @@ mod tests {
         }
 
         ctx.sql(
-            "INSERT INTO orders (id, customer_id, product_id, date, amount) VALUES 
+            "INSERT INTO orders (id, customer_id, product_id, date, amount) VALUES
                 (7, 1, 3, '2020-01-03', 1),
                 (8, 2, 1, '2020-01-03', 2),
                 (9, 2, 2, '2020-01-03', 1),
@@ -1412,7 +1422,7 @@ mod tests {
         ctx.register_catalog("iceberg", datafusion_catalog);
 
         ctx.sql(
-            "INSERT INTO iceberg.test.orders (id, customer_id, product_id, date, amount) VALUES 
+            "INSERT INTO iceberg.test.orders (id, customer_id, product_id, date, amount) VALUES
                 (1, 1, 1, '2020-01-01', 1),
                 (2, 2, 1, '2020-01-01', 1),
                 (3, 3, 1, '2020-01-01', 3),
@@ -1463,7 +1473,7 @@ mod tests {
         }
 
         ctx.sql(
-            "INSERT INTO iceberg.test.orders (id, customer_id, product_id, date, amount) VALUES 
+            "INSERT INTO iceberg.test.orders (id, customer_id, product_id, date, amount) VALUES
                 (7, 1, 3, '2020-01-03', 1),
                 (8, 2, 1, '2020-01-03', 2),
                 (9, 2, 2, '2020-01-03', 1);",
@@ -1580,7 +1590,7 @@ mod tests {
         ctx.register_table("orders", table).unwrap();
 
         ctx.sql(
-            "INSERT INTO orders (id, customer_id, product_id, date, amount) VALUES 
+            "INSERT INTO orders (id, customer_id, product_id, date, amount) VALUES
                 (1, 1, 1, '2020-01-01', 1),
                 (2, 2, 1, '2020-01-01', 1),
                 (3, 3, 1, '2020-01-01', 3),

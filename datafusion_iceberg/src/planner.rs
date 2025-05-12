@@ -2,8 +2,8 @@ use std::{fmt::Debug, hash::Hash, sync::Arc};
 
 use async_trait::async_trait;
 use datafusion_expr::{
-    ColumnarValue, CreateCatalogSchema, CreateView, DropCatalogSchema, DropTable, ScalarUDFImpl,
-    Signature, Volatility,
+    ColumnarValue, CreateCatalogSchema, CreateView, DropCatalogSchema, DropTable,
+    ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility,
 };
 use itertools::Itertools;
 use regex::Regex;
@@ -964,7 +964,7 @@ OPTIONS ('has_header' 'true');";
             .expect("Failed to execute query plan.");
 
         ctx.sql(
-            "INSERT INTO iceberg.public.orders (id, customer_id, product_id, order_date, quantity) VALUES 
+            "INSERT INTO iceberg.public.orders (id, customer_id, product_id, order_date, quantity) VALUES
                 (1, 1, 1, '2020-01-01', 1),
                 (2, 2, 1, '2020-01-01', 1),
                 (3, 3, 1, '2020-01-01', 3),

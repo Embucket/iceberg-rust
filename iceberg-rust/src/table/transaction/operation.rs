@@ -106,10 +106,8 @@ impl Operation {
                 let old_snapshot = table_metadata.current_snapshot(branch.as_deref())?;
 
                 let snapshot_operation = match (data_files.len(), delete_files.len()) {
-                    (0, 0) => Err(Error::InvalidFormat(
-                        "Empty data and delete files".to_string(),
-                    )),
-                    (_, 0) => Ok(SnapshotOperation::Append),
+                    (0, 0) => return Ok((None, Vec::new())),
+                    (_, 0) => Ok::<_, Error>(SnapshotOperation::Append),
                     (0, _) => Ok(SnapshotOperation::Delete),
                     (_, _) => Ok(SnapshotOperation::Overwrite),
                 }?;
@@ -510,7 +508,7 @@ impl Operation {
                 let mut snapshot_builder = SnapshotBuilder::default();
                 snapshot_builder
                     .with_snapshot_id(snapshot_id)
-                    .with_sequence_number(0)
+                    .with_sequence_number(sequence_number)
                     .with_schema_id(*schema.schema_id())
                     .with_manifest_list(new_manifest_list_location)
                     .with_summary(Summary {
@@ -521,18 +519,12 @@ impl Operation {
                     .build()
                     .map_err(iceberg_rust_spec::error::Error::from)?;
 
-                let old_snapshot_ids: Vec<i64> =
-                    table_metadata.snapshots.keys().map(Clone::clone).collect();
-
                 Ok((
                     old_snapshot.map(|x| TableRequirement::AssertRefSnapshotId {
                         r#ref: branch.clone().unwrap_or("main".to_owned()),
                         snapshot_id: Some(*x.snapshot_id()),
                     }),
                     vec![
-                        TableUpdate::RemoveSnapshots {
-                            snapshot_ids: old_snapshot_ids,
-                        },
                         TableUpdate::AddSnapshot { snapshot },
                         TableUpdate::SetSnapshotRef {
                             ref_name: branch.unwrap_or("main".to_owned()),
