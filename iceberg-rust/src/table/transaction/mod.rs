@@ -21,7 +21,6 @@ use iceberg_rust_spec::spec::{manifest::DataFile, schema::Schema, snapshot::Snap
 
 use crate::table::transaction::append::append_summary;
 use crate::{catalog::commit::CommitTable, error::Error, table::Table};
-use crate::table::transaction::append::append_summary;
 
 use self::operation::Operation;
 
