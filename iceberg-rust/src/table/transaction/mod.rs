@@ -21,10 +21,9 @@ use iceberg_rust_spec::spec::{manifest::DataFile, schema::Schema, snapshot::Snap
 
 use crate::table::transaction::append::append_summary;
 use crate::{catalog::commit::CommitTable, error::Error, table::Table};
+use crate::table::transaction::append::append_summary;
 
 use self::operation::Operation;
-
-use super::delete_all_table_files;
 
 pub(crate) mod append;
 pub(crate) mod operation;
@@ -333,24 +332,7 @@ impl<'table> TableTransaction<'table> {
     /// ```
     pub async fn commit(self) -> Result<(), Error> {
         let catalog = self.table.catalog();
-        let object_store = self.table.object_store();
         let identifier = self.table.identifier.clone();
-
-        // Save old metadata to be able to remove old data after a rewrite operation
-        let delete_data = if self.operations.values().any(|x| {
-            matches!(
-                x,
-                Operation::Replace {
-                    branch: _,
-                    files: _,
-                    additional_summary: _,
-                }
-            )
-        }) {
-            Some(self.table.metadata())
-        } else {
-            None
-        };
 
         // Execute the table operations
         let (mut requirements, mut updates) = (Vec::new(), Vec::new());
@@ -365,6 +347,10 @@ impl<'table> TableTransaction<'table> {
             updates.extend(update);
         }
 
+        if updates.is_empty() {
+            return Ok(());
+        }
+
         let new_table = catalog
             .clone()
             .update_table(CommitTable {
@@ -373,10 +359,6 @@ impl<'table> TableTransaction<'table> {
                 updates,
             })
             .await?;
-
-        if let Some(old_metadata) = delete_data {
-            delete_all_table_files(old_metadata, object_store).await?;
-        }
 
         *self.table = new_table;
         Ok(())

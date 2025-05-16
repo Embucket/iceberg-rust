@@ -1,4 +1,3 @@
-use core::panic;
 use std::{
     fmt::{self, Debug},
     hash::Hash,
