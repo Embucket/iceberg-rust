@@ -47,7 +47,8 @@ impl Operation {
                 schema,
                 branch,
             } => {
-                let schema_changed = metadata.current_schema(branch.as_deref())
+                let schema_changed = metadata
+                    .current_schema(branch.as_deref())
                     .map(|s| schema != *s.fields())
                     .unwrap_or(true);
 
@@ -56,7 +57,10 @@ impl Operation {
                 let schema_id = if schema_changed {
                     metadata.schemas.keys().max().unwrap_or(&0) + 1
                 } else {
-                    *metadata.current_schema(branch.as_deref()).unwrap().schema_id()
+                    *metadata
+                        .current_schema(branch.as_deref())
+                        .unwrap()
+                        .schema_id()
                 };
                 let last_column_id = schema.iter().map(|x| x.id).max().unwrap_or(0);
 
