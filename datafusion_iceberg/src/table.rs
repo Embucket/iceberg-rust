@@ -797,6 +797,11 @@ impl DataSink for IcebergDataSink {
             write_parquet_partitioned(table, data.map_err(Into::into), self.0.branch.as_deref())
                 .await?;
 
+        let count = metadata_files
+            .iter()
+            .map(|x| x.record_count())
+            .fold(0, |acc, x| acc + x);
+
         table
             .new_transaction(self.0.branch.as_deref())
             .append_data(metadata_files)
@@ -804,7 +809,7 @@ impl DataSink for IcebergDataSink {
             .await
             .map_err(DataFusionIcebergError::from)?;
 
-        Ok(0)
+        Ok(count as u64)
     }
     fn metrics(&self) -> Option<MetricsSet> {
         None
