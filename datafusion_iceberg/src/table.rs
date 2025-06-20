@@ -17,16 +17,17 @@ use std::{
 };
 use tokio::sync::{RwLock, RwLockWriteGuard};
 
+use datafusion::datasource::physical_plan::FileGroup;
 use datafusion::{
     arrow::datatypes::{Field, Schema as ArrowSchema, SchemaRef},
     catalog::Session,
     common::{not_impl_err, plan_err, DataFusionError, SchemaExt},
+    datasource::sink::{DataSink, DataSinkExec},
     datasource::{
         file_format::{parquet::ParquetFormat, FileFormat},
         listing::PartitionedFile,
         object_store::ObjectStoreUrl,
-        physical_plan::{parquet::source::ParquetSource, FileGroup, FileScanConfigBuilder},
-        sink::{DataSink, DataSinkExec},
+        physical_plan::{parquet::source::ParquetSource, FileScanConfigBuilder},
         TableProvider, ViewTable,
     },
     execution::{context::SessionState, TaskContext},
@@ -262,6 +263,7 @@ impl TableProvider for DataFusionTable {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(deprecated)]
 async fn table_scan(
     table: &Table,
     snapshot_range: &(Option<i64>, Option<i64>),
@@ -889,7 +891,6 @@ fn value_to_scalarvalue(value: &Value) -> Result<ScalarValue, DataFusionError> {
 
 #[cfg(test)]
 mod tests {
-
     use datafusion::{arrow::array::Int64Array, prelude::SessionContext};
     use iceberg_rust::{
         catalog::tabular::Tabular,

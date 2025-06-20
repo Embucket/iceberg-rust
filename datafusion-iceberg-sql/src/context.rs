@@ -91,7 +91,7 @@ impl ContextProvider for IcebergContext {
     fn get_function_meta(&self, name: &str) -> Option<Arc<ScalarUDF>> {
         self.function_registry.udf(name).ok()
     }
-    fn get_variable_type(&self, _variable_names: &[String]) -> Option<DataType> {
+    fn get_variable_type(&self, _variable_names: &[String]) -> Option<datafusion_common::arrow::datatypes::DataType> {
         None
     }
     fn get_aggregate_meta(&self, name: &str) -> Option<Arc<AggregateUDF>> {

@@ -11,6 +11,7 @@
 
 use std::collections::HashMap;
 
+use crate::error::Error;
 use iceberg_rust_spec::{
     spec::{
         partition::PartitionSpec,
@@ -25,8 +26,6 @@ use iceberg_rust_spec::{
 };
 use serde_derive::{Deserialize, Serialize};
 use uuid::Uuid;
-
-use crate::error::Error;
 
 use super::identifier::Identifier;
 
