@@ -1704,20 +1704,29 @@ mod tests {
 
         ctx.register_table("orders", table.clone()).unwrap();
 
-        ctx.sql(
-            "INSERT INTO orders (id, customer_id, product_id, date, amount) VALUES
+        let res = ctx
+            .sql(
+                "INSERT INTO orders (id, customer_id, product_id, date, amount) VALUES
                 (1, 1, 1, '2020-01-01', 1),
                 (2, 2, 1, '2020-01-01', 1),
                 (3, 3, 1, '2020-01-01', 3),
                 (4, 1, 2, '2020-02-02', 1),
                 (5, 1, 1, '2020-02-02', 2),
                 (6, 3, 3, '2020-02-02', 3);",
-        )
-        .await
-        .expect("Failed to create query plan for insert")
-        .collect()
-        .await
-        .expect("Failed to insert values into table");
+            )
+            .await
+            .expect("Failed to create query plan for insert")
+            .collect()
+            .await
+            .expect("Failed to insert values into table");
+
+        let count = res[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .values()[0];
+        assert_eq!(count, 6);
 
         let batches = ctx
             .sql("select product_id, sum(amount) from orders where customer_id = 1 group by product_id;")
