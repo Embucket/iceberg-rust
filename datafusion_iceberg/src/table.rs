@@ -1006,6 +1006,11 @@ impl DataSink for IcebergDataSink {
         let metadata_files =
             write_parquet_data_files(&table, data, context, self.0.branch.as_deref()).await?;
 
+        let count = metadata_files
+            .iter()
+            .map(|x| x.record_count())
+            .fold(0, |acc, x| acc + x);
+
         table
             .new_transaction(self.0.branch.as_deref())
             .append_data(metadata_files)
@@ -1017,7 +1022,7 @@ impl DataSink for IcebergDataSink {
         let mut lock = self.0.tabular.write().unwrap();
         *lock = Tabular::Table(table);
 
-        Ok(0)
+        Ok(count as u64)
     }
     fn metrics(&self) -> Option<MetricsSet> {
         None
