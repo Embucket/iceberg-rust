@@ -495,7 +495,7 @@ impl Operation {
                 Ok((
                     Some(TableRequirement::AssertRefSnapshotId {
                         r#ref: branch.clone().unwrap_or("main".to_owned()),
-                        snapshot_id: *old_snapshot.snapshot_id(),
+                        snapshot_id: Some(*old_snapshot.snapshot_id()),
                     }),
                     vec![
                         TableUpdate::AddSnapshot { snapshot },
