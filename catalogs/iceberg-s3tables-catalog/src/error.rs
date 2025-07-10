@@ -3,7 +3,6 @@ use aws_sdk_s3tables::{
     error::SdkError,
     operation::{
         create_namespace::CreateNamespaceError, create_table::CreateTableError,
-        delete_namespace::DeleteNamespaceError, get_namespace::GetNamespaceError,
         delete_table::DeleteTableError, get_table::GetTableError,
         list_namespaces::ListNamespacesError, list_tables::ListTablesError,
         update_table_metadata_location::UpdateTableMetadataLocationError,
@@ -20,10 +19,6 @@ pub enum Error {
     ParseError(#[from] url::ParseError),
     #[error(transparent)]
     CreateNamespace(#[from] SdkError<CreateNamespaceError, HttpResponse>),
-    #[error(transparent)]
-    DeleteNamespace(#[from] SdkError<DeleteNamespaceError, HttpResponse>),
-    #[error(transparent)]
-    GetNamespace(#[from] SdkError<GetNamespaceError, HttpResponse>),
     #[error(transparent)]
     ListTables(#[from] SdkError<ListTablesError, HttpResponse>),
     #[error(transparent)]
