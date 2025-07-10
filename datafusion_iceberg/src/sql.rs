@@ -17,16 +17,18 @@ pub(crate) fn transform_relations(sql: &str) -> Result<Vec<String>, Error> {
     let mut statements = Parser::parse_sql(&GenericDialect, sql)?;
 
     visit_relations_mut(&mut statements, |relation| {
-        let combined_name = relation.0.iter()
+        let combined_name = relation
+            .0
+            .iter()
             .map(|part| match part {
-                ObjectNamePart::Identifier(ident) => ident.value.as_str()
+                ObjectNamePart::Identifier(ident) => ident.value.as_str(),
             })
             .intersperse(".")
             .collect::<String>();
-        
+
         let transformed_name = transform_name(&combined_name);
         relation.0 = vec![ObjectNamePart::Identifier(Ident::new(transformed_name))];
-        
+
         ControlFlow::<()>::Continue(())
     });
 
