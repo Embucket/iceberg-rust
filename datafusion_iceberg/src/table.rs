@@ -345,6 +345,7 @@ fn fake_object_store_url(table_location_url: &str) -> ObjectStoreUrl {
             .replace('/', "-2F")
             .replace(':', "-3A")
             .replace(' ', "-20")
+            .replace('%', "-25")
     ))
     .expect("Invalid object store url.")
 }
