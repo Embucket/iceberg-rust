@@ -3378,7 +3378,7 @@ dependencies = [
  "serde_derive",
  "serde_json",
  "smallvec",
- "sqlparser 0.58.0 (git+https://github.com/Embucket/datafusion-sqlparser-rs.git?rev=7dbb724b8173db35363fa07a2bb2b8bef35ac098)",
+ "sqlparser 0.58.0 (git+https://github.com/Embucket/datafusion-sqlparser-rs.git?rev=28012078c09714542c95ddbad8203a282fa37cb2)",
  "thiserror",
  "thrift",
  "tokio",
@@ -5619,11 +5619,11 @@ dependencies = [
 [[package]]
 name = "sqlparser"
 version = "0.58.0"
-source = "git+https://github.com/Embucket/datafusion-sqlparser-rs.git?rev=7dbb724b8173db35363fa07a2bb2b8bef35ac098#7dbb724b8173db35363fa07a2bb2b8bef35ac098"
+source = "git+https://github.com/Embucket/datafusion-sqlparser-rs.git?rev=28012078c09714542c95ddbad8203a282fa37cb2#28012078c09714542c95ddbad8203a282fa37cb2"
 dependencies = [
  "log",
  "recursive",
- "sqlparser_derive 0.3.0 (git+https://github.com/Embucket/datafusion-sqlparser-rs.git?rev=7dbb724b8173db35363fa07a2bb2b8bef35ac098)",
+ "sqlparser_derive 0.3.0 (git+https://github.com/Embucket/datafusion-sqlparser-rs.git?rev=28012078c09714542c95ddbad8203a282fa37cb2)",
 ]
 
 [[package]]
@@ -5640,7 +5640,7 @@ dependencies = [
 [[package]]
 name = "sqlparser_derive"
 version = "0.3.0"
-source = "git+https://github.com/Embucket/datafusion-sqlparser-rs.git?rev=7dbb724b8173db35363fa07a2bb2b8bef35ac098#7dbb724b8173db35363fa07a2bb2b8bef35ac098"
+source = "git+https://github.com/Embucket/datafusion-sqlparser-rs.git?rev=28012078c09714542c95ddbad8203a282fa37cb2#28012078c09714542c95ddbad8203a282fa37cb2"
 dependencies = [
  "proc-macro2",
  "quote",
