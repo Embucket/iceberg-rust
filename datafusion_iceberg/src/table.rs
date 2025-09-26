@@ -528,6 +528,10 @@ async fn table_scan(
         (itertools::Either::Right(iter), statistics)
     };
 
+    async move { () }
+        .instrument(tracing::trace_span!("test_span"))
+        .await;
+
     if partition_fields.is_empty() {
         let (data_files, equality_delete_files): (Vec<_>, Vec<_>) = content_file_iter
             .filter(|manifest| *manifest.1.status() != Status::Deleted)
