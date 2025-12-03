@@ -274,7 +274,7 @@ impl Operation {
                 Ok((
                     old_snapshot.map(|x| TableRequirement::AssertRefSnapshotId {
                         r#ref: branch.clone().unwrap_or("main".to_owned()),
-                        snapshot_id: *x.snapshot_id(),
+                        snapshot_id: Some(*x.snapshot_id()),
                     }),
                     vec![
                         TableUpdate::AddSnapshot { snapshot },
@@ -450,7 +450,7 @@ impl Operation {
                 Ok((
                     old_snapshot.map(|x| TableRequirement::AssertRefSnapshotId {
                         r#ref: branch.clone().unwrap_or("main".to_owned()),
-                        snapshot_id: *x.snapshot_id(),
+                        snapshot_id: Some(*x.snapshot_id()),
                     }),
                     vec![
                         TableUpdate::AddSnapshot { snapshot },
@@ -621,7 +621,7 @@ impl Operation {
                 Ok((
                     old_snapshot.map(|x| TableRequirement::AssertRefSnapshotId {
                         r#ref: branch.clone().unwrap_or("main".to_owned()),
-                        snapshot_id: *x.snapshot_id(),
+                        snapshot_id: Some(*x.snapshot_id()),
                     }),
                     vec![
                         TableUpdate::AddSnapshot { snapshot },
@@ -806,7 +806,7 @@ impl Operation {
                 Ok((
                     Some(TableRequirement::AssertRefSnapshotId {
                         r#ref: branch.clone().unwrap_or("main".to_owned()),
-                        snapshot_id: *old_snapshot.snapshot_id(),
+                        snapshot_id: Some(*old_snapshot.snapshot_id()),
                     }),
                     vec![
                         TableUpdate::AddSnapshot { snapshot },
@@ -843,7 +843,7 @@ impl Operation {
                         .get(&key)
                         .map(|x| TableRequirement::AssertRefSnapshotId {
                             r#ref: key.clone(),
-                            snapshot_id: x.snapshot_id,
+                            snapshot_id: Some(x.snapshot_id),
                         }),
                     vec![TableUpdate::SetSnapshotRef {
                         ref_name: key,
