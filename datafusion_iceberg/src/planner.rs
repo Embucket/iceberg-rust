@@ -815,14 +815,14 @@ impl ScalarUDFImpl for RefreshMaterializedView {
 
         let catalog_list = self.catalog_list.clone();
 
-        tokio::task::spawn(async move {
+        let runtime_handle = tokio::runtime::Handle::current();
+        runtime_handle.block_on(async move {
             let catalog_name = &identifier.catalog;
             let catalog = catalog_list
                 .catalog(catalog_name)
                 .ok_or(DataFusionError::Execution(format!(
                     "Catalog {catalog_name} not found."
-                )))
-                .unwrap();
+                )))?;
 
             let Tabular::MaterializedView(mut matview) = catalog
                 .load_tabular(&Identifier::new(
@@ -830,16 +830,19 @@ impl ScalarUDFImpl for RefreshMaterializedView {
                     &identifier.table,
                 ))
                 .await
-                .map_err(|err| DataFusionError::External(Box::new(err)))
-                .unwrap()
+                .map_err(|err| DataFusionError::External(Box::new(err)))?
             else {
-                panic!("Failed to load table {identifier}");
+                return Err(DataFusionError::Execution(format!(
+                    "Expected MaterializedView but got different tabular type for {identifier}"
+                )));
             };
 
             refresh_materialized_view(&mut matview, catalog_list, None)
                 .await
-                .unwrap();
-        });
+                .map_err(|err| DataFusionError::External(Box::new(err)))?;
+
+            Ok(())
+        })?;
 
         Ok(ColumnarValue::Scalar(ScalarValue::Utf8(Some(
             "Refresh successful".to_string(),
