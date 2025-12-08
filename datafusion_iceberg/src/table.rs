@@ -44,10 +44,7 @@ use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::{
     arrow::datatypes::{DataType, Field, Schema as ArrowSchema, SchemaBuilder, SchemaRef},
     catalog::Session,
-    common::{
-        not_impl_err, plan_err, runtime::SpawnedTask, DataFusionError, Result as DFResult,
-        SchemaExt,
-    },
+    common::{not_impl_err, plan_err, runtime::SpawnedTask, DataFusionError, SchemaExt},
     config::TableParquetOptions,
     datasource::{
         file_format::{
@@ -59,10 +56,7 @@ use datafusion::{
         object_store::ObjectStoreUrl,
         physical_plan::{
             parquet::source::ParquetSource, FileGroup, FileScanConfigBuilder, FileSink,
-            FileSinkConfig, FileSource,
-        },
-        schema_adapter::{
-            DefaultSchemaAdapterFactory, SchemaAdapter, SchemaAdapterFactory, SchemaMapper,
+            FileSinkConfig,
         },
         sink::{DataSink, DataSinkExec},
         TableProvider, ViewTable,
@@ -100,62 +94,6 @@ use iceberg_rust::{
 
 static DATA_FILE_PATH_COLUMN: &str = "__data_file_path";
 static MANIFEST_FILE_PATH_COLUMN: &str = "__manifest_file_path";
-
-/// A schema adapter factory that normalizes file field names to lowercase
-/// before delegating to the default adapter, ensuring case-insensitive mapping
-/// between table schema and physical Parquet files.
-#[derive(Debug, Default)]
-struct CaseInsensitiveSchemaAdapterFactory;
-
-impl SchemaAdapterFactory for CaseInsensitiveSchemaAdapterFactory {
-    fn create(
-        &self,
-        projected_table_schema: SchemaRef,
-        _file_schema: SchemaRef,
-    ) -> Box<dyn SchemaAdapter> {
-        Box::new(CaseInsensitiveSchemaAdapter {
-            inner: DefaultSchemaAdapterFactory::from_schema(projected_table_schema),
-        })
-    }
-}
-
-struct CaseInsensitiveSchemaAdapter {
-    inner: Box<dyn SchemaAdapter>,
-}
-
-impl std::fmt::Debug for CaseInsensitiveSchemaAdapter {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CaseInsensitiveSchemaAdapter").finish()
-    }
-}
-
-impl SchemaAdapter for CaseInsensitiveSchemaAdapter {
-    fn map_column_index(&self, index: usize, file_schema: &ArrowSchema) -> Option<usize> {
-        let normalized = normalize_schema_case(file_schema);
-        self.inner.map_column_index(index, &normalized)
-    }
-
-    fn map_schema(
-        &self,
-        file_schema: &ArrowSchema,
-    ) -> DFResult<(Arc<dyn SchemaMapper>, Vec<usize>)> {
-        let normalized = normalize_schema_case(file_schema);
-        self.inner.map_schema(&normalized)
-    }
-}
-
-fn normalize_schema_case(schema: &ArrowSchema) -> ArrowSchema {
-    let fields = schema
-        .fields()
-        .iter()
-        .map(|field| {
-            let mut cloned = field.as_ref().clone();
-            cloned.set_name(field.name().to_ascii_lowercase());
-            cloned
-        })
-        .collect::<Vec<_>>();
-    ArrowSchema::new(fields)
-}
 
 #[derive(Debug, Clone)]
 /// Iceberg table for datafusion
@@ -673,24 +611,21 @@ async fn table_scan(
         });
     }
 
-    let schema_adapter_factory: Arc<dyn SchemaAdapterFactory> =
-        Arc::new(CaseInsensitiveSchemaAdapterFactory::default());
-
     let file_source = {
         let physical_predicate = physical_predicate.clone();
-        let schema_adapter = Arc::clone(&schema_adapter_factory);
         async move {
-            let source = if let Some(physical_predicate) = physical_predicate.clone() {
-                ParquetSource::default()
-                    .with_predicate(physical_predicate)
-                    .with_pushdown_filters(true)
-            } else {
-                ParquetSource::default()
-            };
-            source.with_schema_adapter_factory(schema_adapter)
+            Arc::new(
+                if let Some(physical_predicate) = physical_predicate.clone() {
+                    ParquetSource::default()
+                        .with_predicate(physical_predicate)
+                        .with_pushdown_filters(true)
+                } else {
+                    ParquetSource::default()
+                },
+            )
         }
         .instrument(tracing::debug_span!("datafusion_iceberg::file_source"))
-        .await?
+        .await
     };
 
     // Create plan for every partition with delete files
@@ -703,7 +638,6 @@ async fn table_scan(
             let schema = &schema;
             let file_schema = file_schema.clone();
             let file_source = file_source.clone();
-            let schema_adapter_factory = Arc::clone(&schema_adapter_factory);
             let projection_expr = projection_expr.clone();
             let projection = &projection;
             let mut data_files = data_file_groups
@@ -760,7 +694,6 @@ async fn table_scan(
                         let schema = &schema;
                         let file_schema: Arc<ArrowSchema> = file_schema.clone();
                         let file_source = file_source.clone();
-                        let schema_adapter_factory = Arc::clone(&schema_adapter_factory);
                         let mut data_files = Vec::new();
                         let equality_projection = equality_projection.clone();
 
@@ -810,16 +743,15 @@ async fn table_scan(
                                 manifest_path,
                             )?;
 
-                            let delete_source =
+                            let delete_file_source = Arc::new(
                                 if let Some(physical_predicate) = physical_predicate.clone() {
                                     ParquetSource::default()
                                         .with_predicate(physical_predicate)
                                         .with_pushdown_filters(true)
                                 } else {
                                     ParquetSource::default()
-                                };
-                            let delete_file_source = delete_source
-                                .with_schema_adapter_factory(Arc::clone(&schema_adapter_factory))?;
+                                },
+                            );
 
                             let delete_file_scan_config = FileScanConfigBuilder::new(
                                 object_store_url.clone(),
