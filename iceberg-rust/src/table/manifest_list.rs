@@ -34,7 +34,7 @@ use crate::{
 };
 
 use super::{
-    manifest::{ManifestReader, ManifestWriter},
+    manifest::{FilteredManifestStats, ManifestReader, ManifestWriter},
     transaction::{
         append::{
             select_manifest_partitioned, select_manifest_unpartitioned, split_datafiles,
@@ -1192,8 +1192,8 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
     /// * `object_store` - The object store for reading existing and writing new manifest files
     ///
     /// # Returns
-    /// * `Result<(), Error>` - Ok if all manifests were successfully processed and filtered
-    ///
+    /// * `Result<FilteredManifestStats, Error>` - Ok if all manifests were successfully processed and filtered, along with
+    ///   statistics about the removed files
     /// # Errors
     /// Returns an error if:
     /// * A manifest path is not found in the `data_files_to_filter` map
@@ -1227,7 +1227,7 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
         manifests_to_overwrite: Vec<ManifestListEntry>,
         data_files_to_filter: &HashMap<String, Vec<String>>,
         object_store: Arc<dyn ObjectStore>,
-    ) -> Result<(), Error> {
+    ) -> Result<FilteredManifestStats, Error> {
         let partition_fields = self
             .table_metadata
             .current_partition_fields(self.branch.as_deref())?;
@@ -1269,16 +1269,22 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
                     branch.as_deref(),
                 )?;
 
+                let stats = manifest_writer.filtered_stats();
+
                 let new_manifest = manifest_writer.finish(object_store.clone()).await?;
 
-                Ok::<_, Error>(new_manifest)
+                Ok::<_, Error>((new_manifest, stats))
             }
         });
+        let mut removed_stats = FilteredManifestStats::default();
         for manifest_res in join_all(futures).await {
-            let manifest = manifest_res?;
+            let (manifest, stats) = manifest_res?;
+            removed_stats.removed_data_files += stats.removed_data_files;
+            removed_stats.removed_records += stats.removed_records;
+            removed_stats.removed_file_size += stats.removed_file_size;
             self.writer.append_ser(manifest)?;
         }
-        Ok(())
+        Ok(removed_stats)
     }
 
     pub(crate) fn selected_data_manifest(&self) -> Option<&ManifestListEntry> {
