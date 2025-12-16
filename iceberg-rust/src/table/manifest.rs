@@ -590,7 +590,7 @@ impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
         manifest.sequence_number = table_metadata.last_sequence_number + 1;
         manifest.min_sequence_number = min_sequence_number.min(manifest.sequence_number);
 
-        manifest.existing_files_count = Some(existing_files as i32);
+        manifest.existing_files_count = Some(existing_files);
         manifest.added_files_count = Some(0);
         manifest.deleted_files_count = Some(0);
         manifest.added_rows_count = Some(0);

@@ -72,7 +72,6 @@ use futures::stream;
 
 use iceberg_rust::arrow::write::write_parquet_partitioned;
 use iceberg_rust::catalog::Catalog;
-use iceberg_rust::error::Error;
 use iceberg_rust::object_store::{Bucket, ObjectStoreBuilder};
 use iceberg_rust::table::Table;
 use iceberg_rust_spec::spec::partition::PartitionSpec;
