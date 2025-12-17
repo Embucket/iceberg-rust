@@ -201,6 +201,14 @@ pub(crate) struct ManifestWriter<'schema, 'metadata> {
     writer: AvroWriter<'schema, Vec<u8>>,
 }
 
+#[derive(Default, Debug, Clone, Copy)]
+pub(crate) struct FilteredManifestStats {
+    pub removed_data_files: i64,
+    pub removed_delete_files: i64,
+    pub removed_records: i64,
+    pub removed_file_size_bytes: i64,
+}
+
 impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
     /// Creates a new ManifestWriter for writing manifest entries to a new manifest file.
     ///
@@ -464,10 +472,11 @@ impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
         schema: &'schema AvroSchema,
         table_metadata: &'metadata TableMetadata,
         branch: Option<&str>,
-    ) -> Result<Self, Error> {
+    ) -> Result<(Self, FilteredManifestStats), Error> {
         let manifest_reader = ManifestReader::new(bytes)?;
 
         let mut writer = AvroWriter::new(schema, Vec::new());
+        let mut filtered_stats = FilteredManifestStats::default();
         reset_manifest_summary(&mut manifest, table_metadata);
         writer.add_user_metadata(
             "format-version".to_string(),
@@ -520,37 +529,43 @@ impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
             },
         )?;
 
-        writer.extend(manifest_reader.filter_map(|entry| {
-            let mut entry = entry
-                .map_err(|err| apache_avro::Error::DeserializeValue(err.to_string()))
-                .unwrap();
-            if !filter.contains(entry.data_file().file_path()) {
-                *entry.status_mut() = Status::Existing;
-                if entry.sequence_number().is_none() {
-                    *entry.sequence_number_mut() = Some(manifest.sequence_number);
-                }
-                if entry.snapshot_id().is_none() {
-                    *entry.snapshot_id_mut() = Some(manifest.added_snapshot_id);
-                }
-                Some(to_value(entry).unwrap())
-            } else {
-                None
-            }
-        }))?;
-
-        manifest.sequence_number = table_metadata.last_sequence_number + 1;
-
-        manifest.existing_files_count = Some(
-            manifest.existing_files_count.unwrap_or(0) + manifest.added_files_count.unwrap_or(0),
-        );
-
-        manifest.added_files_count = None;
-
-        Ok(ManifestWriter {
+        let mut manifest_writer = ManifestWriter {
             manifest,
             writer,
             table_metadata,
-        })
+        };
+
+        for entry in manifest_reader {
+            let mut entry = entry?;
+            if filter.contains(entry.data_file().file_path()) {
+                match entry.data_file().content() {
+                    Content::Data => {
+                        filtered_stats.removed_data_files += 1;
+                        filtered_stats.removed_records += entry.data_file().record_count();
+                        filtered_stats.removed_file_size_bytes +=
+                            entry.data_file().file_size_in_bytes();
+                    }
+                    _ => {
+                        filtered_stats.removed_delete_files += 1;
+                        filtered_stats.removed_file_size_bytes +=
+                            entry.data_file().file_size_in_bytes();
+                    }
+                }
+                continue;
+            }
+
+            *entry.status_mut() = Status::Existing;
+            if entry.sequence_number().is_none() {
+                *entry.sequence_number_mut() = Some(manifest_writer.manifest.sequence_number);
+            }
+            if entry.snapshot_id().is_none() {
+                *entry.snapshot_id_mut() = Some(manifest_writer.manifest.added_snapshot_id);
+            }
+
+            manifest_writer.append(entry)?;
+        }
+
+        Ok((manifest_writer, filtered_stats))
     }
 
     /// Appends a manifest entry to the manifest file and updates summary statistics.

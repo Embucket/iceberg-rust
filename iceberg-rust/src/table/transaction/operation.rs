@@ -655,7 +655,7 @@ impl Operation {
                 }
 
                 // Compute summary before moving data_files
-                let summary_fields = update_snapshot_summary(
+                let mut summary_fields = update_snapshot_summary(
                     Some(old_snapshot.summary()),
                     data_files.iter(),
                     std::iter::empty::<&DataFile>(), // No separate delete files in this operation
@@ -680,13 +680,33 @@ impl Operation {
                         branch.as_deref(),
                     )?;
 
-                manifest_list_writer
+                let filtered_stats = manifest_list_writer
                     .append_and_filter(
                         manifests_to_overwrite,
                         &files_to_overwrite,
                         object_store.clone(),
                     )
                     .await?;
+
+                let mut subtract_from_summary = |key: &str, delta: i64| {
+                    if delta == 0 {
+                        return;
+                    }
+                    let current = summary_fields
+                        .get(key)
+                        .and_then(|v| v.parse::<i64>().ok())
+                        .unwrap_or(0);
+                    let updated = (current - delta).max(0);
+                    summary_fields.insert(key.to_string(), updated.to_string());
+                };
+
+                subtract_from_summary("total-records", filtered_stats.removed_records);
+                subtract_from_summary("total-data-files", filtered_stats.removed_data_files);
+                subtract_from_summary("total-delete-files", filtered_stats.removed_delete_files);
+                subtract_from_summary(
+                    "total-file-size-bytes",
+                    filtered_stats.removed_file_size_bytes,
+                );
 
                 let n_splits =
                     manifest_list_writer.n_splits(n_data_files, ManifestListContent::Data);
