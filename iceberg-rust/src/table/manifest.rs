@@ -486,7 +486,8 @@ impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
         branch: Option<&str>,
     ) -> Result<Self, Error> {
         let fallback_schema = table_metadata.current_schema(None)?;
-        let manifest_reader = ManifestReader::new_with_fallback_schema(bytes, Some(fallback_schema.clone()))?;
+        let manifest_reader =
+            ManifestReader::new_with_fallback_schema(bytes, Some(fallback_schema.clone()))?;
 
         let mut writer = AvroWriter::new(schema, Vec::new());
 
@@ -547,7 +548,7 @@ impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
         let mut min_sequence_number = manifest.sequence_number;
 
         let mut removed_data_files = 0i64;
-        let mut removed_data_rows  = 0i64;
+        let mut removed_data_rows = 0i64;
         let mut removed_data_size = 0i64;
 
         for entry in manifest_reader {

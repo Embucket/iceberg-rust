@@ -684,7 +684,7 @@ impl Operation {
                         branch.as_deref(),
                     )?;
 
-                let rewrite_summary =manifest_list_writer
+                let rewrite_summary = manifest_list_writer
                     .append_and_filter(
                         manifests_to_overwrite,
                         &files_to_overwrite,
@@ -995,7 +995,7 @@ pub fn update_snapshot_summary<'files>(
     let total_data_files = old_total_data_files - removed.removed_data_files + added_data_files;
     let total_delete_files = old_total_delete_files + added_delete_files;
     let total_file_size = old_total_file_size - removed.removed_data_size + added_files_size;
-    
+
     // Build result map
     let mut result = HashMap::new();
     result.insert("total-records".to_string(), total_records.to_string());
