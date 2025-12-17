@@ -337,6 +337,8 @@ impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
     ) -> Result<Self, Error> {
         let mut writer = AvroWriter::new(schema, Vec::new());
 
+        reset_manifest_summary(&mut manifest, table_metadata);
+
         writer.add_user_metadata(
             "format-version".to_string(),
             match table_metadata.format_version {
@@ -466,7 +468,7 @@ impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
         let manifest_reader = ManifestReader::new(bytes)?;
 
         let mut writer = AvroWriter::new(schema, Vec::new());
-
+        reset_manifest_summary(&mut manifest, table_metadata);
         writer.add_user_metadata(
             "format-version".to_string(),
             match table_metadata.format_version {
@@ -727,6 +729,19 @@ impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
         };
         Ok((self.manifest, future))
     }
+}
+
+fn reset_manifest_summary(manifest: &mut ManifestListEntry, table_metadata: &TableMetadata) {
+    manifest.sequence_number = table_metadata.last_sequence_number + 1;
+    manifest.min_sequence_number = 0;
+    manifest.manifest_length = 0;
+    manifest.added_files_count = Some(0);
+    manifest.existing_files_count = Some(0);
+    manifest.deleted_files_count = Some(0);
+    manifest.added_rows_count = Some(0);
+    manifest.existing_rows_count = Some(0);
+    manifest.deleted_rows_count = Some(0);
+    manifest.partitions = None;
 }
 
 #[allow(clippy::type_complexity)]
