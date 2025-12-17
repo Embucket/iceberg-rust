@@ -657,16 +657,6 @@ impl Operation {
                     return Ok((None, Vec::new()));
                 }
 
-                // Compute summary before moving data_files
-                let mut summary_fields = update_snapshot_summary(
-                    Some(old_snapshot.summary()),
-                    data_files.iter(),
-                    std::iter::empty::<&DataFile>(), // No separate delete files in this operation
-                    None,
-                );
-
-                let data_files_iter = data_files.iter();
-
                 let manifests_to_overwrite: HashSet<String> =
                     files_to_overwrite.keys().map(ToOwned::to_owned).collect();
 
@@ -677,7 +667,7 @@ impl Operation {
                 let (mut manifest_list_writer, manifests_to_overwrite) =
                     ManifestListWriter::from_existing_without_overwrites(
                         &bytes,
-                        data_files_iter,
+                        data_files.iter(),
                         &manifests_to_overwrite,
                         manifest_list_schema,
                         table_metadata,
@@ -692,19 +682,12 @@ impl Operation {
                     )
                     .await?;
 
-                if rewrite_summary.removed_data_files > 0 {
-                    let removed_summary = ManifestRewriteSummary {
-                        removed_data_files: rewrite_summary.removed_data_files,
-                        removed_data_rows: rewrite_summary.removed_data_rows,
-                        removed_data_size: rewrite_summary.removed_data_size,
-                    };
-                    summary_fields = update_snapshot_summary(
-                        Some(old_snapshot.summary()),
-                        data_files.iter(),
-                        std::iter::empty::<&DataFile>(),
-                        Some(&removed_summary),
-                    );
-                }
+                let summary_fields = update_snapshot_summary(
+                    Some(old_snapshot.summary()),
+                    data_files.iter(),
+                    std::iter::empty::<&DataFile>(),
+                    Some(&rewrite_summary),
+                );
 
                 let n_splits =
                     manifest_list_writer.n_splits(n_data_files, ManifestListContent::Data);

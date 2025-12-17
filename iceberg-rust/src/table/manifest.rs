@@ -397,10 +397,6 @@ impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
             },
         )?;
 
-        let mut existing_files_count = 0i32;
-        let mut existing_rows_count = 0i64;
-        let mut min_sequence_number = manifest.sequence_number;
-
         writer.extend(
             manifest_reader
                 .map(|entry| {
@@ -413,26 +409,16 @@ impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
                     if entry.snapshot_id().is_none() {
                         *entry.snapshot_id_mut() = Some(manifest.added_snapshot_id);
                     }
-                    if let Some(seq_num) = entry.sequence_number() {
-                        min_sequence_number = min_sequence_number.min(*seq_num);
-                    }
-                    if *entry.data_file().content() == Content::Data {
-                        existing_rows_count += entry.data_file().record_count();
-                    }
-                    existing_files_count += 1;
                     to_value(entry)
                 })
                 .filter_map(Result::ok),
         )?;
 
-        manifest.sequence_number = table_metadata.last_sequence_number + 1;
-        manifest.min_sequence_number = min_sequence_number.min(manifest.sequence_number);
-        manifest.existing_files_count = Some(existing_files_count);
-        manifest.added_files_count = Some(0);
-        manifest.deleted_files_count = Some(0);
-        manifest.added_rows_count = Some(0);
-        manifest.deleted_rows_count = Some(0);
-        manifest.existing_rows_count = Some(existing_rows_count);
+        manifest.existing_files_count = Some(
+            manifest.existing_files_count.unwrap_or(0) + manifest.added_files_count.unwrap_or(0),
+        );
+
+        manifest.added_files_count = None;
 
         Ok(ManifestWriter {
             manifest,
@@ -587,11 +573,9 @@ impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
         manifest.sequence_number = table_metadata.last_sequence_number + 1;
         manifest.min_sequence_number = min_sequence_number.min(manifest.sequence_number);
         manifest.existing_files_count = Some(existing_files_count);
-        manifest.added_files_count = Some(0);
-        manifest.deleted_files_count = Some(0);
-        manifest.added_rows_count = Some(0);
-        manifest.deleted_rows_count = Some(removed_data_rows);
         manifest.existing_rows_count = Some(existing_rows_count);
+        manifest.deleted_files_count = Some(removed_data_files as i32);
+        manifest.deleted_rows_count = Some(removed_data_rows);
 
         Ok(ManifestWriter {
             manifest,
