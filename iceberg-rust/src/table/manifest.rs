@@ -628,7 +628,12 @@ impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
                     None => Some(1),
                 };
             }
-            Status::Deleted => (),
+            Status::Deleted => {
+                self.manifest.deleted_files_count = match self.manifest.deleted_files_count {
+                    Some(count) => Some(count + 1),
+                    None => Some(1),
+                };
+            },
         }
 
         self.manifest.added_rows_count = match self.manifest.added_rows_count {
