@@ -199,6 +199,14 @@ pub(crate) struct ManifestWriter<'schema, 'metadata> {
     table_metadata: &'metadata TableMetadata,
     manifest: ManifestListEntry,
     writer: AvroWriter<'schema, Vec<u8>>,
+    rewrite_summary: ManifestRewriteSummary,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct ManifestRewriteSummary {
+    pub removed_data_files: i64,
+    pub removed_data_rows: i64,
+    pub removed_data_size: i64,
 }
 
 impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
@@ -303,6 +311,7 @@ impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
             manifest,
             writer,
             table_metadata,
+            rewrite_summary: ManifestRewriteSummary::default(),
         })
     }
 
@@ -388,6 +397,10 @@ impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
             },
         )?;
 
+        let mut existing_files_count = 0i32;
+        let mut existing_rows_count = 0i64;
+        let mut min_sequence_number = manifest.sequence_number;
+
         writer.extend(
             manifest_reader
                 .map(|entry| {
@@ -400,23 +413,32 @@ impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
                     if entry.snapshot_id().is_none() {
                         *entry.snapshot_id_mut() = Some(manifest.added_snapshot_id);
                     }
+                    if let Some(seq_num) = entry.sequence_number() {
+                        min_sequence_number = min_sequence_number.min(*seq_num);
+                    }
+                    if *entry.data_file().content() == Content::Data {
+                        existing_rows_count += entry.data_file().record_count();
+                    }
+                    existing_files_count += 1;
                     to_value(entry)
                 })
                 .filter_map(Result::ok),
         )?;
 
         manifest.sequence_number = table_metadata.last_sequence_number + 1;
-
-        manifest.existing_files_count = Some(
-            manifest.existing_files_count.unwrap_or(0) + manifest.added_files_count.unwrap_or(0),
-        );
-
-        manifest.added_files_count = None;
+        manifest.min_sequence_number = min_sequence_number.min(manifest.sequence_number);
+        manifest.existing_files_count = Some(existing_files_count);
+        manifest.added_files_count = Some(0);
+        manifest.deleted_files_count = Some(0);
+        manifest.added_rows_count = Some(0);
+        manifest.deleted_rows_count = Some(0);
+        manifest.existing_rows_count = Some(existing_rows_count);
 
         Ok(ManifestWriter {
             manifest,
             writer,
             table_metadata,
+            rewrite_summary: ManifestRewriteSummary::default(),
         })
     }
 
@@ -463,7 +485,8 @@ impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
         table_metadata: &'metadata TableMetadata,
         branch: Option<&str>,
     ) -> Result<Self, Error> {
-        let manifest_reader = ManifestReader::new(bytes)?;
+        let fallback_schema = table_metadata.current_schema(None)?;
+        let manifest_reader = ManifestReader::new_with_fallback_schema(bytes, Some(fallback_schema.clone()))?;
 
         let mut writer = AvroWriter::new(schema, Vec::new());
 
@@ -518,37 +541,71 @@ impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
             },
         )?;
 
-        writer.extend(manifest_reader.filter_map(|entry| {
-            let mut entry = entry
-                .map_err(|err| apache_avro::Error::DeserializeValue(err.to_string()))
-                .unwrap();
-            if !filter.contains(entry.data_file().file_path()) {
-                *entry.status_mut() = Status::Existing;
-                if entry.sequence_number().is_none() {
-                    *entry.sequence_number_mut() = Some(manifest.sequence_number);
+        let mut entries = Vec::new();
+        let mut existing_files_count = 0i32;
+        let mut existing_rows_count = 0i64;
+        let mut min_sequence_number = manifest.sequence_number;
+
+        let mut removed_data_files = 0i64;
+        let mut removed_data_rows  = 0i64;
+        let mut removed_data_size = 0i64;
+
+        for entry in manifest_reader {
+            let mut entry =
+                entry.map_err(|err| apache_avro::Error::DeserializeValue(err.to_string()))?;
+
+            if filter.contains(entry.data_file().file_path()) {
+                if *entry.data_file().content() == Content::Data {
+                    removed_data_rows += entry.data_file().record_count();
                 }
-                if entry.snapshot_id().is_none() {
-                    *entry.snapshot_id_mut() = Some(manifest.added_snapshot_id);
-                }
-                Some(to_value(entry).unwrap())
-            } else {
-                None
+                removed_data_size += entry.data_file().file_size_in_bytes();
+                removed_data_files += 1;
+                continue;
             }
-        }))?;
 
+            *entry.status_mut() = Status::Existing;
+            if entry.sequence_number().is_none() {
+                *entry.sequence_number_mut() = Some(manifest.sequence_number);
+            }
+            if entry.snapshot_id().is_none() {
+                *entry.snapshot_id_mut() = Some(manifest.added_snapshot_id);
+            }
+
+            if let Some(seq_num) = entry.sequence_number() {
+                min_sequence_number = min_sequence_number.min(*seq_num);
+            }
+
+            if *entry.data_file().content() == Content::Data {
+                existing_rows_count += entry.data_file().record_count();
+            }
+            existing_files_count += 1;
+            entries.push(to_value(entry)?);
+        }
+
+        writer.extend(entries)?;
         manifest.sequence_number = table_metadata.last_sequence_number + 1;
-
-        manifest.existing_files_count = Some(
-            manifest.existing_files_count.unwrap_or(0) + manifest.added_files_count.unwrap_or(0),
-        );
-
-        manifest.added_files_count = None;
+        manifest.min_sequence_number = min_sequence_number.min(manifest.sequence_number);
+        manifest.existing_files_count = Some(existing_files_count);
+        manifest.added_files_count = Some(0);
+        manifest.deleted_files_count = Some(0);
+        manifest.added_rows_count = Some(0);
+        manifest.deleted_rows_count = Some(removed_data_rows);
+        manifest.existing_rows_count = Some(existing_rows_count);
 
         Ok(ManifestWriter {
             manifest,
             writer,
             table_metadata,
+            rewrite_summary: ManifestRewriteSummary {
+                removed_data_files,
+                removed_data_rows,
+                removed_data_size,
+            },
         })
+    }
+
+    pub(crate) fn rewrite_summary(&self) -> ManifestRewriteSummary {
+        self.rewrite_summary
     }
 
     /// Appends a manifest entry to the manifest file and updates summary statistics.

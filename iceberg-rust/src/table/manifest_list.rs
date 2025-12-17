@@ -34,7 +34,7 @@ use crate::{
 };
 
 use super::{
-    manifest::{ManifestReader, ManifestWriter},
+    manifest::{ManifestReader, ManifestRewriteSummary, ManifestWriter},
     transaction::{
         append::{
             select_manifest_partitioned, select_manifest_unpartitioned, split_datafiles,
@@ -1192,7 +1192,8 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
     /// * `object_store` - The object store for reading existing and writing new manifest files
     ///
     /// # Returns
-    /// * `Result<(), Error>` - Ok if all manifests were successfully processed and filtered
+    /// * `Result<ManifestRewriteSummary, Error>` - Summary of removed data files if manifests were
+    ///   successfully processed and filtered
     ///
     /// # Errors
     /// Returns an error if:
@@ -1227,7 +1228,7 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
         manifests_to_overwrite: Vec<ManifestListEntry>,
         data_files_to_filter: &HashMap<String, Vec<String>>,
         object_store: Arc<dyn ObjectStore>,
-    ) -> Result<(), Error> {
+    ) -> Result<ManifestRewriteSummary, Error> {
         let partition_fields = self
             .table_metadata
             .current_partition_fields(self.branch.as_deref())?;
@@ -1269,16 +1270,22 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
                     branch.as_deref(),
                 )?;
 
+                let rewrite_summary = manifest_writer.rewrite_summary();
+
                 let new_manifest = manifest_writer.finish(object_store.clone()).await?;
 
-                Ok::<_, Error>(new_manifest)
+                Ok::<_, Error>((new_manifest, rewrite_summary))
             }
         });
+        let mut summary = ManifestRewriteSummary::default();
         for manifest_res in join_all(futures).await {
-            let manifest = manifest_res?;
+            let (manifest, rewrite_summary) = manifest_res?;
+            summary.removed_data_files += rewrite_summary.removed_data_files;
+            summary.removed_data_rows += rewrite_summary.removed_data_rows;
+            summary.removed_data_size += rewrite_summary.removed_data_size;
             self.writer.append_ser(manifest)?;
         }
-        Ok(())
+        Ok(summary)
     }
 
     pub(crate) fn selected_data_manifest(&self) -> Option<&ManifestListEntry> {

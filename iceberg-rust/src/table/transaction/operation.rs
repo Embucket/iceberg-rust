@@ -31,7 +31,7 @@ use smallvec::SmallVec;
 use tokio::task::JoinHandle;
 use tracing::{debug, instrument};
 
-use crate::table::manifest::ManifestWriter;
+use crate::table::manifest::{ManifestRewriteSummary, ManifestWriter};
 use crate::table::manifest_list::ManifestListWriter;
 use crate::table::transaction::append::append_summary;
 use crate::{
@@ -241,6 +241,7 @@ impl Operation {
                     old_snapshot.map(|s| s.summary()),
                     data_files_iter,
                     delete_files_iter,
+                    None,
                 );
 
                 // Merge with any additional summary fields
@@ -311,6 +312,7 @@ impl Operation {
                     old_snapshot.map(|s| s.summary()),
                     data_files.iter(),
                     delete_files.iter(),
+                    None,
                 );
 
                 let data_files_iter = delete_files.iter().chain(data_files.iter());
@@ -593,6 +595,7 @@ impl Operation {
                     None, // No old summary - this is a full replacement
                     data_files_iter,
                     delete_files_iter,
+                    None,
                 );
 
                 // Merge with any additional summary fields
@@ -655,10 +658,11 @@ impl Operation {
                 }
 
                 // Compute summary before moving data_files
-                let summary_fields = update_snapshot_summary(
+                let mut summary_fields = update_snapshot_summary(
                     Some(old_snapshot.summary()),
                     data_files.iter(),
                     std::iter::empty::<&DataFile>(), // No separate delete files in this operation
+                    None,
                 );
 
                 let data_files_iter = data_files.iter();
@@ -680,13 +684,27 @@ impl Operation {
                         branch.as_deref(),
                     )?;
 
-                manifest_list_writer
+                let rewrite_summary =manifest_list_writer
                     .append_and_filter(
                         manifests_to_overwrite,
                         &files_to_overwrite,
                         object_store.clone(),
                     )
                     .await?;
+
+                if rewrite_summary.removed_data_files > 0 {
+                    let removed_summary = ManifestRewriteSummary {
+                        removed_data_files: rewrite_summary.removed_data_files,
+                        removed_data_rows: rewrite_summary.removed_data_rows,
+                        removed_data_size: rewrite_summary.removed_data_size,
+                    };
+                    summary_fields = update_snapshot_summary(
+                        Some(old_snapshot.summary()),
+                        data_files.iter(),
+                        std::iter::empty::<&DataFile>(),
+                        Some(&removed_summary),
+                    );
+                }
 
                 let n_splits =
                     manifest_list_writer.n_splits(n_data_files, ManifestListContent::Data);
@@ -929,6 +947,7 @@ pub fn update_snapshot_summary<'files>(
     old_summary: Option<&Summary>,
     data_files: impl Iterator<Item = &'files DataFile>,
     delete_files: impl Iterator<Item = &'files DataFile>,
+    removed_data: Option<&ManifestRewriteSummary>,
 ) -> HashMap<String, String> {
     // Parse existing values from old summary
     let old_other = old_summary.map(|s| &s.other);
@@ -969,11 +988,14 @@ pub fn update_snapshot_summary<'files>(
     let added_files_size = added_data_files_size + added_delete_files_size;
 
     // Compute new totals
-    let total_records = old_total_records + added_records;
-    let total_data_files = old_total_data_files + added_data_files;
-    let total_delete_files = old_total_delete_files + added_delete_files;
-    let total_file_size = old_total_file_size + added_files_size;
+    let removed_default = ManifestRewriteSummary::default();
+    let removed = removed_data.unwrap_or(&removed_default);
 
+    let total_records = old_total_records - removed.removed_data_rows + added_records;
+    let total_data_files = old_total_data_files - removed.removed_data_files + added_data_files;
+    let total_delete_files = old_total_delete_files + added_delete_files;
+    let total_file_size = old_total_file_size - removed.removed_data_size + added_files_size;
+    
     // Build result map
     let mut result = HashMap::new();
     result.insert("total-records".to_string(), total_records.to_string());
