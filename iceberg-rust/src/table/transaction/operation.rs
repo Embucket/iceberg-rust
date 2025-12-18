@@ -31,7 +31,7 @@ use smallvec::SmallVec;
 use tokio::task::JoinHandle;
 use tracing::{debug, instrument};
 
-use crate::table::manifest::ManifestWriter;
+use crate::table::manifest::{FilteredManifestStats, ManifestWriter};
 use crate::table::manifest_list::ManifestListWriter;
 use crate::table::transaction::append::append_summary;
 use crate::{
@@ -655,7 +655,7 @@ impl Operation {
                 }
 
                 // Compute summary before moving data_files
-                let summary_fields = update_snapshot_summary(
+                let mut summary_fields = update_snapshot_summary(
                     Some(old_snapshot.summary()),
                     data_files.iter(),
                     std::iter::empty::<&DataFile>(), // No separate delete files in this operation
@@ -750,33 +750,11 @@ impl Operation {
                 let snapshot_operation = SnapshotOperation::Overwrite;
 
                 // Merge with any additional summary fields
-                let mut summary_fields = summary_fields;
                 if let Some(additional) = additional_summary {
                     summary_fields.extend(additional);
                 }
                 // Apply filtration stats
-                let mut subtract_from_summary = |key: &str, delta: i64| {
-                    if delta == 0 {
-                        return;
-                    }
-                    let current = summary_fields
-                        .get(key)
-                        .and_then(|v| v.parse::<i64>().ok())
-                        .unwrap_or(0);
-                    let updated = (current - delta).max(0);
-                    summary_fields.insert(key.to_string(), updated.to_string());
-                };
-                subtract_from_summary("total-records", filtered_stats.removed_records);
-                subtract_from_summary(
-                    "deleted-data-files",
-                    -filtered_stats.removed_data_files as i64,
-                );
-                subtract_from_summary("deleted-records", -filtered_stats.removed_records);
-                subtract_from_summary("total-data-files", filtered_stats.removed_data_files.into());
-                subtract_from_summary(
-                    "total-file-size-bytes",
-                    filtered_stats.removed_file_size_bytes,
-                );
+                update_snapshot_summary_by_filtered_stats(&mut summary_fields, filtered_stats);
 
                 let mut snapshot_builder = SnapshotBuilder::default();
                 snapshot_builder
@@ -1012,6 +990,33 @@ pub fn update_snapshot_summary<'files>(
     );
 
     result
+}
+
+pub(crate) fn update_snapshot_summary_by_filtered_stats(
+    summary: &mut HashMap<String, String>,
+    stats: FilteredManifestStats
+) {
+    let mut subtract_from_summary = |key: &str, delta: i64, add: bool| {
+        if delta == 0 {
+            return;
+        }
+        let current = summary
+            .get(key)
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(0);
+
+        let updated = if add {
+            current + delta
+        } else {
+            (current - delta).max(0)
+        };
+        summary.insert(key.to_string(), updated.to_string());
+    };
+    subtract_from_summary("total-records", stats.removed_records, false);
+    subtract_from_summary("deleted-data-files", stats.removed_data_files.into(), true);
+    subtract_from_summary("deleted-records", stats.removed_records, true);
+    subtract_from_summary("total-data-files", stats.removed_data_files.into(), false);
+    subtract_from_summary("total-file-size-bytes", stats.removed_file_size_bytes, false);
 }
 
 pub(crate) fn new_manifest_location(
