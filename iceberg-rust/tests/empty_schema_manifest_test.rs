@@ -103,10 +103,7 @@ async fn test_zero_field_schema_in_manifest_metadata() {
     let manifest_bytes = create_manifest_with_zero_field_schema();
 
     // Verify the manifest file was created
-    assert!(
-        !manifest_bytes.is_empty(),
-        "Manifest file should not be empty"
-    );
+    assert!(!manifest_bytes.is_empty(), "Manifest file should not be empty");
 
     // Write the manifest to object store
     let manifest_path = ObjectPath::from("warehouse/test/metadata/zero-field-schema-manifest.avro");
@@ -161,10 +158,7 @@ async fn test_empty_schema_in_manifest_metadata() {
     let manifest_bytes = create_manifest_with_empty_schema();
 
     // Verify the manifest file was created
-    assert!(
-        !manifest_bytes.is_empty(),
-        "Manifest file should not be empty"
-    );
+    assert!(!manifest_bytes.is_empty(), "Manifest file should not be empty");
 
     // Write the corrupted manifest to object store to verify storage works
     let manifest_path =
@@ -479,8 +473,8 @@ fn create_manifest_with_empty_schema() -> Vec<u8> {
     }
     "#;
 
-    let schema = AvroSchema::parse_str(manifest_entry_schema)
-        .expect("Failed to parse manifest entry schema");
+    let schema =
+        AvroSchema::parse_str(manifest_entry_schema).expect("Failed to parse manifest entry schema");
 
     let mut writer = AvroWriter::new(&schema, Vec::new());
 
@@ -531,10 +525,7 @@ async fn test_empty_json_schema_in_manifest_metadata() {
     let manifest_bytes = create_manifest_with_empty_json_schema();
 
     // Verify the manifest file was created
-    assert!(
-        !manifest_bytes.is_empty(),
-        "Manifest file should not be empty"
-    );
+    assert!(!manifest_bytes.is_empty(), "Manifest file should not be empty");
 
     // Write to object store
     let manifest_path =
@@ -625,8 +616,8 @@ fn create_manifest_with_empty_json_schema() -> Vec<u8> {
     }
     "#;
 
-    let schema = AvroSchema::parse_str(manifest_entry_schema)
-        .expect("Failed to parse manifest entry schema");
+    let schema =
+        AvroSchema::parse_str(manifest_entry_schema).expect("Failed to parse manifest entry schema");
 
     let mut writer = AvroWriter::new(&schema, Vec::new());
 
@@ -809,7 +800,8 @@ async fn test_datafiles_with_zero_field_schema_manifest() {
                 .await
                 .expect("Failed to read original manifest bytes");
 
-            let corrupted_bytes = create_corrupted_manifest_with_zero_field_schema(&original_bytes);
+            let corrupted_bytes =
+                create_corrupted_manifest_with_zero_field_schema(&original_bytes);
 
             object_store_impl
                 .put(&path, corrupted_bytes.into())
@@ -834,7 +826,8 @@ async fn test_datafiles_with_zero_field_schema_manifest() {
                 .await
                 .expect("Failed to read original manifest bytes");
 
-            let corrupted_bytes = create_corrupted_manifest_with_zero_field_schema(&original_bytes);
+            let corrupted_bytes =
+                create_corrupted_manifest_with_zero_field_schema(&original_bytes);
 
             object_store_impl
                 .put(&path, corrupted_bytes.into())
@@ -876,14 +869,13 @@ async fn test_datafiles_with_zero_field_schema_manifest() {
             assert_eq!(
                 count, expected_count,
                 "Expected {} datafile(s) with fallback schema but got {}. Single manifest mode: {}",
-                expected_count, count, single_manifest_mode
+                expected_count,
+                count,
+                single_manifest_mode
             );
 
             println!("✓ SUCCESS: Manifest with zero-field schema successfully used table schema fallback!");
-            println!(
-                "✓ All {} datafiles were correctly returned despite corrupted manifest",
-                count
-            );
+            println!("✓ All {} datafiles were correctly returned despite corrupted manifest", count);
         }
         Err(e) => {
             // This is the CURRENT behavior - it fails completely
@@ -910,7 +902,7 @@ fn create_record_batch(ids: Vec<i64>, data: Vec<&str>) -> RecordBatch {
         Arc::new(schema),
         vec![Arc::new(id_array), Arc::new(data_array)],
     )
-    .expect("Failed to create RecordBatch")
+        .expect("Failed to create RecordBatch")
 }
 
 /// Creates a corrupted version of a manifest file with zero-field schema.
