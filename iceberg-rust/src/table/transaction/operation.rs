@@ -767,6 +767,11 @@ impl Operation {
                     summary_fields.insert(key.to_string(), updated.to_string());
                 };
                 subtract_from_summary("total-records", filtered_stats.removed_records);
+                subtract_from_summary(
+                    "deleted-data-files",
+                    -filtered_stats.removed_data_files as i64,
+                );
+                subtract_from_summary("deleted-records", -filtered_stats.removed_records);
                 subtract_from_summary("total-data-files", filtered_stats.removed_data_files.into());
                 subtract_from_summary(
                     "total-file-size-bytes",
