@@ -473,7 +473,9 @@ impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
         table_metadata: &'metadata TableMetadata,
         branch: Option<&str>,
     ) -> Result<Self, Error> {
-        let manifest_reader = ManifestReader::new(bytes)?;
+        let fallback_schema = table_metadata.current_schema(None)?;
+        let manifest_reader =
+            ManifestReader::new_with_fallback_schema(bytes, Some(fallback_schema.clone()))?;
 
         let mut writer = AvroWriter::new(schema, Vec::new());
         let mut filtered_stats = FilteredManifestStats::default();
