@@ -655,7 +655,7 @@ impl Operation {
                 }
 
                 // Compute summary before moving data_files
-                let mut summary_fields = update_snapshot_summary(
+                let summary_fields = update_snapshot_summary(
                     Some(old_snapshot.summary()),
                     data_files.iter(),
                     std::iter::empty::<&DataFile>(), // No separate delete files in this operation
@@ -688,26 +688,6 @@ impl Operation {
                     )
                     .await?;
 
-                let mut subtract_from_summary = |key: &str, delta: i64| {
-                    if delta == 0 {
-                        return;
-                    }
-                    let current = summary_fields
-                        .get(key)
-                        .and_then(|v| v.parse::<i64>().ok())
-                        .unwrap_or(0);
-                    let updated = (current - delta).max(0);
-                    summary_fields.insert(key.to_string(), updated.to_string());
-                };
-
-                subtract_from_summary("total-records", filtered_stats.removed_records);
-                subtract_from_summary("total-data-files", filtered_stats.removed_data_files);
-                subtract_from_summary("total-delete-files", filtered_stats.removed_delete_files);
-                subtract_from_summary(
-                    "total-file-size-bytes",
-                    filtered_stats.removed_file_size_bytes,
-                );
-
                 let n_splits =
                     manifest_list_writer.n_splits(n_data_files, ManifestListContent::Data);
 
@@ -727,34 +707,27 @@ impl Operation {
                     .map(|x| x.manifest_path.clone())
                     .ok_or(Error::NotFound("Selected manifest".to_owned()))?;
 
-                let files_to_filter = files_to_overwrite.get(&selected_manifest_location);
-
-                let filter = if let Some(filter_files) = files_to_filter {
-                    let filter_files: HashSet<String> =
-                        filter_files.iter().map(ToOwned::to_owned).collect();
-                    Some(move |file: &Result<ManifestEntry, Error>| {
-                        let Ok(file) = file else { return true };
-
-                        !filter_files.contains(file.data_file().file_path())
-                    })
-                } else {
-                    None
-                };
+                let files_to_filter =
+                    files_to_overwrite
+                        .get(&selected_manifest_location)
+                        .map(|filter_files| {
+                            filter_files
+                                .iter()
+                                .map(ToOwned::to_owned)
+                                .collect::<HashSet<String>>()
+                        });
 
                 // Write manifest files
                 // Split manifest file if limit is exceeded
-                let new_manifest_list_location = if n_splits == 0 {
+                let selected_filter_stats = if n_splits == 0 {
                     manifest_list_writer
                         .append_filtered(
                             new_datafile_iter,
                             snapshot_id,
-                            filter,
+                            files_to_filter.clone(),
                             object_store.clone(),
                             ManifestListContent::Data,
                         )
-                        .await?;
-                    manifest_list_writer
-                        .finish(snapshot_id, object_store)
                         .await?
                 } else {
                     manifest_list_writer
@@ -762,15 +735,15 @@ impl Operation {
                             new_datafile_iter,
                             snapshot_id,
                             n_splits,
-                            filter,
+                            files_to_filter.clone(),
                             object_store.clone(),
                             ManifestListContent::Data,
                         )
-                        .await?;
-                    manifest_list_writer
-                        .finish(snapshot_id, object_store)
                         .await?
                 };
+                let new_manifest_list_location = manifest_list_writer
+                    .finish(snapshot_id, object_store)
+                    .await?;
 
                 let snapshot_operation = SnapshotOperation::Overwrite;
 

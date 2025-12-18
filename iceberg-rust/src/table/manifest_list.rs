@@ -27,12 +27,6 @@ use iceberg_rust_spec::{
 use object_store::ObjectStore;
 use smallvec::SmallVec;
 
-use crate::{
-    error::Error,
-    table::datafiles,
-    util::{summary_to_rectangle, Rectangle, Vec4},
-};
-use crate::table::manifest::FilteredManifestStats;
 use super::{
     manifest::{ManifestReader, ManifestWriter},
     transaction::{
@@ -49,6 +43,12 @@ use super::{
             select_manifest_without_overwrites_unpartitioned, OverwriteManifest,
         },
     },
+};
+use crate::table::manifest::FilteredManifestStats;
+use crate::{
+    error::Error,
+    table::datafiles,
+    util::{summary_to_rectangle, Rectangle, Vec4},
 };
 
 type ReaderZip<'a, 'metadata, R> = Zip<AvroReader<'a, R>, Repeat<&'metadata TableMetadata>>;
@@ -703,11 +703,12 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
         self.append_filtered(
             data_files,
             snapshot_id,
-            None::<fn(&Result<ManifestEntry, Error>) -> bool>,
+            None::<HashSet<String>>,
             object_store,
             content,
         )
         .await
+        .map(|_| ())
     }
 
     #[inline]
@@ -721,11 +722,12 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
         self.append_filtered_concurrently(
             data_files,
             snapshot_id,
-            None::<fn(&Result<ManifestEntry, Error>) -> bool>,
+            None::<HashSet<String>>,
             object_store,
             content,
         )
         .await
+        .map(|(future, _)| future)
     }
 
     /// Appends data files to a single manifest with optional filtering and finalizes the manifest list.
@@ -758,7 +760,7 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
     /// # Arguments
     /// * `data_files` - Iterator over manifest entries to append
     /// * `snapshot_id` - The snapshot ID for the new manifest
-    /// * `filter` - Optional filter function to apply to existing manifest entries when reusing
+    /// * `filter` - Optional set of file paths to exclude when reusing an existing manifest
     /// * `object_store` - The object store for writing files
     ///
     /// # Returns
@@ -787,24 +789,31 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
         &mut self,
         data_files: impl Iterator<Item = Result<ManifestEntry, Error>>,
         snapshot_id: i64,
-        filter: Option<impl Fn(&Result<ManifestEntry, Error>) -> bool>,
+        filter: Option<HashSet<String>>,
         object_store: Arc<dyn ObjectStore>,
         content: Content,
-    ) -> Result<(), Error> {
-        self.append_filtered_concurrently(data_files, snapshot_id, filter, object_store, content)
-            .await?
+    ) -> Result<FilteredManifestStats, Error> {
+        let (future, stats) = self
+            .append_filtered_concurrently(data_files, snapshot_id, filter, object_store, content)
             .await?;
-        Ok(())
+        future.await?;
+        Ok(stats)
     }
 
     pub(crate) async fn append_filtered_concurrently(
         &mut self,
         data_files: impl Iterator<Item = Result<ManifestEntry, Error>>,
         snapshot_id: i64,
-        filter: Option<impl Fn(&Result<ManifestEntry, Error>) -> bool>,
+        filter: Option<HashSet<String>>,
         object_store: Arc<dyn ObjectStore>,
         content: Content,
-    ) -> Result<impl Future<Output = Result<(), Error>>, Error> {
+    ) -> Result<
+        (
+            impl Future<Output = Result<(), Error>>,
+            FilteredManifestStats,
+        ),
+        Error,
+    > {
         let selected_manifest = match content {
             Content::Data => self.selected_data_manifest.take(),
             Content::Deletes => self.selected_delete_manifest.take(),
@@ -830,9 +839,10 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
             let manifest_reader = ManifestReader::new(manifest_bytes.as_ref())?;
 
             if let Some(filter) = filter {
-                ManifestWriter::from_existing(
-                    manifest_reader.filter(filter),
+                ManifestWriter::from_existing_with_filter(
+                    manifest_bytes.as_ref(),
                     manifest,
+                    &filter,
                     &manifest_schema,
                     self.table_metadata,
                     self.branch.as_deref(),
@@ -863,11 +873,12 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
             manifest_writer.append(manifest_entry?)?;
         }
 
+        let filtered_stats = manifest_writer.filtered_stats();
         let (manifest, future) = manifest_writer.finish_concurrently(object_store.clone())?;
 
         self.writer.append_ser(manifest)?;
 
-        Ok(future)
+        Ok((future, filtered_stats))
     }
 
     /// Appends data files by splitting them across multiple manifests and finalizes the manifest list.
@@ -930,11 +941,12 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
             data_files,
             snapshot_id,
             n_splits,
-            None::<fn(&Result<ManifestEntry, Error>) -> bool>,
+            None::<HashSet<String>>,
             object_store,
             content,
         )
         .await
+        .map(|(future, _)| future)
     }
 
     /// Appends data files across multiple manifests with optional filtering and finalizes the manifest list.
@@ -970,7 +982,7 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
     /// * `data_files` - Iterator over manifest entries to append and split
     /// * `snapshot_id` - The snapshot ID for the new manifests
     /// * `n_splits` - The number of manifest files to create (should match `n_splits()` result)
-    /// * `filter` - Optional filter function to apply to existing manifest entries when reusing
+    /// * `filter` - Optional set of file paths to exclude when reusing an existing manifest
     /// * `object_store` - The object store for writing files
     ///
     /// # Returns
@@ -1004,21 +1016,22 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
         data_files: impl Iterator<Item = Result<ManifestEntry, Error>>,
         snapshot_id: i64,
         n_splits: u32,
-        filter: Option<impl Fn(&Result<ManifestEntry, Error>) -> bool>,
+        filter: Option<HashSet<String>>,
         object_store: Arc<dyn ObjectStore>,
         content: Content,
-    ) -> Result<(), Error> {
-        self.append_multiple_filtered_concurrently(
-            data_files,
-            snapshot_id,
-            n_splits,
-            filter,
-            object_store,
-            content,
-        )
-        .await?
-        .await?;
-        Ok(())
+    ) -> Result<FilteredManifestStats, Error> {
+        let (future, stats) = self
+            .append_multiple_filtered_concurrently(
+                data_files,
+                snapshot_id,
+                n_splits,
+                filter,
+                object_store,
+                content,
+            )
+            .await?;
+        future.await?;
+        Ok(stats)
     }
 
     pub(crate) async fn append_multiple_filtered_concurrently(
@@ -1026,10 +1039,17 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
         data_files: impl Iterator<Item = Result<ManifestEntry, Error>>,
         snapshot_id: i64,
         n_splits: u32,
-        filter: Option<impl Fn(&Result<ManifestEntry, Error>) -> bool>,
+        filter: Option<HashSet<String>>,
         object_store: Arc<dyn ObjectStore>,
         content: Content,
-    ) -> Result<impl Future<Output = Result<(), Error>>, Error> {
+    ) -> Result<
+        (
+            impl Future<Output = Result<(), Error>>,
+            FilteredManifestStats,
+        ),
+        Error,
+    > {
+        let mut removed_stats = FilteredManifestStats::default();
         let partition_fields = self
             .table_metadata
             .current_partition_fields(self.branch.as_deref())?;
@@ -1067,8 +1087,27 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
             (selected_manifest, selected_manifest_bytes_opt)
         {
             let manifest_bytes = manifest_bytes.await??;
-            let manifest_reader = ManifestReader::new(&*manifest_bytes)?.map(|entry| {
-                let mut entry = entry?;
+
+            let manifest_reader = ManifestReader::new(&*manifest_bytes)?.filter_map(|entry| {
+                let mut entry = match entry {
+                    Ok(entry) => entry,
+                    Err(err) => return Some(Err(err)),
+                };
+
+                if let Some(files_to_filter) = filter.as_ref() {
+                    if files_to_filter.contains(entry.data_file().file_path()) {
+                        if *entry.data_file().content()
+                            == iceberg_rust_spec::manifest::Content::Data
+                        {
+                            removed_stats.removed_records += entry.data_file().record_count();
+                        }
+                        removed_stats.removed_file_size_bytes +=
+                            entry.data_file().file_size_in_bytes();
+                        removed_stats.removed_data_files += 1;
+                        return None;
+                    }
+                }
+
                 *entry.status_mut() = Status::Existing;
                 if entry.sequence_number().is_none() {
                     *entry.sequence_number_mut() = Some(manifest.sequence_number);
@@ -1076,24 +1115,15 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
                 if entry.snapshot_id().is_none() {
                     *entry.snapshot_id_mut() = Some(manifest.added_snapshot_id);
                 }
-                Ok(entry)
+                Some(Ok(entry))
             });
 
-            if let Some(filter) = filter {
-                split_datafiles(
-                    data_files.chain(manifest_reader.filter(filter)),
-                    bounds,
-                    &partition_column_names,
-                    n_splits,
-                )?
-            } else {
-                split_datafiles(
-                    data_files.chain(manifest_reader),
-                    bounds,
-                    &partition_column_names,
-                    n_splits,
-                )?
-            }
+            split_datafiles(
+                data_files.chain(manifest_reader),
+                bounds,
+                &partition_column_names,
+                n_splits,
+            )?
         } else {
             split_datafiles(data_files, bounds, &partition_column_names, n_splits)?
         };
@@ -1126,7 +1156,7 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
 
         let future = futures::future::try_join_all(manifest_futures).map_ok(|_| ());
 
-        Ok(future)
+        Ok((future, removed_stats))
     }
 
     pub(crate) async fn finish(
@@ -1260,7 +1290,7 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
 
                 manifest.manifest_path = manifest_location;
 
-                let (manifest_writer, filtered_stats) =  ManifestWriter::from_existing_with_filter(
+                let manifest_writer = ManifestWriter::from_existing_with_filter(
                     &bytes,
                     manifest,
                     &data_files_to_filter,
@@ -1268,6 +1298,9 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
                     table_metadata,
                     branch.as_deref(),
                 )?;
+
+                // Capture filtered statistics
+                let filtered_stats = manifest_writer.filtered_stats();
 
                 let new_manifest = manifest_writer.finish(object_store.clone()).await?;
 
@@ -1278,7 +1311,6 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
         for manifest_res in join_all(futures).await {
             let (manifest, filtered_stats) = manifest_res?;
             removed_stats.removed_data_files += filtered_stats.removed_data_files;
-            removed_stats.removed_delete_files += filtered_stats.removed_delete_files;
             removed_stats.removed_records += filtered_stats.removed_records;
             removed_stats.removed_file_size_bytes += filtered_stats.removed_file_size_bytes;
             self.writer.append_ser(manifest)?;

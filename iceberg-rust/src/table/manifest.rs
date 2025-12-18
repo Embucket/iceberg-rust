@@ -199,12 +199,12 @@ pub(crate) struct ManifestWriter<'schema, 'metadata> {
     table_metadata: &'metadata TableMetadata,
     manifest: ManifestListEntry,
     writer: AvroWriter<'schema, Vec<u8>>,
+    filtered_stats: FilteredManifestStats,
 }
 
 #[derive(Default, Debug, Clone, Copy)]
 pub(crate) struct FilteredManifestStats {
-    pub removed_data_files: i64,
-    pub removed_delete_files: i64,
+    pub removed_data_files: i32,
     pub removed_records: i64,
     pub removed_file_size_bytes: i64,
 }
@@ -311,6 +311,7 @@ impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
             manifest,
             writer,
             table_metadata,
+            filtered_stats: FilteredManifestStats::default(),
         })
     }
 
@@ -414,19 +415,11 @@ impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
                 })
                 .filter_map(Result::ok),
         )?;
-
-        manifest.sequence_number = table_metadata.last_sequence_number + 1;
-
-        manifest.existing_files_count = Some(
-            manifest.existing_files_count.unwrap_or(0) + manifest.added_files_count.unwrap_or(0),
-        );
-
-        manifest.added_files_count = None;
-
         Ok(ManifestWriter {
             manifest,
             writer,
             table_metadata,
+            filtered_stats: FilteredManifestStats::default(),
         })
     }
 
@@ -472,11 +465,12 @@ impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
         schema: &'schema AvroSchema,
         table_metadata: &'metadata TableMetadata,
         branch: Option<&str>,
-    ) -> Result<(Self, FilteredManifestStats), Error> {
+    ) -> Result<Self, Error> {
         let manifest_reader = ManifestReader::new(bytes)?;
 
         let mut writer = AvroWriter::new(schema, Vec::new());
         let mut filtered_stats = FilteredManifestStats::default();
+
         reset_manifest_summary(&mut manifest, table_metadata);
         writer.add_user_metadata(
             "format-version".to_string(),
@@ -529,43 +523,41 @@ impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
             },
         )?;
 
-        let mut manifest_writer = ManifestWriter {
-            manifest,
-            writer,
-            table_metadata,
-        };
-
+        let mut entries = Vec::new();
         for entry in manifest_reader {
-            let mut entry = entry?;
+            let mut entry =
+                entry.map_err(|err| apache_avro::Error::DeserializeValue(err.to_string()))?;
+
             if filter.contains(entry.data_file().file_path()) {
-                match entry.data_file().content() {
-                    Content::Data => {
-                        filtered_stats.removed_data_files += 1;
-                        filtered_stats.removed_records += entry.data_file().record_count();
-                        filtered_stats.removed_file_size_bytes +=
-                            entry.data_file().file_size_in_bytes();
-                    }
-                    _ => {
-                        filtered_stats.removed_delete_files += 1;
-                        filtered_stats.removed_file_size_bytes +=
-                            entry.data_file().file_size_in_bytes();
-                    }
+                if *entry.data_file().content() == Content::Data {
+                    filtered_stats.removed_records += entry.data_file().record_count();
                 }
+                filtered_stats.removed_file_size_bytes += entry.data_file().file_size_in_bytes();
+                filtered_stats.removed_data_files += 1;
                 continue;
             }
 
             *entry.status_mut() = Status::Existing;
             if entry.sequence_number().is_none() {
-                *entry.sequence_number_mut() = Some(manifest_writer.manifest.sequence_number);
+                *entry.sequence_number_mut() = Some(manifest.sequence_number);
             }
             if entry.snapshot_id().is_none() {
-                *entry.snapshot_id_mut() = Some(manifest_writer.manifest.added_snapshot_id);
+                *entry.snapshot_id_mut() = Some(manifest.added_snapshot_id);
             }
-
-            manifest_writer.append(entry)?;
+            entries.push(to_value(entry)?);
         }
+        writer.extend(entries)?;
 
-        Ok((manifest_writer, filtered_stats))
+        Ok(ManifestWriter {
+            manifest,
+            writer,
+            table_metadata,
+            filtered_stats,
+        })
+    }
+
+    pub(crate) fn filtered_stats(&self) -> FilteredManifestStats {
+        self.filtered_stats
     }
 
     /// Appends a manifest entry to the manifest file and updates summary statistics.
@@ -650,7 +642,7 @@ impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
                     Some(count) => Some(count + 1),
                     None => Some(1),
                 };
-            },
+            }
         }
 
         self.manifest.added_rows_count = match self.manifest.added_rows_count {
@@ -687,6 +679,8 @@ impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
         mut self,
         object_store: Arc<dyn ObjectStore>,
     ) -> Result<ManifestListEntry, Error> {
+        self.apply_filtered_stats();
+
         let manifest_bytes = self.writer.into_inner()?;
 
         let manifest_length: i64 = manifest_bytes.len() as i64;
@@ -728,6 +722,8 @@ impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
         mut self,
         object_store: Arc<dyn ObjectStore>,
     ) -> Result<(ManifestListEntry, impl Future<Output = Result<(), Error>>), Error> {
+        self.apply_filtered_stats();
+
         let manifest_bytes = self.writer.into_inner()?;
 
         let manifest_length: i64 = manifest_bytes.len() as i64;
@@ -743,6 +739,23 @@ impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
                 .await
         };
         Ok((self.manifest, future))
+    }
+
+    fn apply_filtered_stats(&mut self) {
+        let removed_files = self.filtered_stats.removed_data_files;
+        if removed_files > 0 {
+            self.manifest.deleted_files_count = match self.manifest.deleted_files_count {
+                Some(count) => Some(count + removed_files),
+                None => Some(removed_files),
+            };
+        }
+
+        if self.filtered_stats.removed_records > 0 {
+            self.manifest.deleted_rows_count = match self.manifest.deleted_rows_count {
+                Some(count) => Some(count + self.filtered_stats.removed_records),
+                None => Some(self.filtered_stats.removed_records),
+            };
+        }
     }
 }
 
