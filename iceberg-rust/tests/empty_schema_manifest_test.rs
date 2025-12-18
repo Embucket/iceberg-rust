@@ -902,7 +902,7 @@ fn create_record_batch(ids: Vec<i64>, data: Vec<&str>) -> RecordBatch {
         Arc::new(schema),
         vec![Arc::new(id_array), Arc::new(data_array)],
     )
-        .expect("Failed to create RecordBatch")
+    .expect("Failed to create RecordBatch")
 }
 
 /// Creates a corrupted version of a manifest file with zero-field schema.
