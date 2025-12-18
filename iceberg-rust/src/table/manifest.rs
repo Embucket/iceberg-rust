@@ -209,6 +209,13 @@ pub(crate) struct FilteredManifestStats {
     pub removed_file_size_bytes: i64,
 }
 
+impl FilteredManifestStats {
+    pub(crate) fn append(&mut self, stats: FilteredManifestStats) {
+        self.removed_file_size_bytes += stats.removed_file_size_bytes;
+        self.removed_records += stats.removed_records;
+        self.removed_file_size_bytes += stats.removed_file_size_bytes;
+    }
+}
 impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
     /// Creates a new ManifestWriter for writing manifest entries to a new manifest file.
     ///

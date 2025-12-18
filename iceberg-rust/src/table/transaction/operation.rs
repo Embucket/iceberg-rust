@@ -680,7 +680,7 @@ impl Operation {
                         branch.as_deref(),
                     )?;
 
-                let filtered_stats = manifest_list_writer
+                let mut filtered_stats = manifest_list_writer
                     .append_and_filter(
                         manifests_to_overwrite,
                         &files_to_overwrite,
@@ -741,6 +741,8 @@ impl Operation {
                         )
                         .await?
                 };
+
+                filtered_stats.append(selected_filter_stats);
                 let new_manifest_list_location = manifest_list_writer
                     .finish(snapshot_id, object_store)
                     .await?;
@@ -752,6 +754,24 @@ impl Operation {
                 if let Some(additional) = additional_summary {
                     summary_fields.extend(additional);
                 }
+                // Apply filtration stats
+                let mut subtract_from_summary = |key: &str, delta: i64| {
+                    if delta == 0 {
+                        return;
+                    }
+                    let current = summary_fields
+                        .get(key)
+                        .and_then(|v| v.parse::<i64>().ok())
+                        .unwrap_or(0);
+                    let updated = (current - delta).max(0);
+                    summary_fields.insert(key.to_string(), updated.to_string());
+                };
+                subtract_from_summary("total-records", filtered_stats.removed_records);
+                subtract_from_summary("total-data-files", filtered_stats.removed_data_files.into());
+                subtract_from_summary(
+                    "total-file-size-bytes",
+                    filtered_stats.removed_file_size_bytes,
+                );
 
                 let mut snapshot_builder = SnapshotBuilder::default();
                 snapshot_builder
