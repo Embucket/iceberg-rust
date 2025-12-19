@@ -849,7 +849,11 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
                         )?;
                     (manifest_writer, Some(filtered_stats))
                 } else {
-                    let manifest_reader = ManifestReader::new(manifest_bytes.as_ref())?;
+                    let fallback_schema = self.table_metadata.current_schema(None)?;
+                    let manifest_reader = ManifestReader::new_with_fallback_schema(
+                        manifest_bytes.as_ref(),
+                        Some(fallback_schema.clone()),
+                    )?;
                     let manifest_writer = ManifestWriter::from_existing(
                         manifest_reader,
                         manifest,
@@ -1098,8 +1102,13 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
             (selected_manifest, selected_manifest_bytes_opt)
         {
             let manifest_bytes = manifest_bytes.await??;
+            let fallback_schema = self.table_metadata.current_schema(None)?;
 
-            let manifest_reader = ManifestReader::new(&*manifest_bytes)?.filter_map(|entry| {
+            let manifest_reader = ManifestReader::new_with_fallback_schema(
+                manifest_bytes.as_ref(),
+                Some(fallback_schema.clone()),
+            )?
+            .filter_map(|entry| {
                 let mut entry = match entry {
                     Ok(entry) => entry,
                     Err(err) => return Some(Err(err)),
