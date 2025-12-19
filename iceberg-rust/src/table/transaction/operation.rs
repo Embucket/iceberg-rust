@@ -742,7 +742,10 @@ impl Operation {
                         .await?
                 };
 
-                filtered_stats.append(selected_filter_stats);
+                if let Some(selected_filter_stats) = selected_filter_stats {
+                    filtered_stats.append(selected_filter_stats);
+                }
+
                 let new_manifest_list_location = manifest_list_writer
                     .finish(snapshot_id, object_store)
                     .await?;
@@ -994,7 +997,7 @@ pub fn update_snapshot_summary<'files>(
 
 pub(crate) fn update_snapshot_summary_by_filtered_stats(
     summary: &mut HashMap<String, String>,
-    stats: FilteredManifestStats
+    stats: FilteredManifestStats,
 ) {
     let mut subtract_from_summary = |key: &str, delta: i64, add: bool| {
         if delta == 0 {
@@ -1016,7 +1019,11 @@ pub(crate) fn update_snapshot_summary_by_filtered_stats(
     subtract_from_summary("deleted-data-files", stats.removed_data_files.into(), true);
     subtract_from_summary("deleted-records", stats.removed_records, true);
     subtract_from_summary("total-data-files", stats.removed_data_files.into(), false);
-    subtract_from_summary("total-file-size-bytes", stats.removed_file_size_bytes, false);
+    subtract_from_summary(
+        "total-file-size-bytes",
+        stats.removed_file_size_bytes,
+        false,
+    );
 }
 
 pub(crate) fn new_manifest_location(

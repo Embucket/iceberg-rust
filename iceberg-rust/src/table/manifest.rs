@@ -199,7 +199,6 @@ pub(crate) struct ManifestWriter<'schema, 'metadata> {
     table_metadata: &'metadata TableMetadata,
     manifest: ManifestListEntry,
     writer: AvroWriter<'schema, Vec<u8>>,
-    filtered_stats: FilteredManifestStats,
 }
 
 #[derive(Default, Debug, Clone, Copy)]
@@ -318,7 +317,6 @@ impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
             manifest,
             writer,
             table_metadata,
-            filtered_stats: FilteredManifestStats::default(),
         })
     }
 
@@ -426,7 +424,6 @@ impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
             manifest,
             writer,
             table_metadata,
-            filtered_stats: FilteredManifestStats::default(),
         })
     }
 
@@ -472,7 +469,7 @@ impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
         schema: &'schema AvroSchema,
         table_metadata: &'metadata TableMetadata,
         branch: Option<&str>,
-    ) -> Result<Self, Error> {
+    ) -> Result<(Self, FilteredManifestStats), Error> {
         let fallback_schema = table_metadata.current_schema(None)?;
         let manifest_reader =
             ManifestReader::new_with_fallback_schema(bytes, Some(fallback_schema.clone()))?;
@@ -557,16 +554,14 @@ impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
         }
         writer.extend(entries)?;
 
-        Ok(ManifestWriter {
-            manifest,
-            writer,
-            table_metadata,
+        Ok((
+            ManifestWriter {
+                manifest,
+                writer,
+                table_metadata,
+            },
             filtered_stats,
-        })
-    }
-
-    pub(crate) fn filtered_stats(&self) -> FilteredManifestStats {
-        self.filtered_stats
+        ))
     }
 
     /// Appends a manifest entry to the manifest file and updates summary statistics.
@@ -688,8 +683,6 @@ impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
         mut self,
         object_store: Arc<dyn ObjectStore>,
     ) -> Result<ManifestListEntry, Error> {
-        self.apply_filtered_stats();
-
         let manifest_bytes = self.writer.into_inner()?;
 
         let manifest_length: i64 = manifest_bytes.len() as i64;
@@ -731,8 +724,6 @@ impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
         mut self,
         object_store: Arc<dyn ObjectStore>,
     ) -> Result<(ManifestListEntry, impl Future<Output = Result<(), Error>>), Error> {
-        self.apply_filtered_stats();
-
         let manifest_bytes = self.writer.into_inner()?;
 
         let manifest_length: i64 = manifest_bytes.len() as i64;
@@ -750,8 +741,8 @@ impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
         Ok((self.manifest, future))
     }
 
-    fn apply_filtered_stats(&mut self) {
-        let removed_files = self.filtered_stats.removed_data_files;
+    pub(crate) fn apply_filtered_stats(&mut self, filtered_stats: &FilteredManifestStats) {
+        let removed_files = filtered_stats.removed_data_files;
         if removed_files > 0 {
             self.manifest.deleted_files_count = match self.manifest.deleted_files_count {
                 Some(count) => Some(count + removed_files),
@@ -759,10 +750,10 @@ impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
             };
         }
 
-        if self.filtered_stats.removed_records > 0 {
+        if filtered_stats.removed_records > 0 {
             self.manifest.deleted_rows_count = match self.manifest.deleted_rows_count {
-                Some(count) => Some(count + self.filtered_stats.removed_records),
-                None => Some(self.filtered_stats.removed_records),
+                Some(count) => Some(count + filtered_stats.removed_records),
+                None => Some(filtered_stats.removed_records),
             };
         }
     }
