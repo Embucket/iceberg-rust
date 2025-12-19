@@ -560,7 +560,8 @@ impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
         manifest.sequence_number = table_metadata.last_sequence_number + 1;
 
         manifest.existing_files_count = Some(
-            manifest.existing_files_count.unwrap_or(0) + manifest.added_files_count.unwrap_or(0),
+            manifest.existing_files_count.unwrap_or(0) + manifest.added_files_count.unwrap_or(0)
+                - filtered_stats.removed_data_files,
         );
 
         manifest.added_files_count = None;
