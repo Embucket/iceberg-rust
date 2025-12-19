@@ -792,7 +792,7 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
         filter: Option<HashSet<String>>,
         object_store: Arc<dyn ObjectStore>,
         content: Content,
-    ) -> Result<FilteredManifestStats, Error> {
+    ) -> Result<Option<FilteredManifestStats>, Error> {
         let (future, stats) = self
             .append_filtered_concurrently(data_files, snapshot_id, filter, object_store, content)
             .await?;
@@ -810,7 +810,7 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
     ) -> Result<
         (
             impl Future<Output = Result<(), Error>>,
-            FilteredManifestStats,
+            Option<FilteredManifestStats>,
         ),
         Error,
     > {
@@ -829,51 +829,59 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
             &self.table_metadata.format_version,
         )?;
 
-        let mut manifest_writer = if let (Some(mut manifest), Some(manifest_bytes)) =
-            (selected_manifest, selected_manifest_bytes_opt)
-        {
-            let manifest_bytes = manifest_bytes.await??;
+        let (mut manifest_writer, filtered_stats) =
+            if let (Some(mut manifest), Some(manifest_bytes)) =
+                (selected_manifest, selected_manifest_bytes_opt)
+            {
+                let manifest_bytes = manifest_bytes.await??;
 
-            manifest.manifest_path = self.next_manifest_location();
+                manifest.manifest_path = self.next_manifest_location();
 
-            let manifest_reader = ManifestReader::new(manifest_bytes.as_ref())?;
+                let manifest_reader = ManifestReader::new(manifest_bytes.as_ref())?;
 
-            if let Some(filter) = filter {
-                ManifestWriter::from_existing_with_filter(
-                    manifest_bytes.as_ref(),
-                    manifest,
-                    &filter,
-                    &manifest_schema,
-                    self.table_metadata,
-                    self.branch.as_deref(),
-                )?
+                if let Some(filter) = filter {
+                    let (manifest_writer, filtered_stats) =
+                        ManifestWriter::from_existing_with_filter(
+                            manifest_bytes.as_ref(),
+                            manifest,
+                            &filter,
+                            &manifest_schema,
+                            self.table_metadata,
+                            self.branch.as_deref(),
+                        )?;
+                    (manifest_writer, Some(filtered_stats))
+                } else {
+                    let manifest_writer = ManifestWriter::from_existing(
+                        manifest_reader,
+                        manifest,
+                        &manifest_schema,
+                        self.table_metadata,
+                        self.branch.as_deref(),
+                    )?;
+                    (manifest_writer, None)
+                }
             } else {
-                ManifestWriter::from_existing(
-                    manifest_reader,
-                    manifest,
+                let manifest_location = self.next_manifest_location();
+
+                let manifest_writer = ManifestWriter::new(
+                    &manifest_location,
+                    snapshot_id,
                     &manifest_schema,
                     self.table_metadata,
+                    content,
                     self.branch.as_deref(),
-                )?
-            }
-        } else {
-            let manifest_location = self.next_manifest_location();
-
-            ManifestWriter::new(
-                &manifest_location,
-                snapshot_id,
-                &manifest_schema,
-                self.table_metadata,
-                content,
-                self.branch.as_deref(),
-            )?
-        };
+                )?;
+                (manifest_writer, None)
+            };
 
         for manifest_entry in data_files {
             manifest_writer.append(manifest_entry?)?;
         }
 
-        let filtered_stats = manifest_writer.filtered_stats();
+        if let Some(filtered_stats) = filtered_stats {
+            manifest_writer.apply_filtered_stats(&filtered_stats);
+        }
+
         let (manifest, future) = manifest_writer.finish_concurrently(object_store.clone())?;
 
         self.writer.append_ser(manifest)?;
@@ -1019,7 +1027,7 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
         filter: Option<HashSet<String>>,
         object_store: Arc<dyn ObjectStore>,
         content: Content,
-    ) -> Result<FilteredManifestStats, Error> {
+    ) -> Result<Option<FilteredManifestStats>, Error> {
         let (future, stats) = self
             .append_multiple_filtered_concurrently(
                 data_files,
@@ -1045,11 +1053,15 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
     ) -> Result<
         (
             impl Future<Output = Result<(), Error>>,
-            FilteredManifestStats,
+            Option<FilteredManifestStats>,
         ),
         Error,
     > {
-        let mut removed_stats = FilteredManifestStats::default();
+        let mut removed_stats = if filter.is_some() {
+            Some(FilteredManifestStats::default())
+        } else {
+            None
+        };
         let partition_fields = self
             .table_metadata
             .current_partition_fields(self.branch.as_deref())?;
@@ -1094,7 +1106,9 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
                     Err(err) => return Some(Err(err)),
                 };
 
-                if let Some(files_to_filter) = filter.as_ref() {
+                if let (Some(files_to_filter), Some(removed_stats)) =
+                    (filter.as_ref(), &mut removed_stats)
+                {
                     if files_to_filter.contains(entry.data_file().file_path()) {
                         if *entry.data_file().content()
                             == iceberg_rust_spec::manifest::Content::Data
@@ -1290,17 +1304,19 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
 
                 manifest.manifest_path = manifest_location;
 
-                let manifest_writer = ManifestWriter::from_existing_with_filter(
-                    &bytes,
-                    manifest,
-                    &data_files_to_filter,
-                    &manifest_schema,
-                    table_metadata,
-                    branch.as_deref(),
-                )?;
+                let (mut manifest_writer, filtered_stats) =
+                    ManifestWriter::from_existing_with_filter(
+                        &bytes,
+                        manifest,
+                        &data_files_to_filter,
+                        &manifest_schema,
+                        table_metadata,
+                        branch.as_deref(),
+                    )?;
+
+                manifest_writer.apply_filtered_stats(&filtered_stats);
 
                 // Capture filtered statistics
-                let filtered_stats = manifest_writer.filtered_stats();
 
                 let new_manifest = manifest_writer.finish(object_store.clone()).await?;
 
