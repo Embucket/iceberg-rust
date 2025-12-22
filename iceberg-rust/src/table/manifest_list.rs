@@ -27,12 +27,6 @@ use iceberg_rust_spec::{
 use object_store::{ObjectStore, ObjectStoreExt};
 use smallvec::SmallVec;
 
-use crate::{
-    error::Error,
-    table::datafiles,
-    util::{summary_to_rectangle, Rectangle, Vec4},
-};
-
 use super::{
     manifest::{FilteredManifestStats, ManifestReader, ManifestWriter},
     transaction::{
@@ -49,6 +43,12 @@ use super::{
             select_manifest_without_overwrites_unpartitioned, OverwriteManifest,
         },
     },
+};
+use crate::table::manifest::FilteredManifestStats;
+use crate::{
+    error::Error,
+    table::datafiles,
+    util::{summary_to_rectangle, Rectangle, Vec4},
 };
 
 type ReaderZip<'a, 'metadata, R> = Zip<AvroReader<'a, R>, Repeat<&'metadata TableMetadata>>;
@@ -849,7 +849,11 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
                         )?;
                     (manifest_writer, Some(filtered_stats))
                 } else {
-                    let manifest_reader = ManifestReader::new(manifest_bytes.as_ref())?;
+                    let fallback_schema = self.table_metadata.current_schema(None)?;
+                    let manifest_reader = ManifestReader::new_with_fallback_schema(
+                        manifest_bytes.as_ref(),
+                        Some(fallback_schema.clone()),
+                    )?;
                     let manifest_writer = ManifestWriter::from_existing(
                         manifest_reader,
                         manifest,
@@ -1098,7 +1102,13 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
             (selected_manifest, selected_manifest_bytes_opt)
         {
             let manifest_bytes = manifest_bytes.await??;
-            let manifest_reader = ManifestReader::new(&*manifest_bytes)?.filter_map(|entry| {
+            let fallback_schema = self.table_metadata.current_schema(None)?;
+
+            let manifest_reader = ManifestReader::new_with_fallback_schema(
+                manifest_bytes.as_ref(),
+                Some(fallback_schema.clone()),
+            )?
+            .filter_map(|entry| {
                 let mut entry = match entry {
                     Ok(entry) => entry,
                     Err(err) => return Some(Err(err)),
@@ -1119,6 +1129,8 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
                         return None;
                     }
                 }
+
+
                 *entry.status_mut() = Status::Existing;
                 if entry.sequence_number().is_none() {
                     *entry.sequence_number_mut() = Some(manifest.sequence_number);
@@ -1311,7 +1323,6 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
                         branch.as_deref(),
                     )?;
 
-                // Apply filtered statistics
                 manifest_writer.apply_filtered_stats(&filtered_stats);
 
                 let new_manifest = manifest_writer.finish(object_store.clone()).await?;
@@ -1325,12 +1336,7 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
             removed_stats.removed_data_files += filtered_stats.removed_data_files;
             removed_stats.removed_records += filtered_stats.removed_records;
             removed_stats.removed_file_size_bytes += filtered_stats.removed_file_size_bytes;
-
-            if manifest.added_files_count.unwrap_or(0) > 0
-                || manifest.existing_files_count.unwrap_or(0) > 0
-            {
-                self.writer.append_ser(manifest)?;
-            }
+            self.writer.append_ser(manifest)?;
         }
         Ok(removed_stats)
     }

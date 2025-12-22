@@ -776,12 +776,22 @@ impl Operation {
                     .finish(snapshot_id, object_store)
                     .await?;
 
+                if let Some(selected_filter_stats) = selected_filter_stats {
+                    filtered_stats.append(selected_filter_stats);
+                }
+
+                let new_manifest_list_location = manifest_list_writer
+                    .finish(snapshot_id, object_store)
+                    .await?;
+
                 let snapshot_operation = SnapshotOperation::Overwrite;
 
                 // Merge with any additional summary fields
                 if let Some(additional) = additional_summary {
                     summary_fields.extend(additional);
                 }
+                // Apply filtration stats
+                update_snapshot_summary_by_filtered_stats(&mut summary_fields, filtered_stats);
 
                 // Apply filtration stats
                 update_snapshot_summary_by_filtered_stats(&mut summary_fields, filtered_stats);
