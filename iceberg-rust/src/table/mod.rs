@@ -356,7 +356,8 @@ async fn datafiles(
         let (bytes, path, sequence_number) = result;
 
         // Use new_with_fallback_schema to handle manifests with empty schemas
-        let reader = match ManifestReader::new_with_fallback_schema(bytes, fallback_schema.clone()) {
+        let reader = match ManifestReader::new_with_fallback_schema(bytes, fallback_schema.clone())
+        {
             Ok(reader) => reader,
             Err(e) => {
                 tracing::warn!(
@@ -365,7 +366,8 @@ async fn datafiles(
                     e
                 );
                 // Return an empty iterator for this manifest so we can continue with others
-                return Box::new(std::iter::empty()) as Box<dyn Iterator<Item = Result<(ManifestPath, ManifestEntry), Error>>>;
+                return Box::new(std::iter::empty())
+                    as Box<dyn Iterator<Item = Result<(ManifestPath, ManifestEntry), Error>>>;
             }
         };
 
