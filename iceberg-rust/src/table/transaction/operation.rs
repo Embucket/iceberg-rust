@@ -666,9 +666,10 @@ impl Operation {
                 let manifests_to_overwrite: HashSet<String> =
                     files_to_overwrite.keys().map(ToOwned::to_owned).collect();
 
-                let bytes = prefetch_manifest_list(Some(old_snapshot), &object_store)
-                    .unwrap()
-                    .await??;
+                let handle = prefetch_manifest_list(Some(old_snapshot), &object_store)
+                    .ok_or_else(|| Error::NotFound("Old snapshot manifest list location".to_owned()))?;
+                let bytes = handle.await??;
+                
 
                 let (mut manifest_list_writer, manifests_to_overwrite) =
                     ManifestListWriter::from_existing_without_overwrites(
