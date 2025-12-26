@@ -26,7 +26,7 @@ use iceberg_rust_spec::{
 };
 use object_store::ObjectStore;
 use smallvec::SmallVec;
-use iceberg_rust_spec::manifest::DataFileBuilder;
+
 use super::{
     manifest::{ManifestReader, ManifestWriter},
     transaction::{
@@ -1182,7 +1182,7 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
             })
             .collect::<Result<(Vec<_>, Vec<_>), _>>()?;
 
-        // Add additional manifest with filtered data files
+        // Add additional manifest with filtered (deleted) data files
         if let Some(removed_stats) = removed_stats.as_ref() {
             if removed_stats.removed_data_files > 0 {
                 let manifest_location = self.next_manifest_location();
@@ -1197,7 +1197,7 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
                 for manifest_entry in filtered_files {
                     manifest_writer.append(manifest_entry)?;
                 }
-                manifest_writer.apply_filtered_stats(removed_stats);
+                manifest_writer.adjust_filtered_stats(removed_stats);
                 let (manifest, future) =
                     manifest_writer.finish_concurrently(object_store.clone())?;
                 manifests.push(manifest);
