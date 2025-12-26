@@ -1061,7 +1061,7 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
         Error,
     > {
         let mut removed_stats = if filter.is_some() {
-            Some(FilteredManifestStats::new())
+            Some(FilteredManifestStats::default())
         } else {
             None
         };
