@@ -1061,7 +1061,7 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
         Error,
     > {
         let mut removed_stats = if filter.is_some() {
-            Some(FilteredManifestStats::default())
+            Some(FilteredManifestStats::new())
         } else {
             None
         };
@@ -1118,6 +1118,13 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
                     if let (Some(files_to_filter), Some(removed_stats)) =
                         (filter.as_ref(), &mut removed_stats)
                     {
+                        if entry.sequence_number().is_none() {
+                            *entry.sequence_number_mut() = Some(manifest.sequence_number);
+                        }
+                        if entry.snapshot_id().is_none() {
+                            *entry.snapshot_id_mut() = Some(manifest.added_snapshot_id);
+                        }
+
                         if files_to_filter.contains(entry.data_file().file_path()) {
                             if *entry.data_file().content()
                                 == iceberg_rust_spec::manifest::Content::Data
@@ -1127,17 +1134,13 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
                             removed_stats.removed_file_size_bytes +=
                                 entry.data_file().file_size_in_bytes();
                             removed_stats.removed_data_files += 1;
+
+                            *entry.status_mut() = Status::Deleted;
                             filtered_files.push(entry);
                             return None;
                         }
                     }
                     *entry.status_mut() = Status::Existing;
-                    if entry.sequence_number().is_none() {
-                        *entry.sequence_number_mut() = Some(manifest.sequence_number);
-                    }
-                    if entry.snapshot_id().is_none() {
-                        *entry.snapshot_id_mut() = Some(manifest.added_snapshot_id);
-                    }
                     Some(Ok(entry))
                 });
 
@@ -1179,6 +1182,7 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
             })
             .collect::<Result<(Vec<_>, Vec<_>), _>>()?;
 
+        // Add additional manifest with filtered data files
         if let Some(removed_stats) = removed_stats.as_ref() {
             if removed_stats.removed_data_files > 0 {
                 let manifest_location = self.next_manifest_location();
@@ -1190,10 +1194,10 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
                     content,
                     self.branch.as_deref(),
                 )?;
-                for mut manifest_entry in filtered_files {
-                    *manifest_entry.status_mut() = Status::Deleted;
+                for manifest_entry in filtered_files {
                     manifest_writer.append(manifest_entry)?;
                 }
+                manifest_writer.apply_filtered_stats(removed_stats);
                 let (manifest, future) =
                     manifest_writer.finish_concurrently(object_store.clone())?;
                 manifests.push(manifest);

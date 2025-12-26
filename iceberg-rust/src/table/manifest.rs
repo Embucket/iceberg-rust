@@ -206,6 +206,7 @@ pub(crate) struct FilteredManifestStats {
     pub removed_data_files: i32,
     pub removed_records: i64,
     pub removed_file_size_bytes: i64,
+    pub adjust_added: bool,
 }
 
 impl FilteredManifestStats {
@@ -213,6 +214,15 @@ impl FilteredManifestStats {
         self.removed_file_size_bytes += stats.removed_file_size_bytes;
         self.removed_records += stats.removed_records;
         self.removed_data_files += stats.removed_data_files;
+    }
+
+    pub(crate) fn new() -> Self {
+        Self {
+            removed_data_files: 0,
+            removed_records: 0,
+            removed_file_size_bytes: 0,
+            adjust_added: true,
+        } 
     }
 }
 impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
@@ -775,6 +785,13 @@ impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
             self.manifest.deleted_rows_count = match self.manifest.deleted_rows_count {
                 Some(count) => Some(count + filtered_stats.removed_records),
                 None => Some(filtered_stats.removed_records),
+            };
+        }
+        
+        if filtered_stats.adjust_added {
+            self.manifest.added_rows_count = match self.manifest.added_rows_count {
+                Some(count) => Some((count - filtered_stats.removed_records).max(0)),
+                None => Some(filtered_stats.removed_records.max(0)),
             };
         }
     }
