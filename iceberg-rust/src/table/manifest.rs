@@ -778,6 +778,23 @@ impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
             };
         }
     }
+
+    pub(crate) fn adjust_filtered_stats(&mut self, filtered_stats: &FilteredManifestStats) {
+        let removed_files = filtered_stats.removed_data_files;
+        if removed_files > 0 {
+            self.manifest.added_files_count = self
+                .manifest
+                .added_files_count
+                .map(|count| (count - filtered_stats.removed_data_files).max(0));
+        }
+
+        if filtered_stats.removed_records > 0 {
+            self.manifest.added_rows_count = self
+                .manifest
+                .added_rows_count
+                .map(|count| (count - filtered_stats.removed_records).max(0));
+        }
+    }
 }
 
 #[allow(clippy::type_complexity)]
