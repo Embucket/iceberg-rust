@@ -1098,9 +1098,10 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
         let selected_manifest_bytes_opt = prefetch_manifest(&selected_manifest, &object_store);
 
         // Split datafiles
-        let splits = if let (Some(manifest), Some(manifest_bytes)) =
+        let (splits, filtered_files) = if let (Some(manifest), Some(manifest_bytes)) =
             (selected_manifest, selected_manifest_bytes_opt)
         {
+            let mut filtered_files = Vec::new();
             let manifest_bytes = manifest_bytes.await??;
             let fallback_schema = self.table_metadata.current_schema(None)?;
 
@@ -1108,46 +1109,52 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
                 manifest_bytes.as_ref(),
                 Some(fallback_schema.clone()),
             )?
-            .filter_map(|entry| {
-                let mut entry = match entry {
-                    Ok(entry) => entry,
-                    Err(err) => return Some(Err(err)),
-                };
+                .filter_map(|entry| {
+                    let mut entry = match entry {
+                        Ok(entry) => entry,
+                        Err(err) => return Some(Err(err)),
+                    };
 
-                if let (Some(files_to_filter), Some(removed_stats)) =
-                    (filter.as_ref(), &mut removed_stats)
-                {
-                    if files_to_filter.contains(entry.data_file().file_path()) {
-                        if *entry.data_file().content()
-                            == iceberg_rust_spec::manifest::Content::Data
-                        {
-                            removed_stats.removed_records += entry.data_file().record_count();
+                    if let (Some(files_to_filter), Some(removed_stats)) =
+                        (filter.as_ref(), &mut removed_stats)
+                    {
+                        if files_to_filter.contains(entry.data_file().file_path()) {
+                            if *entry.data_file().content()
+                                == iceberg_rust_spec::manifest::Content::Data
+                            {
+                                removed_stats.removed_records += entry.data_file().record_count();
+                            }
+                            removed_stats.removed_file_size_bytes +=
+                                entry.data_file().file_size_in_bytes();
+                            removed_stats.removed_data_files += 1;
+                            filtered_files.push(entry);
+                            return None;
                         }
-                        removed_stats.removed_file_size_bytes +=
-                            entry.data_file().file_size_in_bytes();
-                        removed_stats.removed_data_files += 1;
-                        return None;
                     }
-                }
+                    *entry.status_mut() = Status::Existing;
+                    if entry.sequence_number().is_none() {
+                        *entry.sequence_number_mut() = Some(manifest.sequence_number);
+                    }
+                    if entry.snapshot_id().is_none() {
+                        *entry.snapshot_id_mut() = Some(manifest.added_snapshot_id);
+                    }
+                    Some(Ok(entry))
+                });
 
-                *entry.status_mut() = Status::Existing;
-                if entry.sequence_number().is_none() {
-                    *entry.sequence_number_mut() = Some(manifest.sequence_number);
-                }
-                if entry.snapshot_id().is_none() {
-                    *entry.snapshot_id_mut() = Some(manifest.added_snapshot_id);
-                }
-                Some(Ok(entry))
-            });
-
-            split_datafiles(
-                data_files.chain(manifest_reader),
-                bounds,
-                &partition_column_names,
-                n_splits,
-            )?
+            (
+                split_datafiles(
+                    data_files.chain(manifest_reader),
+                    bounds,
+                    &partition_column_names,
+                    n_splits,
+                )?,
+                filtered_files,
+            )
         } else {
-            split_datafiles(data_files, bounds, &partition_column_names, n_splits)?
+            (
+                split_datafiles(data_files, bounds, &partition_column_names, n_splits)?,
+                Vec::new(),
+            )
         };
 
         let (mut manifests, mut manifest_futures) = splits
@@ -1172,7 +1179,6 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
             })
             .collect::<Result<(Vec<_>, Vec<_>), _>>()?;
 
-
         if let Some(removed_stats) = removed_stats.as_ref() {
             if removed_stats.removed_data_files > 0 {
                 let manifest_location = self.next_manifest_location();
@@ -1184,6 +1190,10 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
                     content,
                     self.branch.as_deref(),
                 )?;
+                for mut manifest_entry in filtered_files {
+                    *manifest_entry.status_mut() = Status::Deleted;
+                    manifest_writer.append(manifest_entry)?;
+                }
                 manifest_writer.apply_filtered_stats(removed_stats);
                 let (manifest, future) =
                     manifest_writer.finish_concurrently(object_store.clone())?;
@@ -1191,6 +1201,7 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
                 manifest_futures.push(future);
             }
         }
+
         for manifest in manifests {
             self.writer.append_ser(manifest)?;
         }
