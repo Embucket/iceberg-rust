@@ -26,7 +26,7 @@ use iceberg_rust_spec::{
 };
 use object_store::ObjectStore;
 use smallvec::SmallVec;
-
+use iceberg_rust_spec::manifest::DataFileBuilder;
 use super::{
     manifest::{ManifestReader, ManifestWriter},
     transaction::{
@@ -1194,7 +1194,6 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
                     *manifest_entry.status_mut() = Status::Deleted;
                     manifest_writer.append(manifest_entry)?;
                 }
-                manifest_writer.apply_filtered_stats(removed_stats);
                 let (manifest, future) =
                     manifest_writer.finish_concurrently(object_store.clone())?;
                 manifests.push(manifest);
