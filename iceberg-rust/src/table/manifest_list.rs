@@ -1197,7 +1197,6 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
                 for manifest_entry in filtered_files {
                     manifest_writer.append(manifest_entry)?;
                 }
-                manifest_writer.adjust_filtered_stats(removed_stats);
                 let (manifest, future) =
                     manifest_writer.finish_concurrently(object_store.clone())?;
                 manifests.push(manifest);

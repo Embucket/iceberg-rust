@@ -607,6 +607,7 @@ impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
     pub(crate) fn append(&mut self, manifest_entry: ManifestEntry) -> Result<(), Error> {
         let mut added_rows_count = 0;
         let mut deleted_rows_count = 0;
+        let mut existing_rows_count = 0;
 
         if self.manifest.partitions.is_none() {
             self.manifest.partitions = Some(
@@ -624,16 +625,26 @@ impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
             );
         }
 
+        let status = *manifest_entry.status();
         match manifest_entry.data_file().content() {
             Content::Data => {
-                added_rows_count += manifest_entry.data_file().record_count();
+                match status {
+                    Status::Added => {
+                        added_rows_count += manifest_entry.data_file().record_count();
+                    }
+                    Status::Existing => {
+                        existing_rows_count += manifest_entry.data_file().record_count();
+                    }
+                    Status::Deleted => {
+                        deleted_rows_count += manifest_entry.data_file().record_count();
+                    }
+                }
             }
             Content::EqualityDeletes => {
                 deleted_rows_count += manifest_entry.data_file().record_count();
             }
             _ => (),
         }
-        let status = *manifest_entry.status();
 
         update_partitions(
             self.manifest.partitions.as_mut().unwrap(),
@@ -674,10 +685,15 @@ impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
             Some(count) => Some(count + added_rows_count),
             None => Some(added_rows_count),
         };
-
-        self.manifest.deleted_rows_count = match self.manifest.deleted_rows_count {
+        
+        self.manifest.existing_rows_count = match self.manifest.existing_rows_count {
             Some(count) => Some(count + deleted_rows_count),
             None => Some(deleted_rows_count),
+        };
+        
+        self.manifest.deleted_rows_count = match self.manifest.deleted_rows_count {
+            Some(count) => Some(count + existing_rows_count),
+            None => Some(existing_rows_count),
         };
 
         Ok(())
@@ -776,23 +792,6 @@ impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
                 Some(count) => Some(count + filtered_stats.removed_records),
                 None => Some(filtered_stats.removed_records),
             };
-        }
-    }
-
-    pub(crate) fn adjust_filtered_stats(&mut self, filtered_stats: &FilteredManifestStats) {
-        let removed_files = filtered_stats.removed_data_files;
-        if removed_files > 0 {
-            self.manifest.added_files_count = self
-                .manifest
-                .added_files_count
-                .map(|count| (count - filtered_stats.removed_data_files).max(0));
-        }
-
-        if filtered_stats.removed_records > 0 {
-            self.manifest.added_rows_count = self
-                .manifest
-                .added_rows_count
-                .map(|count| (count - filtered_stats.removed_records).max(0));
         }
     }
 }
