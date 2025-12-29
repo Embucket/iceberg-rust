@@ -685,15 +685,15 @@ impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
             Some(count) => Some(count + added_rows_count),
             None => Some(added_rows_count),
         };
-        
+
         self.manifest.existing_rows_count = match self.manifest.existing_rows_count {
-            Some(count) => Some(count + deleted_rows_count),
-            None => Some(deleted_rows_count),
-        };
-        
-        self.manifest.deleted_rows_count = match self.manifest.deleted_rows_count {
             Some(count) => Some(count + existing_rows_count),
             None => Some(existing_rows_count),
+        };
+
+        self.manifest.deleted_rows_count = match self.manifest.deleted_rows_count {
+            Some(count) => Some(count + deleted_rows_count),
+            None => Some(deleted_rows_count),
         };
 
         Ok(())
