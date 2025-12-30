@@ -67,16 +67,10 @@ pub(crate) fn select_manifest_without_overwrites_partitioned(
         }
     }
     selected_state
-        .map(|(_, entry)| {
-            let mut manifests_to_overwrite = manifests_to_overwrite;
-            if overwrites.contains(&entry.manifest_path) {
-                manifests_to_overwrite.push(entry.clone());
-            }
-            OverwriteManifest {
-                manifest: entry,
-                file_count_all_entries,
-                manifests_to_overwrite,
-            }
+        .map(|(_, entry)| OverwriteManifest {
+            manifest: entry,
+            file_count_all_entries,
+            manifests_to_overwrite,
         })
         .ok_or(Error::NotFound("Manifest for insert".to_owned()))
 }
@@ -127,16 +121,10 @@ pub(crate) fn select_manifest_without_overwrites_unpartitioned(
         }
     }
     selected_state
-        .map(|(_, entry)| {
-            let mut manifests_to_overwrite = manifests_to_overwrite;
-            if overwrites.contains(&entry.manifest_path) {
-                manifests_to_overwrite.push(entry.clone());
-            }
-            OverwriteManifest {
-                manifest: entry,
-                file_count_all_entries,
-                manifests_to_overwrite,
-            }
+        .map(|(_, entry)| OverwriteManifest {
+            manifest: entry,
+            file_count_all_entries,
+            manifests_to_overwrite,
         })
         .ok_or(Error::NotFound("Manifest for insert".to_owned()))
 }
