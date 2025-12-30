@@ -214,10 +214,7 @@ impl FilteredManifestStats {
         self.removed_file_size_bytes += stats.removed_file_size_bytes;
         self.removed_records += stats.removed_records;
         self.removed_data_files += stats.removed_data_files;
-    }
-
-    pub fn filtered_entries(&mut self) -> &Vec<ManifestEntry> {
-        &self.filtered_entries
+        self.filtered_entries.extend(stats.filtered_entries);
     }
 }
 impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
