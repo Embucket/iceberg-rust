@@ -217,12 +217,12 @@ mod _serde {
                 sequence_number: value.sequence_number,
                 min_sequence_number: value.min_sequence_number,
                 added_snapshot_id: value.added_snapshot_id,
-                added_files_count: value.added_files_count.unwrap(),
-                existing_files_count: value.existing_files_count.unwrap(),
-                deleted_files_count: value.deleted_files_count.unwrap(),
-                added_rows_count: value.added_rows_count.unwrap(),
-                existing_rows_count: value.existing_rows_count.unwrap(),
-                deleted_rows_count: value.deleted_rows_count.unwrap(),
+                added_files_count: value.added_files_count.unwrap_or(0),
+                existing_files_count: value.existing_files_count.unwrap_or(0),
+                deleted_files_count: value.deleted_files_count.unwrap_or(0),
+                added_rows_count: value.added_rows_count.unwrap_or(0),
+                existing_rows_count: value.existing_rows_count.unwrap_or(0),
+                deleted_rows_count: value.deleted_rows_count.unwrap_or(0),
                 partitions: value
                     .partitions
                     .map(|v| v.into_iter().map(Into::into).collect()),
