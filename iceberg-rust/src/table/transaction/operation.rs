@@ -752,7 +752,7 @@ impl Operation {
                         .filtered_entries
                         .clone()
                         .into_iter()
-                        .map(|entry| Ok(entry));
+                        .map(Ok);
                     manifest_list_writer
                         .append_multiple_filtered(
                             filtered_iter,
