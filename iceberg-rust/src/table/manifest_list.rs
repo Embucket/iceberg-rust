@@ -1093,7 +1093,7 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
         let selected_manifest_bytes_opt = prefetch_manifest(&selected_manifest, &object_store);
 
         // Split datafiles
-        let splits= if let (Some(manifest), Some(manifest_bytes)) =
+        let splits = if let (Some(manifest), Some(manifest_bytes)) =
             (selected_manifest, selected_manifest_bytes_opt)
         {
             let manifest_bytes = manifest_bytes.await??;
@@ -1310,15 +1310,14 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
 
                 manifest.manifest_path = manifest_location;
 
-                let (manifest_writer, filtered_stats) =
-                    ManifestWriter::from_existing_with_filter(
-                        &bytes,
-                        manifest,
-                        &data_files_to_filter,
-                        &manifest_schema,
-                        table_metadata,
-                        branch.as_deref(),
-                    )?;
+                let (manifest_writer, filtered_stats) = ManifestWriter::from_existing_with_filter(
+                    &bytes,
+                    manifest,
+                    &data_files_to_filter,
+                    &manifest_schema,
+                    table_metadata,
+                    branch.as_deref(),
+                )?;
 
                 let new_manifest = manifest_writer.finish(object_store.clone()).await?;
 

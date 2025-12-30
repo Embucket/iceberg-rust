@@ -38,7 +38,7 @@ use iceberg_rust_spec::{
     values::{Struct, Value},
 };
 use object_store::ObjectStore;
-use iceberg_rust_spec::manifest::DataFile;
+
 use crate::error::Error;
 
 type ReaderZip<'a, R> = Zip<AvroReader<'a, R>, Repeat<Arc<(Schema, PartitionSpec, FormatVersion)>>>;
@@ -554,7 +554,7 @@ impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
             if entry.snapshot_id().is_none() {
                 *entry.snapshot_id_mut() = Some(manifest.added_snapshot_id);
             }
-            
+
             if filter.contains(entry.data_file().file_path()) {
                 if *entry.data_file().content() == Content::Data {
                     filtered_stats.removed_records += entry.data_file().record_count();
@@ -636,19 +636,17 @@ impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
 
         let status = *manifest_entry.status();
         match manifest_entry.data_file().content() {
-            Content::Data => {
-                match status {
-                    Status::Added => {
-                        added_rows_count += manifest_entry.data_file().record_count();
-                    }
-                    Status::Existing => {
-                        existing_rows_count += manifest_entry.data_file().record_count();
-                    }
-                    Status::Deleted => {
-                        deleted_rows_count += manifest_entry.data_file().record_count();
-                    }
+            Content::Data => match status {
+                Status::Added => {
+                    added_rows_count += manifest_entry.data_file().record_count();
                 }
-            }
+                Status::Existing => {
+                    existing_rows_count += manifest_entry.data_file().record_count();
+                }
+                Status::Deleted => {
+                    deleted_rows_count += manifest_entry.data_file().record_count();
+                }
+            },
             Content::EqualityDeletes => {
                 deleted_rows_count += manifest_entry.data_file().record_count();
             }
@@ -785,23 +783,6 @@ impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
                 .await
         };
         Ok((self.manifest, future))
-    }
-
-    pub(crate) fn apply_filtered_stats(&mut self, filtered_stats: &FilteredManifestStats) {
-        let removed_files = filtered_stats.removed_data_files;
-        if removed_files > 0 {
-            self.manifest.deleted_files_count = match self.manifest.deleted_files_count {
-                Some(count) => Some(count + removed_files),
-                None => Some(removed_files),
-            };
-        }
-
-        if filtered_stats.removed_records > 0 {
-            self.manifest.deleted_rows_count = match self.manifest.deleted_rows_count {
-                Some(count) => Some(count + filtered_stats.removed_records),
-                None => Some(filtered_stats.removed_records),
-            };
-        }
     }
 }
 
