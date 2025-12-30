@@ -38,7 +38,7 @@ use iceberg_rust_spec::{
     values::{Struct, Value},
 };
 use object_store::ObjectStore;
-
+use iceberg_rust_spec::manifest::DataFile;
 use crate::error::Error;
 
 type ReaderZip<'a, R> = Zip<AvroReader<'a, R>, Repeat<Arc<(Schema, PartitionSpec, FormatVersion)>>>;
@@ -201,11 +201,12 @@ pub(crate) struct ManifestWriter<'schema, 'metadata> {
     writer: AvroWriter<'schema, Vec<u8>>,
 }
 
-#[derive(Default, Debug, Clone, Copy)]
+#[derive(Default, Debug, Clone)]
 pub(crate) struct FilteredManifestStats {
     pub removed_data_files: i32,
     pub removed_records: i64,
     pub removed_file_size_bytes: i64,
+    pub filtered_entries: Vec<ManifestEntry>,
 }
 
 impl FilteredManifestStats {
@@ -213,6 +214,10 @@ impl FilteredManifestStats {
         self.removed_file_size_bytes += stats.removed_file_size_bytes;
         self.removed_records += stats.removed_records;
         self.removed_data_files += stats.removed_data_files;
+    }
+
+    pub fn filtered_entries(&mut self) -> &Vec<ManifestEntry> {
+        &self.filtered_entries
     }
 }
 impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
@@ -542,22 +547,26 @@ impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
             let mut entry = entry
                 .map_err(|err| apache_avro::Error::DeserializeValue(err.to_string()))
                 .unwrap();
-            if !filter.contains(entry.data_file().file_path()) {
-                *entry.status_mut() = Status::Existing;
-                if entry.sequence_number().is_none() {
-                    *entry.sequence_number_mut() = Some(manifest.sequence_number);
-                }
-                if entry.snapshot_id().is_none() {
-                    *entry.snapshot_id_mut() = Some(manifest.added_snapshot_id);
-                }
-                Some(to_value(entry).unwrap())
-            } else {
+
+            if entry.sequence_number().is_none() {
+                *entry.sequence_number_mut() = Some(manifest.sequence_number);
+            }
+            if entry.snapshot_id().is_none() {
+                *entry.snapshot_id_mut() = Some(manifest.added_snapshot_id);
+            }
+            
+            if filter.contains(entry.data_file().file_path()) {
                 if *entry.data_file().content() == Content::Data {
                     filtered_stats.removed_records += entry.data_file().record_count();
                 }
                 filtered_stats.removed_file_size_bytes += entry.data_file().file_size_in_bytes();
                 filtered_stats.removed_data_files += 1;
+                *entry.status_mut() = Status::Deleted;
+                filtered_stats.filtered_entries.push(entry);
                 None
+            } else {
+                *entry.status_mut() = Status::Existing;
+                Some(to_value(entry).unwrap())
             }
         }))?;
 

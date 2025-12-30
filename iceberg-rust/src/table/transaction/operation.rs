@@ -746,6 +746,25 @@ impl Operation {
                     filtered_stats.append(selected_filter_stats);
                 }
 
+                // Store separate manifest with filtered data files for compatability
+                if !filtered_stats.filtered_entries.is_empty() {
+                    let filtered_iter = filtered_stats
+                        .filtered_entries
+                        .clone()
+                        .into_iter()
+                        .map(|entry| Ok(entry));
+                    manifest_list_writer
+                        .append_multiple_filtered(
+                            filtered_iter,
+                            snapshot_id,
+                            n_splits,
+                            None::<HashSet<String>>,
+                            object_store.clone(),
+                            ManifestListContent::Data,
+                        )
+                        .await?;
+                }
+
                 let new_manifest_list_location = manifest_list_writer
                     .finish(snapshot_id, object_store)
                     .await?;
