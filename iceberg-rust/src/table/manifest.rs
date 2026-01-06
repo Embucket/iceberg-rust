@@ -411,9 +411,7 @@ impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
             if *entry.status() == Status::Deleted {
                 return None;
             }
-            if *entry.status() != Status::Deleted {
-                *entry.status_mut() = Status::Existing;
-            }
+            *entry.status_mut() = Status::Existing;
             if entry.sequence_number().is_none() {
                 *entry.sequence_number_mut() = Some(manifest.sequence_number);
             }
