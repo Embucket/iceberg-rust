@@ -434,6 +434,8 @@ impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
 
         manifest.added_files_count = None;
         manifest.added_rows_count = None;
+        manifest.deleted_rows_count = None;
+        manifest.deleted_files_count = None;
 
         Ok(ManifestWriter {
             manifest,
