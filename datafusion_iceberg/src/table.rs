@@ -932,8 +932,21 @@ async fn table_scan(
 fn datafusion_partition_columns(
     partition_fields: &[BoundPartitionField<'_>],
 ) -> Result<Vec<Field>, DataFusionError> {
+    use iceberg_rust::spec::partition::Transform;
+    // Skip identity-transform partitions whose partition name matches the
+    // source column name. For Iceberg identity partitions on existing columns
+    // (e.g. `identity(event_name)`), the column is present in both the parquet
+    // file body and the Hive-style directory path. datafusion's parquet reader
+    // subtracts matching partition cols from the file schema when computing
+    // the expected column count, which causes an off-by-one mismatch
+    // ("expected N cols but got N+1"). Transformed partitions (day, hour, etc.)
+    // and renamed-identity partitions keep their own synthetic column.
     let table_partition_cols: Vec<Field> = partition_fields
         .iter()
+        .filter(|partition_field| {
+            !(matches!(partition_field.transform(), Transform::Identity)
+                && partition_field.name() == partition_field.source_name())
+        })
         .map(|partition_field| {
             Ok(Field::new(
                 partition_field.name().to_owned(),

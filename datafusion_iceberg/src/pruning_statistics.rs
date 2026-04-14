@@ -357,14 +357,14 @@ struct DateTransform {
 
 impl DateTransform {
     fn new() -> Self {
+        // Accept any second-argument type via `TypeSignature::UserDefined` and
+        // normalize it in `coerce_types`. The underlying transform is
+        // timezone-agnostic (it operates on the i64 microseconds-since-epoch),
+        // so any `Timestamp(Microsecond, *)` is a valid input — we just need
+        // to strip the timezone metadata so the physical invocation sees
+        // `Timestamp(Microsecond, None)`.
         let signature = Signature {
-            type_signature: TypeSignature::OneOf(vec![
-                TypeSignature::Exact(vec![DataType::Utf8, DataType::Date32]),
-                TypeSignature::Exact(vec![
-                    DataType::Utf8,
-                    DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Microsecond, None),
-                ]),
-            ]),
+            type_signature: TypeSignature::UserDefined,
             volatility: Volatility::Immutable,
         };
         Self { signature }
@@ -386,6 +386,38 @@ impl ScalarUDFImpl for DateTransform {
 
     fn return_type(&self, _arg_types: &[DataType]) -> datafusion::error::Result<DataType> {
         Ok(DataType::Int32)
+    }
+
+    fn coerce_types(
+        &self,
+        arg_types: &[DataType],
+    ) -> datafusion::error::Result<Vec<DataType>> {
+        use datafusion::arrow::datatypes::TimeUnit;
+        if arg_types.len() != 2 {
+            return Err(DataFusionError::Plan(format!(
+                "date_transform expects 2 arguments, got {}",
+                arg_types.len()
+            )));
+        }
+        if !matches!(arg_types[0], DataType::Utf8 | DataType::LargeUtf8) {
+            return Err(DataFusionError::Plan(format!(
+                "date_transform first argument must be Utf8, got {}",
+                arg_types[0]
+            )));
+        }
+        let coerced_second = match &arg_types[1] {
+            DataType::Date32 => DataType::Date32,
+            DataType::Timestamp(TimeUnit::Microsecond, _) => {
+                DataType::Timestamp(TimeUnit::Microsecond, None)
+            }
+            DataType::Timestamp(unit, _) => DataType::Timestamp(*unit, None),
+            other => {
+                return Err(DataFusionError::Plan(format!(
+                    "date_transform second argument must be Date32 or Timestamp, got {other}"
+                )))
+            }
+        };
+        Ok(vec![DataType::Utf8, coerced_second])
     }
 
     fn invoke_with_args(
