@@ -432,7 +432,29 @@ async fn table_scan(
         None
     };
 
-    let mut table_partition_cols = datafusion_partition_columns(partition_fields)?;
+    // Compute the subset of partition fields that are materialized via the
+    // Hive-style directory path (i.e. NOT already present in the parquet file
+    // body). Iceberg identity partitions on source columns duplicate those
+    // columns into both the file and the path; for the datafusion scan we must
+    // omit them from `table_partition_cols` so the parquet reader doesn't try
+    // to project them from the path. Column-level pruning still works for
+    // identity partitions via the per-file lower/upper bounds in
+    // PruneDataFiles, so we lose nothing by excluding them here.
+    let (file_partition_fields, drop_partition_indices): (Vec<&BoundPartitionField<'_>>, Vec<usize>) = {
+        use iceberg_rust::spec::partition::Transform;
+        let mut kept: Vec<&BoundPartitionField<'_>> = Vec::new();
+        let mut dropped: Vec<usize> = Vec::new();
+        for (i, pf) in partition_fields.iter().enumerate() {
+            if matches!(pf.transform(), Transform::Identity) && pf.name() == pf.source_name() {
+                dropped.push(i);
+            } else {
+                kept.push(pf);
+            }
+        }
+        (kept, dropped)
+    };
+
+    let mut table_partition_cols = datafusion_partition_columns(&file_partition_fields)?;
 
     let file_schema: SchemaRef = Arc::new((schema.fields()).try_into().unwrap());
 
@@ -472,11 +494,14 @@ async fn table_scan(
         physical_predicate.clone()
     {
         let partition_schema = Arc::new(ArrowSchema::new(table_partition_cols.clone()));
-        let partition_column_names = partition_fields
+        // Use only the file-path-materialized partition fields here so that
+        // predicates on identity-self-named columns (which are pruned via
+        // PruneDataFiles) are NOT routed through the manifest-level
+        // partition pruner.
+        let partition_column_names = file_partition_fields
             .iter()
-            .map(|field| Ok(field.source_name().to_owned()))
-            .collect::<Result<HashSet<_>, Error>>()
-            .map_err(DataFusionIcebergError::from)?;
+            .map(|field| field.source_name().to_owned())
+            .collect::<HashSet<String>>();
 
         let partition_predicates = conjunction(
             filters
@@ -633,6 +658,7 @@ async fn table_scan(
         .then(|(partition_value, mut delete_files)| {
             let object_store_url = object_store_url.clone();
             let table_partition_cols = table_partition_cols.clone();
+            let drop_partition_indices = drop_partition_indices.clone();
             let statistics = statistics.clone();
             let physical_predicate = physical_predicate.clone();
             let schema = &schema;
@@ -689,6 +715,7 @@ async fn table_scan(
                     .try_fold(None, |acc, delete_manifest| {
                         let object_store_url = object_store_url.clone();
                         let table_partition_cols = table_partition_cols.clone();
+                        let drop_partition_indices = drop_partition_indices.clone();
                         let statistics = statistics.clone();
                         let physical_predicate = physical_predicate.clone();
                         let schema = &schema;
@@ -713,6 +740,7 @@ async fn table_scan(
                                 last_updated_ms,
                                 enable_data_file_path_column,
                                 manifest_path,
+                                &drop_partition_indices,
                             )
                             .unwrap();
                             data_files.push(data_file);
@@ -741,6 +769,7 @@ async fn table_scan(
                                 last_updated_ms,
                                 enable_data_file_path_column,
                                 manifest_path,
+                                &drop_partition_indices,
                             )?;
 
                             let delete_file_source = Arc::new(
@@ -843,6 +872,7 @@ async fn table_scan(
                             last_updated_ms,
                             enable_data_file_path_column,
                             manifest_path,
+                            &drop_partition_indices,
                         )
                     })
                     .collect::<Result<Vec<_>, _>>()?;
@@ -892,6 +922,7 @@ async fn table_scan(
                         last_updated_ms,
                         enable_data_file_path_column,
                         manifest_path,
+                        &drop_partition_indices,
                     )
                     .unwrap()
                 })
@@ -930,23 +961,10 @@ async fn table_scan(
 }
 
 fn datafusion_partition_columns(
-    partition_fields: &[BoundPartitionField<'_>],
+    partition_fields: &[&BoundPartitionField<'_>],
 ) -> Result<Vec<Field>, DataFusionError> {
-    use iceberg_rust::spec::partition::Transform;
-    // Skip identity-transform partitions whose partition name matches the
-    // source column name. For Iceberg identity partitions on existing columns
-    // (e.g. `identity(event_name)`), the column is present in both the parquet
-    // file body and the Hive-style directory path. datafusion's parquet reader
-    // subtracts matching partition cols from the file schema when computing
-    // the expected column count, which causes an off-by-one mismatch
-    // ("expected N cols but got N+1"). Transformed partitions (day, hour, etc.)
-    // and renamed-identity partitions keep their own synthetic column.
     let table_partition_cols: Vec<Field> = partition_fields
         .iter()
-        .filter(|partition_field| {
-            !(matches!(partition_field.transform(), Transform::Identity)
-                && partition_field.name() == partition_field.source_name())
-        })
         .map(|partition_field| {
             Ok(Field::new(
                 partition_field.name().to_owned(),
@@ -1051,13 +1069,21 @@ fn generate_partitioned_file(
     last_updated_ms: i64,
     enable_data_file_path: bool,
     manifest_file_path: Option<ManifestPath>,
+    drop_partition_indices: &[usize],
 ) -> Result<PartitionedFile, DataFusionError> {
     let manifest_statistics = manifest_statistics(schema, manifest);
+    // Iceberg stores partition values in the order of the partition spec
+    // (one entry per partition field). Drop entries that correspond to
+    // identity-self-named partitions we've excluded from `table_partition_cols`
+    // so that `file.partition_values.len()` matches the filtered
+    // `partition_fields` length passed to datafusion's `FilePruner`.
     let mut partition_values = manifest
         .data_file()
         .partition()
         .iter()
-        .map(|x| {
+        .enumerate()
+        .filter(|(i, _)| !drop_partition_indices.contains(i))
+        .map(|(_, x)| {
             x.as_ref()
                 .map(value_to_scalarvalue)
                 .unwrap_or(Ok(ScalarValue::Null))
