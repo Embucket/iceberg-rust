@@ -597,10 +597,19 @@ async fn table_scan(
 
         let pruning_predicate =
             PruningPredicate::try_new(physical_predicate, arrow_schema.clone())?;
-        // After the first pruning stage the data_files are pruned again based on the pruning statistics in the manifest files.
+        // After the first pruning stage the data_files are pruned again based
+        // on the pruning statistics in the manifest files. `PruneDataFiles`
+        // looks up each column referenced by the predicate in its
+        // `arrow_schema` field to fetch the datatype; passing the narrow
+        // `partition_schema` here would hide every non-partition-key column
+        // (including identity-self-named partition columns that have been
+        // dropped from `table_partition_cols` because they are materialized
+        // in the parquet file body), so any filter on such a column would
+        // silently prune nothing. Passing the full `arrow_schema` lets the
+        // manifest-level pruner reach any column with per-file statistics.
         let files_to_prune = pruning_predicate.prune(&PruneDataFiles::new(
             &schema,
-            &partition_schema,
+            &arrow_schema,
             &data_files,
         ))?;
 
@@ -3001,6 +3010,117 @@ mod tests {
             Transform::Identity,
         )
         .await;
+    }
+
+    #[tokio::test]
+    pub async fn test_identity_self_named_partition_filter_prunes_files() {
+        // Regression for `partition_schema` being passed to `PruneDataFiles` at
+        // `table.rs:601`: identity-self-named partition columns (where the
+        // partition field's `name()` equals its `source_name()`) are dropped
+        // from `file_partition_fields` upstream, so `partition_schema` doesn't
+        // contain them. When a filter references such a column, the second-
+        // stage `PruneDataFiles` pruner fails its arrow-schema lookup in
+        // `min_values` / `max_values` and returns `None`, so no file gets
+        // pruned. The fix is to pass the full `arrow_schema` — which contains
+        // every column in the table — to `PruneDataFiles::new`.
+        //
+        // Reproducer: partition by `identity(kind)` on a string column named
+        // `kind`, insert rows for 3 distinct `kind` values (one parquet file
+        // per partition), then scan with a filter `kind = 'a'`. The resulting
+        // plan's file_groups should contain exactly ONE parquet file, not 3.
+
+        use datafusion::physical_plan::displayable;
+        use datafusion::prelude::{col, lit};
+        use datafusion::catalog::TableProvider;
+
+        let object_store = ObjectStoreBuilder::memory();
+        let catalog: Arc<dyn Catalog> = Arc::new(
+            SqlCatalog::new("sqlite://", "identity_prune_probe", object_store)
+                .await
+                .unwrap(),
+        );
+
+        let schema = Schema::builder()
+            .with_struct_field(StructField {
+                id: 1,
+                name: "id".to_string(),
+                required: true,
+                field_type: Type::Primitive(PrimitiveType::Long),
+                doc: None,
+            })
+            .with_struct_field(StructField {
+                id: 2,
+                name: "kind".to_string(),
+                required: true,
+                field_type: Type::Primitive(PrimitiveType::String),
+                doc: None,
+            })
+            .build()
+            .unwrap();
+
+        // Identity-self-named: partition field "kind" on source column "kind".
+        let partition_spec = PartitionSpec::builder()
+            .with_partition_field(PartitionField::new(2, 1000, "kind", Transform::Identity))
+            .build()
+            .expect("Failed to build partition spec");
+
+        let table = Table::builder()
+            .with_name("identity_prune_probe")
+            .with_location("/test/identity_prune_probe")
+            .with_schema(schema)
+            .with_partition_spec(partition_spec)
+            .build(&["test".to_owned()], catalog)
+            .await
+            .expect("Failed to create partitioned table");
+
+        let table = Arc::new(DataFusionTable::from(table));
+
+        let ctx = SessionContext::new();
+        ctx.register_table("identity_prune_probe", table.clone())
+            .unwrap();
+
+        // Three rows with three distinct kind values → three partition files.
+        ctx.sql(
+            "INSERT INTO identity_prune_probe (id, kind) VALUES
+                (1, 'a'),
+                (2, 'b'),
+                (3, 'c');",
+        )
+        .await
+        .expect("Failed to create query plan for insert")
+        .collect()
+        .await
+        .expect("Failed to insert values into partitioned table");
+
+        // Sanity: three partition files exist unfiltered.
+        let state = ctx.state();
+        let unfiltered_plan = table
+            .scan(&state, None, &[], None)
+            .await
+            .expect("unfiltered scan should succeed");
+        let unfiltered_display = displayable(unfiltered_plan.as_ref())
+            .indent(false)
+            .to_string();
+        let unfiltered_parquet_count = unfiltered_display.matches(".parquet").count();
+        assert_eq!(
+            unfiltered_parquet_count, 3,
+            "precondition: unfiltered scan should list all 3 partition files, got {unfiltered_parquet_count}:\n{unfiltered_display}"
+        );
+
+        // Now scan with a filter that matches exactly one partition.
+        let filter = col("kind").eq(lit("a"));
+        let filtered_plan = table
+            .scan(&state, None, &[filter], None)
+            .await
+            .expect("filtered scan should succeed");
+        let filtered_display = displayable(filtered_plan.as_ref())
+            .indent(false)
+            .to_string();
+        let filtered_parquet_count = filtered_display.matches(".parquet").count();
+        assert_eq!(
+            filtered_parquet_count, 1,
+            "expected pruning filter `kind = 'a'` to reduce scan to exactly 1 parquet file, got {filtered_parquet_count}:\n{filtered_display}"
+        );
     }
 
     #[test]
