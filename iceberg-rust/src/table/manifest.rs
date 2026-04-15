@@ -543,13 +543,20 @@ impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
             },
         )?;
 
-        writer.extend(manifest_reader.filter_map(|entry| {
-            let mut entry = entry
-                .map_err(|err| apache_avro::Error::DeserializeValue(err.to_string()))
-                .unwrap();
+        // Walk existing entries and either rewrite them as-is or mark them
+        // deleted if their file path is in the filter set. We collect the
+        // surviving values into a Vec because `writer.extend` cannot
+        // short-circuit on a per-element error the way a `for` loop can — a
+        // deserialization failure here used to be `.unwrap()`'d and took out
+        // the whole tokio worker (Lambda `signal: aborted`).
+        let mut rewritten = Vec::new();
+        for entry in manifest_reader {
+            let mut entry = entry.map_err(|err| {
+                Error::from(apache_avro::Error::DeserializeValue(err.to_string()))
+            })?;
 
             if *entry.status() == Status::Deleted {
-                return None;
+                continue;
             }
 
             if entry.sequence_number().is_none() {
@@ -567,12 +574,12 @@ impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
                 filtered_stats.removed_data_files += 1;
                 *entry.status_mut() = Status::Deleted;
                 filtered_stats.filtered_entries.push(entry);
-                None
             } else {
                 *entry.status_mut() = Status::Existing;
-                Some(to_value(entry).unwrap())
+                rewritten.push(to_value(entry)?);
             }
-        }))?;
+        }
+        writer.extend(rewritten.into_iter())?;
 
         manifest.sequence_number = table_metadata.last_sequence_number + 1;
 
