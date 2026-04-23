@@ -72,25 +72,36 @@ pub fn transform_arrow(array: ArrayRef, transform: &Transform) -> Result<ArrayRe
             )?),
             datepart_to_years,
         ))),
-        (DataType::Timestamp(TimeUnit::Microsecond, None), Transform::Hour) => {
+        // `_` for the timezone parameter so both `timestamp` (None) and
+        // `timestamptz` (Some(tz)) match. Iceberg partition transforms are
+        // defined on the absolute instant (microseconds since Unix epoch in
+        // UTC), so the attached tz metadata is irrelevant to the numeric
+        // result — we just need to read the underlying i64.
+        (DataType::Timestamp(TimeUnit::Microsecond, _), Transform::Hour) => {
             Ok(Arc::new(unary::<_, _, Int32Type>(
                 as_primitive_array::<Int64Type>(&cast(&array, &DataType::Int64)?),
                 micros_to_hours,
             )) as Arc<dyn Array>)
         }
-        (DataType::Timestamp(TimeUnit::Microsecond, None), Transform::Day) => {
+        (DataType::Timestamp(TimeUnit::Microsecond, _), Transform::Day) => {
             Ok(Arc::new(unary::<_, _, Int32Type>(
                 as_primitive_array::<Int64Type>(&cast(&array, &DataType::Int64)?),
                 micros_to_days,
             )) as Arc<dyn Array>)
         }
-        (DataType::Timestamp(TimeUnit::Microsecond, None), Transform::Month) => {
+        (DataType::Timestamp(TimeUnit::Microsecond, _), Transform::Month) => {
+            // date_part requires chrono-tz for named timezones like "UTC".
+            // Iceberg computes month/year over the absolute instant, so the
+            // tz metadata only affects display, not the result. Strip the tz
+            // by casting to Timestamp(Microsecond, None) first so date_part
+            // runs on a plain value.
+            let naive = cast(&array, &DataType::Timestamp(TimeUnit::Microsecond, None))?;
             let year = date_part(
-                as_primitive_array::<TimestampMicrosecondType>(&array),
+                as_primitive_array::<TimestampMicrosecondType>(&naive),
                 DatePart::Year,
             )?;
             let month = date_part(
-                as_primitive_array::<TimestampMicrosecondType>(&array),
+                as_primitive_array::<TimestampMicrosecondType>(&naive),
                 DatePart::Month,
             )?;
             Ok(Arc::new(binary::<_, _, _, Int32Type>(
@@ -99,10 +110,12 @@ pub fn transform_arrow(array: ArrayRef, transform: &Transform) -> Result<ArrayRe
                 datepart_to_months,
             )?))
         }
-        (DataType::Timestamp(TimeUnit::Microsecond, None), Transform::Year) => {
+        (DataType::Timestamp(TimeUnit::Microsecond, _), Transform::Year) => {
+            // Same tz-stripping rationale as Month above.
+            let naive = cast(&array, &DataType::Timestamp(TimeUnit::Microsecond, None))?;
             Ok(Arc::new(unary::<_, _, Int32Type>(
                 as_primitive_array::<Int32Type>(&date_part(
-                    as_primitive_array::<TimestampMicrosecondType>(&array),
+                    as_primitive_array::<TimestampMicrosecondType>(&naive),
                     DatePart::Year,
                 )?),
                 datepart_to_years,
@@ -519,5 +532,75 @@ mod tests {
             result.unwrap_err().to_string(),
             "Compute error: Failed to perform transform for datatype"
         );
+    }
+
+    /// Returns the same three representative microsecond values as
+    /// `create_timestamp_micro_array()` but wrapped in a `TimestampMicrosecondArray`
+    /// with a `"UTC"` timezone attached. This matches how Arrow encodes
+    /// Iceberg's `timestamptz` type, which is what Embucket hands to the
+    /// partition transforms for tables like `events_hooli` whose
+    /// `collector_tstamp` is `TIMESTAMP_TZ`.
+    fn create_timestamp_micro_tz_array() -> ArrayRef {
+        Arc::new(
+            TimestampMicrosecondArray::from(vec![
+                Some(1682937000000000),
+                Some(1686840330000000),
+                Some(1704067200000000),
+                None,
+            ])
+            .with_timezone("UTC"),
+        ) as ArrayRef
+    }
+
+    #[test]
+    fn test_timestamp_tz_day_transform() {
+        let array = create_timestamp_micro_tz_array();
+        let result = transform_arrow(array, &Transform::Day).unwrap();
+        let expected = Arc::new(arrow::array::Int32Array::from(vec![
+            Some(19478),
+            Some(19523),
+            Some(19723),
+            None,
+        ])) as ArrayRef;
+        assert_eq!(&expected, &result);
+    }
+
+    #[test]
+    fn test_timestamp_tz_hour_transform() {
+        let array = create_timestamp_micro_tz_array();
+        let result = transform_arrow(array, &Transform::Hour).unwrap();
+        let expected = Arc::new(arrow::array::Int32Array::from(vec![
+            Some(467482),
+            Some(468566),
+            Some(473352),
+            None,
+        ])) as ArrayRef;
+        assert_eq!(&expected, &result);
+    }
+
+    #[test]
+    fn test_timestamp_tz_month_transform() {
+        let array = create_timestamp_micro_tz_array();
+        let result = transform_arrow(array, &Transform::Month).unwrap();
+        let expected = Arc::new(arrow::array::Int32Array::from(vec![
+            Some(641),
+            Some(642),
+            Some(649),
+            None,
+        ])) as ArrayRef;
+        assert_eq!(&expected, &result);
+    }
+
+    #[test]
+    fn test_timestamp_tz_year_transform() {
+        let array = create_timestamp_micro_tz_array();
+        let result = transform_arrow(array, &Transform::Year).unwrap();
+        let expected = Arc::new(arrow::array::Int32Array::from(vec![
+            Some(53),
+            Some(53),
+            Some(54),
+            None,
+        ])) as ArrayRef;
+        assert_eq!(&expected, &result);
     }
 }

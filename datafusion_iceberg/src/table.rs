@@ -432,14 +432,87 @@ async fn table_scan(
         None
     };
 
-    let mut table_partition_cols = datafusion_partition_columns(partition_fields)?;
+    // Compute the subset of partition fields that are materialized via the
+    // Hive-style directory path (i.e. NOT already present in the parquet file
+    // body). Iceberg identity partitions on source columns duplicate those
+    // columns into both the file and the path; for the datafusion scan we must
+    // omit them from `table_partition_cols` so the parquet reader doesn't try
+    // to project them from the path. Column-level pruning still works for
+    // identity partitions via the per-file lower/upper bounds in
+    // PruneDataFiles, so we lose nothing by excluding them here.
+    let (file_partition_fields, drop_partition_indices): (Vec<&BoundPartitionField<'_>>, Vec<usize>) = {
+        use iceberg_rust::spec::partition::Transform;
+        let mut kept: Vec<&BoundPartitionField<'_>> = Vec::new();
+        let mut dropped: Vec<usize> = Vec::new();
+        for (i, pf) in partition_fields.iter().enumerate() {
+            if matches!(pf.transform(), Transform::Identity) && pf.name() == pf.source_name() {
+                dropped.push(i);
+            } else {
+                kept.push(pf);
+            }
+        }
+        (kept, dropped)
+    };
+
+    let mut table_partition_cols = datafusion_partition_columns(&file_partition_fields)?;
 
     let file_schema: SchemaRef = Arc::new((schema.fields()).try_into().unwrap());
 
-    // If no projection was specified default to projecting all the fields
+    if enable_data_file_path_column {
+        table_partition_cols.push(Field::new(DATA_FILE_PATH_COLUMN, DataType::Utf8, false));
+    }
+
+    if enable_manifest_file_path_column {
+        table_partition_cols.push(Field::new(MANIFEST_FILE_PATH_COLUMN, DataType::Utf8, false));
+    }
+
+    // If no projection was specified default to projecting all the fields of
+    // the provider-facing (arrow) schema, which already contains the optional
+    // `__data_file_path` / `__manifest_file_path` columns.
     let projection = projection
         .cloned()
         .unwrap_or((0..arrow_schema.fields().len()).collect_vec());
+
+    // DataFusion's `FileScanConfig.with_projection` interprets indices against
+    // the combined schema `[file_schema, table_partition_cols]`. Our caller,
+    // however, projects against `arrow_schema` (the `DataFusionTable::schema`)
+    // which is `[file_schema, __data_file_path?, __manifest_file_path?]` —
+    // synthetic partition-transform columns like `ts_day` for `day(ts)` are
+    // *not* in `arrow_schema`. When those synthetic columns exist, the two
+    // schemas diverge and passing the caller's indices through unmodified
+    // picks up `ts_day` where `__data_file_path` was expected, shifting every
+    // metadata column and silently truncating `__manifest_file_path`. It
+    // triggers DataFusion's "Input field name <partition>_<transform> does
+    // not match with the projection expression __data_file_path" error as
+    // soon as a downstream ProjectionExec tries to reference those columns
+    // by name (e.g. from Embucket's MERGE COW planner).
+    //
+    // Fix: remap the caller's projection from provider-schema space to
+    // combined-schema space.
+    let file_schema_len = file_schema.fields().len();
+    let kept_partition_len = file_partition_fields.len();
+    let combined_projection: Vec<usize> = projection
+        .iter()
+        .map(|&idx| {
+            if idx < file_schema_len {
+                idx
+            } else {
+                let name = arrow_schema.fields[idx].name().as_str();
+                if name == DATA_FILE_PATH_COLUMN && enable_data_file_path_column {
+                    file_schema_len + kept_partition_len
+                } else if name == MANIFEST_FILE_PATH_COLUMN && enable_manifest_file_path_column {
+                    file_schema_len
+                        + kept_partition_len
+                        + usize::from(enable_data_file_path_column)
+                } else {
+                    // Fallback: preserve the original index. This only fires
+                    // for unexpected columns and will surface as a clear
+                    // error further down the planning pipeline.
+                    idx
+                }
+            }
+        })
+        .collect();
 
     let projection_expr: Vec<_> = projection
         .iter()
@@ -453,14 +526,6 @@ async fn table_scan(
         })
         .collect();
 
-    if enable_data_file_path_column {
-        table_partition_cols.push(Field::new(DATA_FILE_PATH_COLUMN, DataType::Utf8, false));
-    }
-
-    if enable_manifest_file_path_column {
-        table_partition_cols.push(Field::new(MANIFEST_FILE_PATH_COLUMN, DataType::Utf8, false));
-    }
-
     // All files have to be grouped according to their partition values. This is done by using a HashMap with the partition values as the key.
     // This way data files with the same partition value are mapped to the same vector.
     let mut data_file_groups: HashMap<Struct, Vec<(ManifestPath, ManifestEntry)>> = HashMap::new();
@@ -472,11 +537,14 @@ async fn table_scan(
         physical_predicate.clone()
     {
         let partition_schema = Arc::new(ArrowSchema::new(table_partition_cols.clone()));
-        let partition_column_names = partition_fields
+        // Use only the file-path-materialized partition fields here so that
+        // predicates on identity-self-named columns (which are pruned via
+        // PruneDataFiles) are NOT routed through the manifest-level
+        // partition pruner.
+        let partition_column_names = file_partition_fields
             .iter()
-            .map(|field| Ok(field.source_name().to_owned()))
-            .collect::<Result<HashSet<_>, Error>>()
-            .map_err(DataFusionIcebergError::from)?;
+            .map(|field| field.source_name().to_owned())
+            .collect::<HashSet<String>>();
 
         let partition_predicates = conjunction(
             filters
@@ -529,10 +597,19 @@ async fn table_scan(
 
         let pruning_predicate =
             PruningPredicate::try_new(physical_predicate, arrow_schema.clone())?;
-        // After the first pruning stage the data_files are pruned again based on the pruning statistics in the manifest files.
+        // After the first pruning stage the data_files are pruned again based
+        // on the pruning statistics in the manifest files. `PruneDataFiles`
+        // looks up each column referenced by the predicate in its
+        // `arrow_schema` field to fetch the datatype; passing the narrow
+        // `partition_schema` here would hide every non-partition-key column
+        // (including identity-self-named partition columns that have been
+        // dropped from `table_partition_cols` because they are materialized
+        // in the parquet file body), so any filter on such a column would
+        // silently prune nothing. Passing the full `arrow_schema` lets the
+        // manifest-level pruner reach any column with per-file statistics.
         let files_to_prune = pruning_predicate.prune(&PruneDataFiles::new(
             &schema,
-            &partition_schema,
+            &arrow_schema,
             &data_files,
         ))?;
 
@@ -633,13 +710,14 @@ async fn table_scan(
         .then(|(partition_value, mut delete_files)| {
             let object_store_url = object_store_url.clone();
             let table_partition_cols = table_partition_cols.clone();
+            let drop_partition_indices = drop_partition_indices.clone();
             let statistics = statistics.clone();
             let physical_predicate = physical_predicate.clone();
             let schema = &schema;
             let file_schema = file_schema.clone();
             let file_source = file_source.clone();
             let projection_expr = projection_expr.clone();
-            let projection = &projection;
+            let combined_projection = combined_projection.clone();
             let mut data_files = data_file_groups
                 .remove(&partition_value)
                 .unwrap_or_default();
@@ -664,7 +742,10 @@ async fn table_scan(
                 // each equality delete file may have different deletion columns.
                 // And since we need to reconcile them all with data files using joins and unions,
                 // we need to make sure their schemas are fully compatible in all intermediate nodes.
-                let mut equality_projection = projection.clone();
+                // Indices are in combined-schema space (see `combined_projection` above); the
+                // delete-id lookup below adds user-column indices, which already match file_schema
+                // positions 1:1 so no remap is needed for the appended entries.
+                let mut equality_projection = combined_projection.clone();
                 delete_files
                     .iter()
                     .flat_map(|delete_manifest| delete_manifest.1.data_file().equality_ids())
@@ -689,6 +770,7 @@ async fn table_scan(
                     .try_fold(None, |acc, delete_manifest| {
                         let object_store_url = object_store_url.clone();
                         let table_partition_cols = table_partition_cols.clone();
+                        let drop_partition_indices = drop_partition_indices.clone();
                         let statistics = statistics.clone();
                         let physical_predicate = physical_predicate.clone();
                         let schema = &schema;
@@ -713,6 +795,7 @@ async fn table_scan(
                                 last_updated_ms,
                                 enable_data_file_path_column,
                                 manifest_path,
+                                &drop_partition_indices,
                             )
                             .unwrap();
                             data_files.push(data_file);
@@ -741,6 +824,7 @@ async fn table_scan(
                                 last_updated_ms,
                                 enable_data_file_path_column,
                                 manifest_path,
+                                &drop_partition_indices,
                             )?;
 
                             let delete_file_source = Arc::new(
@@ -843,6 +927,7 @@ async fn table_scan(
                             last_updated_ms,
                             enable_data_file_path_column,
                             manifest_path,
+                            &drop_partition_indices,
                         )
                     })
                     .collect::<Result<Vec<_>, _>>()?;
@@ -892,6 +977,7 @@ async fn table_scan(
                         last_updated_ms,
                         enable_data_file_path_column,
                         manifest_path,
+                        &drop_partition_indices,
                     )
                     .unwrap()
                 })
@@ -904,7 +990,7 @@ async fn table_scan(
             FileScanConfigBuilder::new(object_store_url, file_schema, file_source)
                 .with_file_groups(file_groups)
                 .with_statistics(statistics)
-                .with_projection(Some(projection.clone()))
+                .with_projection(Some(combined_projection.clone()))
                 .with_limit(limit)
                 .with_table_partition_cols(table_partition_cols)
                 .build();
@@ -930,7 +1016,7 @@ async fn table_scan(
 }
 
 fn datafusion_partition_columns(
-    partition_fields: &[BoundPartitionField<'_>],
+    partition_fields: &[&BoundPartitionField<'_>],
 ) -> Result<Vec<Field>, DataFusionError> {
     let table_partition_cols: Vec<Field> = partition_fields
         .iter()
@@ -1038,13 +1124,21 @@ fn generate_partitioned_file(
     last_updated_ms: i64,
     enable_data_file_path: bool,
     manifest_file_path: Option<ManifestPath>,
+    drop_partition_indices: &[usize],
 ) -> Result<PartitionedFile, DataFusionError> {
     let manifest_statistics = manifest_statistics(schema, manifest);
+    // Iceberg stores partition values in the order of the partition spec
+    // (one entry per partition field). Drop entries that correspond to
+    // identity-self-named partitions we've excluded from `table_partition_cols`
+    // so that `file.partition_values.len()` matches the filtered
+    // `partition_fields` length passed to datafusion's `FilePruner`.
     let mut partition_values = manifest
         .data_file()
         .partition()
         .iter()
-        .map(|x| {
+        .enumerate()
+        .filter(|(i, _)| !drop_partition_indices.contains(i))
+        .map(|(_, x)| {
             x.as_ref()
                 .map(value_to_scalarvalue)
                 .unwrap_or(Ok(ScalarValue::Null))
@@ -2553,6 +2647,480 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Regression test for the MERGE-on-partitioned-table bug.
+    ///
+    /// When a table has a non-identity partition transform (day, hour, month,
+    /// year, bucket, truncate), `datafusion_partition_columns()` pushes a
+    /// synthetic partition-transform column (e.g. `ts_day` for `day(ts)`) into
+    /// `table_partition_cols`. That column ends up in the physical scan output
+    /// between the user columns and the `__data_file_path` / `__manifest_file_path`
+    /// columns. But `DataFusionTable::schema()` (the logical schema) only
+    /// contains user columns + `__data_file_path` + `__manifest_file_path` —
+    /// no synthetic partition column — so DataFusion validates the projection
+    /// against a physical output that has the wrong field at the position where
+    /// `__data_file_path` is expected, yielding:
+    ///
+    ///     Internal error: Input field name ts_day does not match with the
+    ///     projection expression __data_file_path.
+    ///
+    /// This test exercises the buggy path with a `day(ts)` partition spec. It
+    /// should pass: the scan must emit exactly the DataFusionTable::schema()
+    /// columns in the expected order.
+    #[tokio::test]
+    pub async fn test_data_file_path_with_day_partitioned_table() {
+        let object_store = ObjectStoreBuilder::memory();
+
+        let catalog: Arc<dyn Catalog> = Arc::new(
+            SqlCatalog::new("sqlite://", "test", object_store)
+                .await
+                .unwrap(),
+        );
+
+        let schema = Schema::builder()
+            .with_struct_field(StructField {
+                id: 1,
+                name: "id".to_string(),
+                required: true,
+                field_type: Type::Primitive(PrimitiveType::Long),
+                doc: None,
+            })
+            .with_struct_field(StructField {
+                id: 2,
+                name: "ts".to_string(),
+                required: true,
+                field_type: Type::Primitive(PrimitiveType::Date),
+                doc: None,
+            })
+            .with_struct_field(StructField {
+                id: 3,
+                name: "payload".to_string(),
+                required: false,
+                field_type: Type::Primitive(PrimitiveType::String),
+                doc: None,
+            })
+            .build()
+            .unwrap();
+
+        let partition_spec = PartitionSpec::builder()
+            .with_partition_field(PartitionField::new(2, 1000, "ts_day", Transform::Day))
+            .build()
+            .expect("Failed to build partition spec");
+
+        let table = Table::builder()
+            .with_name("events")
+            .with_location("/test/events")
+            .with_schema(schema)
+            .with_partition_spec(partition_spec)
+            .build(&["test".to_owned()], catalog)
+            .await
+            .expect("Failed to create partitioned table");
+
+        let config = crate::table::DataFusionTableConfigBuilder::default()
+            .enable_data_file_path_column(true)
+            .enable_manifest_file_path_column(true)
+            .build()
+            .unwrap();
+
+        let table = Arc::new(DataFusionTable::new_with_config(
+            Tabular::Table(table),
+            None,
+            None,
+            None,
+            Some(config),
+        ));
+
+        let ctx = SessionContext::new();
+        ctx.register_table("events", table.clone()).unwrap();
+
+        ctx.sql(
+            "INSERT INTO events (id, ts, payload) VALUES
+                (1, DATE '2020-01-01', 'a'),
+                (2, DATE '2020-01-02', 'b'),
+                (3, DATE '2020-01-03', 'c');",
+        )
+        .await
+        .expect("Failed to create query plan for insert")
+        .collect()
+        .await
+        .expect("Failed to insert values into partitioned table");
+
+        let batches = ctx
+            .sql("select * from events;")
+            .await
+            .expect("Failed to create plan for select")
+            .collect()
+            .await
+            .expect("Failed to execute select query");
+
+        // The scan's output schema must match DataFusionTable::schema(). In
+        // particular: no synthetic `ts_day` column leaking through, and
+        // `__data_file_path` sitting where the logical schema expects it.
+        let provider_schema: Vec<String> = table
+            .schema
+            .fields()
+            .iter()
+            .map(|f: &Arc<datafusion::arrow::datatypes::Field>| f.name().to_owned())
+            .collect();
+        assert_eq!(
+            provider_schema,
+            vec![
+                "id".to_string(),
+                "ts".to_string(),
+                "payload".to_string(),
+                "__data_file_path".to_string(),
+                "__manifest_file_path".to_string(),
+            ],
+            "DataFusionTable::schema() precondition"
+        );
+
+        let mut total_rows = 0;
+        let mut saw_non_empty = false;
+        for batch in &batches {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            saw_non_empty = true;
+            total_rows += batch.num_rows();
+
+            let actual_names: Vec<String> = batch
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().to_owned())
+                .collect();
+            assert_eq!(
+                actual_names, provider_schema,
+                "scan output schema must match provider schema; \
+                 synthetic partition columns (e.g. ts_day) must not leak through"
+            );
+
+            let data_file_path_column = batch
+                .column_by_name("__data_file_path")
+                .expect("__data_file_path column should exist in scan output");
+            let values = data_file_path_column
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::StringArray>()
+                .expect("__data_file_path should be a StringArray");
+            for i in 0..batch.num_rows() {
+                let value = values.value(i);
+                assert!(
+                    !value.is_empty(),
+                    "__data_file_path should not be empty for row {i}"
+                );
+                assert!(
+                    value.contains(".parquet"),
+                    "__data_file_path should contain .parquet, got {value}"
+                );
+            }
+        }
+
+        assert!(saw_non_empty, "expected at least one non-empty batch");
+        assert_eq!(total_rows, 3, "expected 3 rows total");
+    }
+
+    /// Parameterised harness exercising every partition transform against
+    /// the `enable_data_file_path_column` scan path. Each transform should
+    /// yield the same provider schema (`id`, `ts`, `kind`, `__data_file_path`,
+    /// `__manifest_file_path`) regardless of whether it rewrites the
+    /// partition field name.
+    async fn run_data_file_path_transform_case(
+        case_name: &'static str,
+        partition_source_id: i32,
+        partition_name: &'static str,
+        transform: Transform,
+    ) {
+        let object_store = ObjectStoreBuilder::memory();
+
+        let catalog: Arc<dyn Catalog> = Arc::new(
+            SqlCatalog::new("sqlite://", case_name, object_store)
+                .await
+                .unwrap(),
+        );
+
+        let schema = Schema::builder()
+            .with_struct_field(StructField {
+                id: 1,
+                name: "id".to_string(),
+                required: true,
+                field_type: Type::Primitive(PrimitiveType::Long),
+                doc: None,
+            })
+            .with_struct_field(StructField {
+                id: 2,
+                name: "ts".to_string(),
+                required: true,
+                field_type: Type::Primitive(PrimitiveType::Timestamp),
+                doc: None,
+            })
+            .with_struct_field(StructField {
+                id: 3,
+                name: "kind".to_string(),
+                required: true,
+                field_type: Type::Primitive(PrimitiveType::String),
+                doc: None,
+            })
+            .build()
+            .unwrap();
+
+        let partition_spec = PartitionSpec::builder()
+            .with_partition_field(PartitionField::new(
+                partition_source_id,
+                1000,
+                partition_name,
+                transform,
+            ))
+            .build()
+            .unwrap_or_else(|e| panic!("[{case_name}] failed to build spec: {e}"));
+
+        let table = Table::builder()
+            .with_name(case_name)
+            .with_location(&format!("/test/{case_name}"))
+            .with_schema(schema)
+            .with_partition_spec(partition_spec)
+            .build(&["test".to_owned()], catalog)
+            .await
+            .unwrap_or_else(|e| panic!("[{case_name}] failed to create table: {e}"));
+
+        let config = crate::table::DataFusionTableConfigBuilder::default()
+            .enable_data_file_path_column(true)
+            .enable_manifest_file_path_column(true)
+            .build()
+            .unwrap();
+
+        let table = Arc::new(DataFusionTable::new_with_config(
+            Tabular::Table(table),
+            None,
+            None,
+            None,
+            Some(config),
+        ));
+
+        let ctx = SessionContext::new();
+        ctx.register_table(case_name, table.clone()).unwrap();
+
+        ctx.sql(&format!(
+            "INSERT INTO {case_name} (id, ts, kind) VALUES
+                (1, TIMESTAMP '2020-01-01 00:00:00', 'a'),
+                (2, TIMESTAMP '2020-01-02 12:00:00', 'b'),
+                (3, TIMESTAMP '2020-02-03 06:30:00', 'c');"
+        ))
+        .await
+        .unwrap_or_else(|e| panic!("[{case_name}] insert plan failed: {e}"))
+        .collect()
+        .await
+        .unwrap_or_else(|e| panic!("[{case_name}] insert exec failed: {e}"));
+
+        let batches = ctx
+            .sql(&format!("select * from {case_name};"))
+            .await
+            .unwrap_or_else(|e| panic!("[{case_name}] select plan failed: {e}"))
+            .collect()
+            .await
+            .unwrap_or_else(|e| panic!("[{case_name}] select exec failed: {e}"));
+
+        let expected: Vec<String> = table
+            .schema
+            .fields()
+            .iter()
+            .map(|f: &Arc<datafusion::arrow::datatypes::Field>| f.name().to_owned())
+            .collect();
+        assert_eq!(
+            expected,
+            vec![
+                "id".to_string(),
+                "ts".to_string(),
+                "kind".to_string(),
+                "__data_file_path".to_string(),
+                "__manifest_file_path".to_string(),
+            ],
+            "[{case_name}] provider schema precondition"
+        );
+
+        let mut total_rows = 0;
+        for batch in &batches {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            total_rows += batch.num_rows();
+            let actual: Vec<String> = batch
+                .schema()
+                .fields()
+                .iter()
+                .map(|f: &Arc<datafusion::arrow::datatypes::Field>| f.name().to_owned())
+                .collect();
+            assert_eq!(
+                actual, expected,
+                "[{case_name}] scan output schema must match provider schema"
+            );
+            assert!(
+                batch
+                    .column_by_name("__data_file_path")
+                    .expect("__data_file_path missing")
+                    .as_any()
+                    .downcast_ref::<datafusion::arrow::array::StringArray>()
+                    .expect("__data_file_path should be StringArray")
+                    .iter()
+                    .all(|v| v.is_some_and(|s| s.contains(".parquet"))),
+                "[{case_name}] __data_file_path values must be populated"
+            );
+        }
+        assert_eq!(total_rows, 3, "[{case_name}] expected 3 rows");
+    }
+
+    #[tokio::test]
+    pub async fn test_data_file_path_with_hour_partition() {
+        run_data_file_path_transform_case("hour_probe", 2, "ts_hour", Transform::Hour).await;
+    }
+
+    #[tokio::test]
+    pub async fn test_data_file_path_with_month_partition() {
+        run_data_file_path_transform_case("month_probe", 2, "ts_month", Transform::Month).await;
+    }
+
+    #[tokio::test]
+    pub async fn test_data_file_path_with_year_partition() {
+        run_data_file_path_transform_case("year_probe", 2, "ts_year", Transform::Year).await;
+    }
+
+    #[tokio::test]
+    pub async fn test_data_file_path_with_bucket_partition() {
+        run_data_file_path_transform_case("bucket_probe", 1, "id_bucket", Transform::Bucket(4))
+            .await;
+    }
+
+    #[tokio::test]
+    pub async fn test_data_file_path_with_truncate_partition() {
+        // Truncate on the `id` Long column. Truncate on strings isn't
+        // supported by the current iceberg-rust transform implementation.
+        run_data_file_path_transform_case("trunc_probe", 1, "id_trunc", Transform::Truncate(10))
+            .await;
+    }
+
+    #[tokio::test]
+    pub async fn test_data_file_path_with_identity_partition_renamed() {
+        // Identity with a renamed partition field (different name from source column)
+        // also goes through `datafusion_partition_columns()` because the
+        // identity-self-named drop only fires when pf.name() == pf.source_name().
+        run_data_file_path_transform_case(
+            "identity_renamed_probe",
+            3,
+            "kind_id",
+            Transform::Identity,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    pub async fn test_identity_self_named_partition_filter_prunes_files() {
+        // Regression for `partition_schema` being passed to `PruneDataFiles` at
+        // `table.rs:601`: identity-self-named partition columns (where the
+        // partition field's `name()` equals its `source_name()`) are dropped
+        // from `file_partition_fields` upstream, so `partition_schema` doesn't
+        // contain them. When a filter references such a column, the second-
+        // stage `PruneDataFiles` pruner fails its arrow-schema lookup in
+        // `min_values` / `max_values` and returns `None`, so no file gets
+        // pruned. The fix is to pass the full `arrow_schema` — which contains
+        // every column in the table — to `PruneDataFiles::new`.
+        //
+        // Reproducer: partition by `identity(kind)` on a string column named
+        // `kind`, insert rows for 3 distinct `kind` values (one parquet file
+        // per partition), then scan with a filter `kind = 'a'`. The resulting
+        // plan's file_groups should contain exactly ONE parquet file, not 3.
+
+        use datafusion::physical_plan::displayable;
+        use datafusion::prelude::{col, lit};
+        use datafusion::catalog::TableProvider;
+
+        let object_store = ObjectStoreBuilder::memory();
+        let catalog: Arc<dyn Catalog> = Arc::new(
+            SqlCatalog::new("sqlite://", "identity_prune_probe", object_store)
+                .await
+                .unwrap(),
+        );
+
+        let schema = Schema::builder()
+            .with_struct_field(StructField {
+                id: 1,
+                name: "id".to_string(),
+                required: true,
+                field_type: Type::Primitive(PrimitiveType::Long),
+                doc: None,
+            })
+            .with_struct_field(StructField {
+                id: 2,
+                name: "kind".to_string(),
+                required: true,
+                field_type: Type::Primitive(PrimitiveType::String),
+                doc: None,
+            })
+            .build()
+            .unwrap();
+
+        // Identity-self-named: partition field "kind" on source column "kind".
+        let partition_spec = PartitionSpec::builder()
+            .with_partition_field(PartitionField::new(2, 1000, "kind", Transform::Identity))
+            .build()
+            .expect("Failed to build partition spec");
+
+        let table = Table::builder()
+            .with_name("identity_prune_probe")
+            .with_location("/test/identity_prune_probe")
+            .with_schema(schema)
+            .with_partition_spec(partition_spec)
+            .build(&["test".to_owned()], catalog)
+            .await
+            .expect("Failed to create partitioned table");
+
+        let table = Arc::new(DataFusionTable::from(table));
+
+        let ctx = SessionContext::new();
+        ctx.register_table("identity_prune_probe", table.clone())
+            .unwrap();
+
+        // Three rows with three distinct kind values → three partition files.
+        ctx.sql(
+            "INSERT INTO identity_prune_probe (id, kind) VALUES
+                (1, 'a'),
+                (2, 'b'),
+                (3, 'c');",
+        )
+        .await
+        .expect("Failed to create query plan for insert")
+        .collect()
+        .await
+        .expect("Failed to insert values into partitioned table");
+
+        // Sanity: three partition files exist unfiltered.
+        let state = ctx.state();
+        let unfiltered_plan = table
+            .scan(&state, None, &[], None)
+            .await
+            .expect("unfiltered scan should succeed");
+        let unfiltered_display = displayable(unfiltered_plan.as_ref())
+            .indent(false)
+            .to_string();
+        let unfiltered_parquet_count = unfiltered_display.matches(".parquet").count();
+        assert_eq!(
+            unfiltered_parquet_count, 3,
+            "precondition: unfiltered scan should list all 3 partition files, got {unfiltered_parquet_count}:\n{unfiltered_display}"
+        );
+
+        // Now scan with a filter that matches exactly one partition.
+        let filter = col("kind").eq(lit("a"));
+        let filtered_plan = table
+            .scan(&state, None, &[filter], None)
+            .await
+            .expect("filtered scan should succeed");
+        let filtered_display = displayable(filtered_plan.as_ref())
+            .indent(false)
+            .to_string();
+        let filtered_parquet_count = filtered_display.matches(".parquet").count();
+        assert_eq!(
+            filtered_parquet_count, 1,
+            "expected pruning filter `kind = 'a'` to reduce scan to exactly 1 parquet file, got {filtered_parquet_count}:\n{filtered_display}"
+        );
     }
 
     #[test]

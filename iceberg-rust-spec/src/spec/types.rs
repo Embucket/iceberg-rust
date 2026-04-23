@@ -300,6 +300,40 @@ impl StructType {
             .map(|idx| &self.fields[*idx])
     }
 
+    /// Recursively looks up a `StructField` by its global field id.
+    ///
+    /// Iceberg assigns every struct field a globally unique id drawn from the
+    /// same pool regardless of depth, and DataFile statistics maps
+    /// (`lower_bounds`, `upper_bounds`, `column_sizes`, ...) are keyed by those
+    /// ids at any depth. This method walks the schema through nested `Struct`,
+    /// `List`, and `Map` types until it finds the field with the given id, or
+    /// returns `None` if no such field exists anywhere in the subtree.
+    pub fn field_by_id(&self, id: i32) -> Option<&StructField> {
+        if let Some(field) = self.get(id as usize) {
+            return Some(field);
+        }
+        for field in &self.fields {
+            if let Some(found) = Self::find_in_type(&field.field_type, id) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    fn find_in_type(ty: &Type, id: i32) -> Option<&StructField> {
+        match ty {
+            Type::Primitive(_) => None,
+            Type::Struct(s) => s.field_by_id(id),
+            Type::List(list) => Self::find_in_type(&list.element, id),
+            Type::Map(map) => {
+                if let Some(found) = Self::find_in_type(&map.key, id) {
+                    return Some(found);
+                }
+                Self::find_in_type(&map.value, id)
+            }
+        }
+    }
+
     /// Gets a reference to the StructField with the given name
     ///
     /// # Arguments
@@ -632,5 +666,122 @@ mod tests {
         let result: MapType = serde_json::from_str(record).unwrap();
         assert_eq!(Type::Primitive(PrimitiveType::String), *result.key);
         assert_eq!(Type::Primitive(PrimitiveType::Double), *result.value);
+    }
+
+    #[test]
+    fn field_by_id_finds_nested_fields() {
+        // Iceberg's DataFile statistics maps (lower_bounds, upper_bounds,
+        // column_sizes, ...) are keyed by column id, and those column ids
+        // can belong to fields at any depth — including fields nested
+        // under struct-of-struct, list<struct>, map<*,struct>. A caller
+        // that only inspects top-level ids will miss them and, in the
+        // manifest deserialization path, panic at `manifest.rs:549` on
+        // a `ColumnNotInSchema` error. Regression for that path.
+        let inner_struct = Type::Struct(StructType::new(vec![
+            StructField {
+                id: 655,
+                name: "percent_progress".to_string(),
+                required: false,
+                field_type: Type::Primitive(PrimitiveType::Int),
+                doc: None,
+            },
+        ]));
+
+        let element_struct = Type::Struct(StructType::new(vec![
+            StructField {
+                id: 479,
+                name: "product_id".to_string(),
+                required: false,
+                field_type: Type::Primitive(PrimitiveType::String),
+                doc: None,
+            },
+            StructField {
+                id: 480,
+                name: "category".to_string(),
+                required: false,
+                field_type: Type::Primitive(PrimitiveType::String),
+                doc: None,
+            },
+        ]));
+
+        let map_value_struct = Type::Struct(StructType::new(vec![StructField {
+            id: 777,
+            name: "count".to_string(),
+            required: false,
+            field_type: Type::Primitive(PrimitiveType::Long),
+            doc: None,
+        }]));
+
+        let outer = StructType::new(vec![
+            StructField {
+                id: 1,
+                name: "event_id".to_string(),
+                required: true,
+                field_type: Type::Primitive(PrimitiveType::String),
+                doc: None,
+            },
+            StructField {
+                id: 2,
+                name: "unstruct_event_media_ad_click".to_string(),
+                required: false,
+                field_type: inner_struct,
+                doc: None,
+            },
+            StructField {
+                id: 3,
+                name: "contexts_ecommerce_product".to_string(),
+                required: false,
+                field_type: Type::List(ListType {
+                    element_id: 478,
+                    element_required: false,
+                    element: Box::new(element_struct),
+                }),
+                doc: None,
+            },
+            StructField {
+                id: 4,
+                name: "refr_params".to_string(),
+                required: false,
+                field_type: Type::Map(MapType {
+                    key_id: 900,
+                    key: Box::new(Type::Primitive(PrimitiveType::String)),
+                    value_id: 901,
+                    value_required: false,
+                    value: Box::new(map_value_struct),
+                }),
+                doc: None,
+            },
+        ]);
+
+        // Top-level still works.
+        assert_eq!(
+            outer.field_by_id(1).map(|f| f.name.as_str()),
+            Some("event_id")
+        );
+
+        // Nested inside struct-of-struct.
+        assert_eq!(
+            outer.field_by_id(655).map(|f| f.name.as_str()),
+            Some("percent_progress")
+        );
+
+        // Nested inside list<struct>.
+        assert_eq!(
+            outer.field_by_id(479).map(|f| f.name.as_str()),
+            Some("product_id")
+        );
+        assert_eq!(
+            outer.field_by_id(480).map(|f| f.name.as_str()),
+            Some("category")
+        );
+
+        // Nested inside map<string, struct>.
+        assert_eq!(
+            outer.field_by_id(777).map(|f| f.name.as_str()),
+            Some("count")
+        );
+
+        // Unknown id returns None (not panic, not a match).
+        assert!(outer.field_by_id(9999).is_none());
     }
 }

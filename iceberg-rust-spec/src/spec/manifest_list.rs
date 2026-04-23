@@ -130,10 +130,13 @@ mod _serde {
         /// ID of the snapshot where the manifest file was added
         pub added_snapshot_id: i64,
         /// Number of entries in the manifest that have status ADDED (1), when null this is assumed to be non-zero
+        #[serde(rename = "added_data_files_count", alias = "added_files_count")]
         pub added_files_count: i32,
         /// Number of entries in the manifest that have status EXISTING (0), when null this is assumed to be non-zero
+        #[serde(rename = "existing_data_files_count", alias = "existing_files_count")]
         pub existing_files_count: i32,
         /// Number of entries in the manifest that have status DELETED (2), when null this is assumed to be non-zero
+        #[serde(rename = "deleted_data_files_count", alias = "deleted_files_count")]
         pub deleted_files_count: i32,
         /// Number of rows in all of files in the manifest that have status ADDED, when null this is assumed to be non-zero
         pub added_rows_count: i64,
@@ -570,17 +573,17 @@ pub fn manifest_list_schema_v2() -> &'static AvroSchema {
                     "field-id": 503
                 },
                 {
-                    "name": "added_files_count",
+                    "name": "added_data_files_count",
                     "type": "int",
                     "field-id": 504
                 },
                 {
-                    "name": "existing_files_count",
+                    "name": "existing_data_files_count",
                     "type": "int",
                     "field-id": 505
                 },
                 {
-                    "name": "deleted_files_count",
+                    "name": "deleted_data_files_count",
                     "type": "int",
                     "field-id": 506
                 },
@@ -842,5 +845,102 @@ mod tests {
                 ManifestListEntry::try_from_v1(result, &table_metadata).unwrap()
             );
         }
+    }
+
+    /// Simulates reading a v2 manifest list written by Apache Iceberg >= 1.0,
+    /// which uses the renamed field names `added_data_files_count`,
+    /// `existing_data_files_count`, `deleted_data_files_count`. Our reader
+    /// schema declares these as Avro field aliases, so resolution should succeed.
+    #[test]
+    pub fn test_manifest_list_v2_apache_field_names() {
+        // Writer schema using Apache Iceberg spec-v2 field names.
+        let apache_writer_schema = apache_avro::Schema::parse_str(
+            r#"
+            {
+                "type": "record",
+                "name": "manifest_file",
+                "fields": [
+                    {"name": "manifest_path", "type": "string", "field-id": 500},
+                    {"name": "manifest_length", "type": "long", "field-id": 501},
+                    {"name": "partition_spec_id", "type": "int", "field-id": 502},
+                    {"name": "content", "type": "int", "field-id": 517},
+                    {"name": "sequence_number", "type": "long", "field-id": 515},
+                    {"name": "min_sequence_number", "type": "long", "field-id": 516},
+                    {"name": "added_snapshot_id", "type": "long", "field-id": 503},
+                    {"name": "added_data_files_count", "type": "int", "field-id": 504},
+                    {"name": "existing_data_files_count", "type": "int", "field-id": 505},
+                    {"name": "deleted_data_files_count", "type": "int", "field-id": 506},
+                    {"name": "added_rows_count", "type": "long", "field-id": 512},
+                    {"name": "existing_rows_count", "type": "long", "field-id": 513},
+                    {"name": "deleted_rows_count", "type": "long", "field-id": 514},
+                    {
+                        "name": "partitions",
+                        "type": ["null", {
+                            "type": "array",
+                            "items": {
+                                "type": "record",
+                                "name": "r508",
+                                "fields": [
+                                    {"name": "contains_null", "type": "boolean", "field-id": 509},
+                                    {"name": "contains_nan", "type": ["null", "boolean"], "field-id": 518},
+                                    {"name": "lower_bound", "type": ["null", "bytes"], "field-id": 510},
+                                    {"name": "upper_bound", "type": ["null", "bytes"], "field-id": 511}
+                                ]
+                            },
+                            "element-id": 508
+                        }],
+                        "default": null,
+                        "field-id": 507
+                    },
+                    {
+                        "name": "key_metadata",
+                        "type": ["null", "bytes"],
+                        "default": null,
+                        "field-id": 519
+                    }
+                ]
+            }
+            "#,
+        )
+        .unwrap();
+
+        // Build an Avro record using the Apache field names.
+        let mut record = apache_avro::types::Record::new(&apache_writer_schema).unwrap();
+        record.put("manifest_path", "s3://bucket/path/manifest-0.avro");
+        record.put("manifest_length", 1200_i64);
+        record.put("partition_spec_id", 0_i32);
+        record.put("content", 0_i32);
+        record.put("sequence_number", 566_i64);
+        record.put("min_sequence_number", 0_i64);
+        record.put("added_snapshot_id", 39487483032_i64);
+        record.put("added_data_files_count", 1_i32);
+        record.put("existing_data_files_count", 2_i32);
+        record.put("deleted_data_files_count", 0_i32);
+        record.put("added_rows_count", 1000_i64);
+        record.put("existing_rows_count", 8000_i64);
+        record.put("deleted_rows_count", 0_i64);
+        record.put("partitions", AvroValue::Union(0, Box::new(AvroValue::Null)));
+        record.put("key_metadata", AvroValue::Union(0, Box::new(AvroValue::Null)));
+
+        let mut writer = apache_avro::Writer::new(&apache_writer_schema, Vec::new());
+        writer.append(record).unwrap();
+        let encoded = writer.into_inner().unwrap();
+
+        // Read with iceberg-rust's schema (aliases declared).
+        let reader_schema = manifest_list_schema_v2();
+        let reader = apache_avro::Reader::with_schema(reader_schema, &*encoded).unwrap();
+
+        let mut count = 0;
+        for record in reader {
+            let result =
+                apache_avro::from_value::<_serde::ManifestListEntryV2>(&record.unwrap()).unwrap();
+            assert_eq!(result.added_files_count, 1);
+            assert_eq!(result.existing_files_count, 2);
+            assert_eq!(result.deleted_files_count, 0);
+            assert_eq!(result.added_rows_count, 1000);
+            assert_eq!(result.manifest_path, "s3://bucket/path/manifest-0.avro");
+            count += 1;
+        }
+        assert_eq!(count, 1, "expected exactly one record");
     }
 }

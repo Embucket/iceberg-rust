@@ -476,34 +476,30 @@ impl<'de, T: Serialize + DeserializeOwned + Clone> Deserialize<'de> for AvroMap<
 }
 
 impl AvroMap<ByteBuf> {
-    /// Converts a map of byte buffers into a map of typed Iceberg values using the provided schema.
+    /// Converts a map of byte buffers into a map of typed Iceberg values using
+    /// the provided schema.
     ///
-    /// # Arguments
-    /// * `schema` - The struct type schema used to determine the correct type for each value
+    /// DataFile statistics maps (`lower_bounds`, `upper_bounds`, ...) are keyed
+    /// by column id at any depth in the schema — including nested fields
+    /// inside struct/list/map types whose ids can be well above the top-level
+    /// count (common in Snowplow-style tables with context/unstruct arrays of
+    /// struct). Field lookup therefore walks the whole schema via
+    /// [`StructType::field_by_id`] rather than inspecting only top-level ids.
     ///
-    /// # Returns
-    /// * `Result<HashMap<i32, Value>, Error>` - A map of field IDs to their typed values, or an error if conversion fails
+    /// Ids that cannot be resolved anywhere in the schema are skipped rather
+    /// than treated as an error: the Iceberg spec permits stats for fields
+    /// that have since been removed from the schema, and a stale entry in an
+    /// old manifest must not break readers on any MERGE that rewrites it.
     fn into_value_map(self, schema: &StructType) -> Result<HashMap<i32, Value>, Error> {
-        Ok(HashMap::from_iter(
-            self.0
-                .into_iter()
-                .map(|(k, v)| {
-                    Ok((
-                        k,
-                        Value::try_from_bytes(
-                            &v,
-                            &schema
-                                .get(k as usize)
-                                .ok_or(Error::ColumnNotInSchema(
-                                    k.to_string(),
-                                    format!("{schema:?}"),
-                                ))?
-                                .field_type,
-                        )?,
-                    ))
-                })
-                .collect::<Result<Vec<_>, Error>>()?,
-        ))
+        self.0
+            .into_iter()
+            .filter_map(|(k, v)| match schema.field_by_id(k) {
+                Some(field) => {
+                    Some(Value::try_from_bytes(&v, &field.field_type).map(|val| (k, val)))
+                }
+                None => None,
+            })
+            .collect::<Result<HashMap<_, _>, Error>>()
     }
 }
 
@@ -1581,5 +1577,78 @@ mod tests {
             let result = apache_avro::from_value::<Struct>(&record.unwrap()).unwrap();
             assert_eq!(partition_values, result);
         }
+    }
+
+    /// Regression for the panic at `iceberg-rust/src/table/manifest.rs:549`
+    /// when MERGEing into real Snowplow events_hooli on S3 Tables. DataFile
+    /// statistics (`lower_bounds`, `upper_bounds`, ...) are keyed by column
+    /// id at any depth — including nested fields inside context/unstruct
+    /// structs whose ids can reach into the hundreds. `into_value_map` used
+    /// to validate these keys against only the top-level `StructType`
+    /// lookup, so any nested id returned `ColumnNotInSchema` and the
+    /// deserializer aborted. It now walks the schema recursively via
+    /// `StructType::field_by_id`, and tolerates ids that aren't in the
+    /// schema at all (schema evolution — Iceberg allows stats for removed
+    /// fields to linger in old manifests).
+    #[test]
+    fn into_value_map_accepts_nested_field_ids() {
+        use crate::spec::types::{ListType, StructType};
+        use serde_bytes::ByteBuf;
+
+        // Schema: top-level `event_id` (id=1) + `ctx_product` list<struct>
+        // whose element has an id-479 field. Mirrors the shape of a
+        // Snowplow `contexts_*` array.
+        let element_struct = Type::Struct(StructType::new(vec![
+            StructField {
+                id: 479,
+                name: "product_id".to_string(),
+                required: false,
+                field_type: Type::Primitive(PrimitiveType::Int),
+                doc: None,
+            },
+        ]));
+        let schema = StructType::new(vec![
+            StructField {
+                id: 1,
+                name: "event_id".to_string(),
+                required: true,
+                field_type: Type::Primitive(PrimitiveType::String),
+                doc: None,
+            },
+            StructField {
+                id: 2,
+                name: "ctx_product".to_string(),
+                required: false,
+                field_type: Type::List(ListType {
+                    element_id: 478,
+                    element_required: false,
+                    element: Box::new(element_struct),
+                }),
+                doc: None,
+            },
+        ]);
+
+        // Build an AvroMap<ByteBuf> with a stat for the nested field id.
+        let mut raw: HashMap<i32, ByteBuf> = HashMap::new();
+        raw.insert(479, Value::Int(42).into());
+        // Plus a known-unknown id to cover the schema-evolution case.
+        raw.insert(9999, Value::Int(7).into());
+        // And a top-level id, to make sure we didn't regress that path.
+        raw.insert(1, Value::String("abc".to_string()).into());
+
+        let avro_map = AvroMap(raw);
+        let value_map = avro_map
+            .into_value_map(&schema)
+            .expect("nested field ids must deserialize cleanly");
+
+        // Nested lookup succeeded and decoded the int.
+        assert_eq!(value_map.get(&479), Some(&Value::Int(42)));
+        // Top-level lookup still works.
+        assert_eq!(
+            value_map.get(&1),
+            Some(&Value::String("abc".to_string()))
+        );
+        // Unknown id is silently dropped, not an error.
+        assert!(value_map.get(&9999).is_none());
     }
 }
