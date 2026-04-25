@@ -89,6 +89,7 @@ impl<R: Read> ManifestReader<'_, R> {
     /// * Required metadata fields are missing
     /// * Format version is invalid
     /// * Schema or partition spec information cannot be parsed
+    #[allow(dead_code)]
     pub(crate) fn new(reader: R) -> Result<Self, Error> {
         Self::new_with_fallback_schema(reader, None)
     }
