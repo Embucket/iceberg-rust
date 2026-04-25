@@ -219,7 +219,6 @@ impl FilteredManifestStats {
     }
 }
 
-
 impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
     /// Creates a new ManifestWriter for writing manifest entries to a new manifest file.
     ///
