@@ -773,14 +773,6 @@ impl Operation {
                     filtered_stats.append(selected_filter_stats);
                 }
 
-                let new_manifest_list_location = manifest_list_writer
-                    .finish(snapshot_id, object_store)
-                    .await?;
-
-                if let Some(selected_filter_stats) = selected_filter_stats {
-                    filtered_stats.append(selected_filter_stats);
-                }
-
                 // Store separate manifest with filtered data files for compatability
                 if !filtered_stats.filtered_entries.is_empty() {
                     let n_filtered_files = filtered_stats.filtered_entries.len();
@@ -822,10 +814,7 @@ impl Operation {
                     summary_fields.extend(additional);
                 }
                 // Apply filtration stats
-                update_snapshot_summary_by_filtered_stats(&mut summary_fields, filtered_stats);
-
-                // Apply filtration stats
-                update_snapshot_summary_by_filtered_stats(&mut summary_fields, filtered_stats);
+                update_snapshot_summary_by_filtered_stats(&mut summary_fields, &filtered_stats);
 
                 let mut snapshot_builder = SnapshotBuilder::default();
                 snapshot_builder
@@ -1164,7 +1153,7 @@ pub fn update_snapshot_summary<'files>(
 
 pub(crate) fn update_snapshot_summary_by_filtered_stats(
     summary: &mut HashMap<String, String>,
-    stats: FilteredManifestStats,
+    stats: &FilteredManifestStats,
 ) {
     let mut subtract_from_summary = |key: &str, delta: i64, add: bool| {
         if delta == 0 {
