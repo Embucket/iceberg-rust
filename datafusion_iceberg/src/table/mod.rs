@@ -996,7 +996,7 @@ impl DataSink for IcebergDataSink {
         let count = metadata_files
             .iter()
             .map(|x| x.record_count())
-            .fold(0, |acc, x| acc + x);
+            .sum::<i64>();
 
         table
             .new_transaction(self.0.branch.as_deref())
