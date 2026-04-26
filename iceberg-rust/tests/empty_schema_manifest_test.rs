@@ -81,7 +81,7 @@ use iceberg_rust_spec::spec::types::{PrimitiveType, StructField, Type};
 use iceberg_rust_spec::util::strip_prefix;
 use iceberg_sql_catalog::SqlCatalog;
 use object_store::path::Path as ObjectPath;
-use object_store::ObjectStore;
+use object_store::ObjectStoreExt;
 
 /// Test for verifying behavior when a manifest file has a schema with zero fields.
 ///
