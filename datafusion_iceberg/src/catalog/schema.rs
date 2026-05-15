@@ -19,9 +19,6 @@ impl IcebergSchema {
 
 #[async_trait::async_trait]
 impl SchemaProvider for IcebergSchema {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn table_names(&self) -> Vec<String> {
         let tables = self.catalog.table_names(&self.schema);
         match tables {

@@ -225,9 +225,6 @@ impl DataFusionTable {
 
 #[async_trait]
 impl TableProvider for DataFusionTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
@@ -976,9 +973,6 @@ impl DisplayAs for IcebergDataSink {
 
 #[async_trait]
 impl DataSink for IcebergDataSink {
-    fn as_any(&self) -> &dyn Any {
-        self.0.as_any()
-    }
     async fn write_all(
         &self,
         data: SendableRecordBatchStream,
@@ -1064,7 +1058,7 @@ fn generate_partitioned_file(
         partition_values,
         range: None,
         statistics: Some(Arc::new(manifest_statistics)),
-        extensions: None,
+        extensions: datafusion::common::extensions::Extensions::new(),
         metadata_size_hint: None,
         ordering: None,
     };

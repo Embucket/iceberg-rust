@@ -13,9 +13,10 @@ use std::{
 use async_trait::async_trait;
 use datafusion::{
     arrow::{array::RecordBatch, datatypes::SchemaRef},
-    common::DFSchemaRef,
+    common::{tree_node::TreeNodeRecursion, DFSchemaRef},
     error::DataFusionError,
     execution::{RecordBatchStream, SendableRecordBatchStream, SessionState},
+    physical_expr::PhysicalExpr,
     physical_plan::{
         stream::RecordBatchStreamAdapter, DisplayAs, ExecutionPlan, Partitioning, PlanProperties,
     },
@@ -171,12 +172,15 @@ impl ExecutionPlan for PhysicalForkNode {
         "PhysicalForkNode"
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&dyn PhysicalExpr) -> datafusion::error::Result<TreeNodeRecursion>,
+    ) -> datafusion::error::Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {

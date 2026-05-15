@@ -43,10 +43,6 @@ impl IcebergCatalogList {
 }
 
 impl CatalogProviderList for IcebergCatalogList {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn catalog(&self, name: &str) -> Option<Arc<dyn CatalogProvider>> {
         self.catalogs.get(name).as_deref().cloned().or_else(|| {
             self.catalog_list.catalog(name).map(|catalog| {

@@ -131,7 +131,7 @@ impl PruningStatistics for PruneManifests<'_, '_> {
         None
     }
 
-    fn row_counts(&self, _column: &Column) -> Option<ArrayRef> {
+    fn row_counts(&self) -> Option<ArrayRef> {
         ScalarValue::iter_to_array(
             self.files
                 .iter()
@@ -221,16 +221,12 @@ impl PruningStatistics for PruneDataFiles<'_, '_> {
         None
     }
 
-    fn row_counts(&self, column: &Column) -> Option<ArrayRef> {
-        let column_id = self.schema.fields().get_name(&column.name)?.id;
-        let null_counts =
-            self.files
-                .iter()
-                .map(|manifest| match &manifest.1.data_file().value_counts() {
-                    Some(map) => map.get(&{ column_id }).copied(),
-                    None => None,
-                });
-        ScalarValue::iter_to_array(null_counts.map(ScalarValue::Int64)).ok()
+    fn row_counts(&self) -> Option<ArrayRef> {
+        let row_counts = self
+            .files
+            .iter()
+            .map(|manifest| Some(*manifest.1.data_file().record_count()));
+        ScalarValue::iter_to_array(row_counts.map(ScalarValue::Int64)).ok()
     }
 }
 
@@ -381,10 +377,6 @@ impl DateTransform {
 }
 
 impl ScalarUDFImpl for DateTransform {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "date_transform"
     }
