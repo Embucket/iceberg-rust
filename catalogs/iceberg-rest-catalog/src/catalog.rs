@@ -393,7 +393,7 @@ impl Catalog for RestCatalog {
             self.name.as_deref(),
             &identifier.namespace().to_string(),
             create_table,
-            None,
+            Some("vended-credentials"),
         )
         .map_err(Into::<Error>::into)
         .await?;
