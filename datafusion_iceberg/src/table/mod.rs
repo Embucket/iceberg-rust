@@ -1061,6 +1061,7 @@ fn generate_partitioned_file(
         extensions: datafusion::common::extensions::Extensions::new(),
         metadata_size_hint: None,
         ordering: None,
+        table_reference: None,
     };
     Ok(file)
 }
