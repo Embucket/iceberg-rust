@@ -72,7 +72,6 @@ use futures::stream;
 
 use iceberg_rust::arrow::write::write_parquet_partitioned;
 use iceberg_rust::catalog::Catalog;
-use iceberg_rust::error::Error;
 use iceberg_rust::object_store::{Bucket, ObjectStoreBuilder};
 use iceberg_rust::table::Table;
 use iceberg_rust_spec::spec::partition::PartitionSpec;
@@ -772,14 +771,16 @@ async fn test_datafiles_with_zero_field_schema_manifest() {
     }
 
     // 10. Before corruption: verify we can read all datafiles
-    let mut pre_corruption_datafiles = table
+    let pre_corruption_datafiles = table
         .datafiles(&manifest_entries, None, (None, None))
         .await
         .expect("Failed to get datafiles before corruption");
 
     let mut pre_corruption_count = 0;
-    while let Some(Ok(_)) = pre_corruption_datafiles.next() {
-        pre_corruption_count += 1;
+    for datafile in pre_corruption_datafiles {
+        if datafile.is_ok() {
+            pre_corruption_count += 1;
+        }
     }
 
     println!("Datafiles before corruption: {}", pre_corruption_count);
@@ -851,10 +852,10 @@ async fn test_datafiles_with_zero_field_schema_manifest() {
     let result = table.datafiles(&manifest_entries, None, (None, None)).await;
 
     match result {
-        Ok(mut datafiles_iter) => {
+        Ok(datafiles_iter) => {
             // Count the datafiles
             let mut count = 0;
-            while let Some(result) = datafiles_iter.next() {
+            for result in datafiles_iter {
                 match result {
                     Ok(_) => count += 1,
                     Err(e) => {

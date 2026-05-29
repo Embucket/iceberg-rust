@@ -148,53 +148,30 @@ pub fn parquet_to_datafile(
                     match lower_bounds.entry(id) {
                         Entry::Occupied(mut entry) => {
                             let entry = entry.get_mut();
-                            match (&entry, &new) {
-                                (Value::Int(current), Value::Int(new_val)) => {
-                                    if *current > *new_val {
-                                        *entry = new
-                                    }
-                                }
+                            let replace = match (&*entry, &new) {
+                                (Value::Int(current), Value::Int(new_val)) => current > new_val,
                                 (Value::LongInt(current), Value::LongInt(new_val)) => {
-                                    if *current > *new_val {
-                                        *entry = new
-                                    }
+                                    current > new_val
                                 }
-                                (Value::Float(current), Value::Float(new_val)) => {
-                                    if *current > *new_val {
-                                        *entry = new
-                                    }
-                                }
+                                (Value::Float(current), Value::Float(new_val)) => current > new_val,
                                 (Value::Double(current), Value::Double(new_val)) => {
-                                    if *current > *new_val {
-                                        *entry = new
-                                    }
+                                    current > new_val
                                 }
                                 (Value::Decimal(current), Value::Decimal(new_val)) => {
-                                    if *current > *new_val {
-                                        *entry = new
-                                    }
+                                    current > new_val
                                 }
-                                (Value::Date(current), Value::Date(new_val)) => {
-                                    if *current > *new_val {
-                                        *entry = new
-                                    }
-                                }
-                                (Value::Time(current), Value::Time(new_val)) => {
-                                    if *current > *new_val {
-                                        *entry = new
-                                    }
-                                }
+                                (Value::Date(current), Value::Date(new_val)) => current > new_val,
+                                (Value::Time(current), Value::Time(new_val)) => current > new_val,
                                 (Value::Timestamp(current), Value::Timestamp(new_val)) => {
-                                    if *current > *new_val {
-                                        *entry = new
-                                    }
+                                    current > new_val
                                 }
                                 (Value::TimestampTZ(current), Value::TimestampTZ(new_val)) => {
-                                    if *current > *new_val {
-                                        *entry = new
-                                    }
+                                    current > new_val
                                 }
-                                _ => (),
+                                _ => false,
+                            };
+                            if replace {
+                                *entry = new;
                             }
                         }
                         Entry::Vacant(entry) => {
@@ -206,53 +183,30 @@ pub fn parquet_to_datafile(
                     match upper_bounds.entry(id) {
                         Entry::Occupied(mut entry) => {
                             let entry = entry.get_mut();
-                            match (&entry, &new) {
-                                (Value::Int(current), Value::Int(new_val)) => {
-                                    if *current < *new_val {
-                                        *entry = new
-                                    }
-                                }
+                            let replace = match (&*entry, &new) {
+                                (Value::Int(current), Value::Int(new_val)) => current < new_val,
                                 (Value::LongInt(current), Value::LongInt(new_val)) => {
-                                    if *current < *new_val {
-                                        *entry = new
-                                    }
+                                    current < new_val
                                 }
-                                (Value::Float(current), Value::Float(new_val)) => {
-                                    if *current < *new_val {
-                                        *entry = new
-                                    }
-                                }
+                                (Value::Float(current), Value::Float(new_val)) => current < new_val,
                                 (Value::Double(current), Value::Double(new_val)) => {
-                                    if *current < *new_val {
-                                        *entry = new
-                                    }
+                                    current < new_val
                                 }
                                 (Value::Decimal(current), Value::Decimal(new_val)) => {
-                                    if *current < *new_val {
-                                        *entry = new
-                                    }
+                                    current < new_val
                                 }
-                                (Value::Date(current), Value::Date(new_val)) => {
-                                    if *current < *new_val {
-                                        *entry = new
-                                    }
-                                }
-                                (Value::Time(current), Value::Time(new_val)) => {
-                                    if *current < *new_val {
-                                        *entry = new
-                                    }
-                                }
+                                (Value::Date(current), Value::Date(new_val)) => current < new_val,
+                                (Value::Time(current), Value::Time(new_val)) => current < new_val,
                                 (Value::Timestamp(current), Value::Timestamp(new_val)) => {
-                                    if *current < *new_val {
-                                        *entry = new
-                                    }
+                                    current < new_val
                                 }
                                 (Value::TimestampTZ(current), Value::TimestampTZ(new_val)) => {
-                                    if *current < *new_val {
-                                        *entry = new
-                                    }
+                                    current < new_val
                                 }
-                                _ => (),
+                                _ => false,
+                            };
+                            if replace {
+                                *entry = new;
                             }
                         }
                         Entry::Vacant(entry) => {
