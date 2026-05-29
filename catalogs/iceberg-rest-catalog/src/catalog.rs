@@ -348,7 +348,7 @@ impl Catalog for RestCatalog {
                         self.name.as_deref(),
                         &identifier.namespace().to_string(),
                         identifier.name(),
-                        Some("vended-credentials"),
+                        configuration.access_delegation.as_deref(),
                         None,
                     )
                     .await
@@ -393,7 +393,7 @@ impl Catalog for RestCatalog {
             self.name.as_deref(),
             &identifier.namespace().to_string(),
             create_table,
-            Some("vended-credentials"),
+            configuration.access_delegation.as_deref(),
         )
         .map_err(Into::<Error>::into)
         .await?;
@@ -719,6 +719,7 @@ pub mod tests {
             base_path: url.to_owned(),
             user_agent: None,
             client: reqwest::Client::new(),
+            access_delegation: None,
             basic_auth: None,
             oauth_access_token: None,
             bearer_access_token: None,
