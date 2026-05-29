@@ -121,12 +121,7 @@ impl From<Value> for ByteBuf {
             Value::UUID(val) => ByteBuf::from(val.as_u128().to_be_bytes()),
             Value::Fixed(_, val) => ByteBuf::from(val),
             Value::Binary(val) => ByteBuf::from(val),
-            Value::Decimal(val) => {
-                // rust_decimal mantissa is 96 bits
-                // so we can remove the first 32 bits of the i128 representation
-                let bytes = val.mantissa().to_be_bytes()[4..].to_vec();
-                ByteBuf::from(bytes)
-            }
+            Value::Decimal(val) => ByteBuf::from(i128_to_minimal_signed_be_bytes(val.mantissa())),
             _ => todo!(),
         }
     }
@@ -755,6 +750,24 @@ pub fn sign_extend_be<const N: usize>(b: &[u8]) -> [u8; N] {
     result
 }
 
+/// Encodes a signed integer using the minimal big-endian two's-complement
+/// representation required for Iceberg decimal values.
+pub fn i128_to_minimal_signed_be_bytes(value: i128) -> Vec<u8> {
+    let bytes = value.to_be_bytes();
+    let sign_extension = if value < 0 { 0xff } else { 0x00 };
+    let sign_bit = sign_extension & 0x80;
+    let mut start = 0;
+
+    while start < bytes.len() - 1
+        && bytes[start] == sign_extension
+        && (bytes[start + 1] & 0x80) == sign_bit
+    {
+        start += 1;
+    }
+
+    bytes[start..].to_vec()
+}
+
 impl From<&Value> for JsonValue {
     fn from(value: &Value) -> Self {
         match value {
@@ -1364,10 +1377,7 @@ mod tests {
         // Test serialization
         let byte_buf: ByteBuf = value.clone().into();
         let bytes: Vec<u8> = byte_buf.into_vec();
-        assert_eq!(
-            bytes,
-            vec![0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 160u8, 16u8, 94u8]
-        );
+        assert_eq!(bytes, vec![0u8, 160u8, 16u8, 94u8]);
 
         // Test deserialization
         check_avro_bytes_serde(
@@ -1378,6 +1388,16 @@ mod tests {
                 scale: 2,
             }),
         );
+    }
+
+    #[test]
+    fn decimal_bytes_are_minimal_signed_big_endian() {
+        assert_eq!(i128_to_minimal_signed_be_bytes(0), vec![0]);
+        assert_eq!(i128_to_minimal_signed_be_bytes(2), vec![2]);
+        assert_eq!(i128_to_minimal_signed_be_bytes(127), vec![127]);
+        assert_eq!(i128_to_minimal_signed_be_bytes(128), vec![0, 128]);
+        assert_eq!(i128_to_minimal_signed_be_bytes(-1), vec![255]);
+        assert_eq!(i128_to_minimal_signed_be_bytes(-129), vec![255, 127]);
     }
 
     #[test]
