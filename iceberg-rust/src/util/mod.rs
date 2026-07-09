@@ -1,3 +1,4 @@
+pub(crate) mod manifest_cache;
 use std::cmp::Ordering;
 
 use iceberg_rust_spec::{

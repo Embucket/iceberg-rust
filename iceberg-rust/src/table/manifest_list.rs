@@ -134,14 +134,22 @@ pub(crate) async fn read_snapshot<'metadata>(
     table_metadata: &'metadata TableMetadata,
     object_store: Arc<dyn ObjectStore>,
 ) -> Result<impl Iterator<Item = Result<ManifestListEntry, Error>> + 'metadata, Error> {
-    let bytes: Cursor<Vec<u8>> = Cursor::new(
-        object_store
-            .get(&strip_prefix(snapshot.manifest_list()).into())
-            .await?
-            .bytes()
-            .await?
-            .into(),
-    );
+    // Manifest-list files are immutable by path; serve/populate the
+    // process-wide cache to skip the object-store round trip on re-scans.
+    let path = strip_prefix(snapshot.manifest_list());
+    let data = match crate::util::manifest_cache::get(&path) {
+        Some(bytes) => bytes,
+        None => {
+            let bytes = object_store
+                .get(&path.clone().into())
+                .await?
+                .bytes()
+                .await?;
+            crate::util::manifest_cache::put(&path, &bytes);
+            bytes
+        }
+    };
+    let bytes: Cursor<Vec<u8>> = Cursor::new(data.into());
     ManifestListReader::new(bytes, table_metadata)
 }
 

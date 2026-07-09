@@ -338,14 +338,23 @@ async fn datafiles(
             let object_store = object_store.clone();
             async move {
                 let manifest_path = &file.manifest_path;
-                let path: Path = util::strip_prefix(manifest_path).into();
-                let bytes = Cursor::new(Vec::from(
-                    object_store
-                        .get(&path)
-                        .and_then(|file| file.bytes())
-                        .instrument(tracing::trace_span!("iceberg_rust::get_manifest"))
-                        .await?,
-                ));
+                let stripped = util::strip_prefix(manifest_path);
+                // Manifest files are immutable by path; serve/populate the
+                // process-wide cache to skip per-scan object-store reads.
+                let data = match crate::util::manifest_cache::get(&stripped) {
+                    Some(bytes) => bytes,
+                    None => {
+                        let path: Path = stripped.clone().into();
+                        let bytes = object_store
+                            .get(&path)
+                            .and_then(|file| file.bytes())
+                            .instrument(tracing::trace_span!("iceberg_rust::get_manifest"))
+                            .await?;
+                        crate::util::manifest_cache::put(&stripped, &bytes);
+                        bytes
+                    }
+                };
+                let bytes = Cursor::new(Vec::from(data));
                 Ok::<_, Error>((bytes, manifest_path, file.sequence_number))
             }
         })
