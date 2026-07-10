@@ -136,16 +136,15 @@ pub(crate) async fn read_snapshot<'metadata>(
 ) -> Result<impl Iterator<Item = Result<ManifestListEntry, Error>> + 'metadata, Error> {
     // Manifest-list files are immutable by path; serve/populate the
     // process-wide cache to skip the object-store round trip on re-scans.
-    let path = strip_prefix(snapshot.manifest_list());
-    let data = match crate::util::manifest_cache::get(&path) {
+    // The cache key is the original URI (scheme + bucket + path): distinct
+    // stores can hold different bytes at the same store-relative path.
+    let uri = snapshot.manifest_list();
+    let data = match crate::util::manifest_cache::get(uri) {
         Some(bytes) => bytes,
         None => {
-            let bytes = object_store
-                .get(&path.clone().into())
-                .await?
-                .bytes()
-                .await?;
-            crate::util::manifest_cache::put(&path, &bytes);
+            let path = strip_prefix(uri);
+            let bytes = object_store.get(&path.into()).await?.bytes().await?;
+            crate::util::manifest_cache::put(uri, &bytes);
             bytes
         }
     };

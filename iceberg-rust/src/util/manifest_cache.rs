@@ -7,6 +7,10 @@ by path never go stale and need no invalidation. Caching them removes the
 per-scan object-store round-trips (`manifest list GET + one GET per
 manifest`) that otherwise repeat on every scan of the same snapshot.
 
+Keys are the original file URIs (scheme + bucket + path), NOT store-relative
+paths: the cache is process-wide, and two object stores can hold different
+bytes at the same relative path (`s3://a/x` vs `s3://b/x`).
+
 The cache is byte-capped LRU. Capacity comes from `ICEBERG_MANIFEST_CACHE_MB`
 (read once per process; default 128 MiB; `0` disables caching entirely).
 Entries larger than the cap are never inserted.
@@ -105,6 +109,30 @@ mod tests {
                 None => break,
             }
         }
+    }
+
+    #[test]
+    fn uri_keys_do_not_collide_across_stores() {
+        // Same store-relative path under two buckets must stay two entries,
+        // and the stripped form must not be a key at all. Exercises the real
+        // process-wide cache (default cap, env unset in tests).
+        put(
+            "s3://bucket-a/db/tbl/metadata/x-m0.avro",
+            &Bytes::from_static(b"bytes-a"),
+        );
+        put(
+            "s3://bucket-b/db/tbl/metadata/x-m0.avro",
+            &Bytes::from_static(b"bytes-b"),
+        );
+        assert_eq!(
+            get("s3://bucket-a/db/tbl/metadata/x-m0.avro").as_deref(),
+            Some(b"bytes-a".as_slice())
+        );
+        assert_eq!(
+            get("s3://bucket-b/db/tbl/metadata/x-m0.avro").as_deref(),
+            Some(b"bytes-b".as_slice())
+        );
+        assert!(get("/db/tbl/metadata/x-m0.avro").is_none());
     }
 
     #[test]
