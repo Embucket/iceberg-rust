@@ -338,19 +338,20 @@ async fn datafiles(
             let object_store = object_store.clone();
             async move {
                 let manifest_path = &file.manifest_path;
-                let stripped = util::strip_prefix(manifest_path);
                 // Manifest files are immutable by path; serve/populate the
                 // process-wide cache to skip per-scan object-store reads.
-                let data = match crate::util::manifest_cache::get(&stripped) {
+                // Keyed by the original URI so equal store-relative paths in
+                // different stores cannot alias each other.
+                let data = match crate::util::manifest_cache::get(manifest_path) {
                     Some(bytes) => bytes,
                     None => {
-                        let path: Path = stripped.clone().into();
+                        let path: Path = util::strip_prefix(manifest_path).into();
                         let bytes = object_store
                             .get(&path)
                             .and_then(|file| file.bytes())
                             .instrument(tracing::trace_span!("iceberg_rust::get_manifest"))
                             .await?;
-                        crate::util::manifest_cache::put(&stripped, &bytes);
+                        crate::util::manifest_cache::put(manifest_path, &bytes);
                         bytes
                     }
                 };
