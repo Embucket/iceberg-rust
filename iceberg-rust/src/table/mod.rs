@@ -328,14 +328,20 @@ async fn datafiles(
             let manifest_path = file.manifest_path.clone();
             let manifest_sequence_number = file.sequence_number;
             async move {
-                let path: Path = util::strip_prefix(&manifest_path).into();
-                let bytes = Cursor::new(Vec::from(
-                    object_store
-                        .get(&path)
-                        .and_then(|file| file.bytes())
-                        .instrument(tracing::trace_span!("iceberg_rust::get_manifest"))
-                        .await?,
-                ));
+                let data = match crate::util::manifest_cache::get(&manifest_path) {
+                    Some(bytes) => bytes,
+                    None => {
+                        let path: Path = util::strip_prefix(&manifest_path).into();
+                        let bytes = object_store
+                            .get(&path)
+                            .and_then(|file| file.bytes())
+                            .instrument(tracing::trace_span!("iceberg_rust::get_manifest"))
+                            .await?;
+                        crate::util::manifest_cache::put(&manifest_path, &bytes);
+                        bytes
+                    }
+                };
+                let bytes = Cursor::new(Vec::from(data));
 
                 ManifestReader::new(bytes)?
                     .filter_map_ok(|mut x| {

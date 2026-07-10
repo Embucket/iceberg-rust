@@ -325,71 +325,68 @@ impl Catalog for RestCatalog {
     /// Load a table.
     async fn load_tabular(self: Arc<Self>, identifier: &Identifier) -> Result<Tabular, Error> {
         let configuration = self.configuration.clone();
-        // Load View/Matview metadata, is loaded as tabular to enable both possibilities. Must not be table metadata
-        let tabular_metadata = catalog_api_api::load_view(
+        // Tables dominate every workload, so try loadTable first and fall
+        // back to loadView on 404 — the previous order paid a wasted
+        // loadView round-trip (always a 404) for every table load.
+        let table_response = catalog_api_api::load_table(
             &configuration,
             self.name.as_deref(),
             &identifier.namespace().to_string(),
             identifier.name(),
+            configuration.access_delegation.as_deref(),
+            None,
         )
-        .await
-        .map(|x| x.metadata);
-        match tabular_metadata {
-            Ok(TabularMetadata::View(view)) => Ok(Tabular::View(
-                View::new(identifier.clone(), self.clone(), view).await?,
-            )),
-            Ok(TabularMetadata::MaterializedView(matview)) => Ok(Tabular::MaterializedView(
-                MaterializedView::new(identifier.clone(), self.clone(), matview).await?,
-            )),
-            Err(apis::Error::ResponseError(content)) => {
-                if content.status == 404 {
-                    let headers = configuration
-                        .access_delegation
-                        .as_ref()
-                        .map(|value| {
-                            HashMap::from([(
-                                "X-Iceberg-Access-Delegation".to_owned(),
-                                value.clone(),
-                            )])
-                        })
-                        .unwrap_or_default();
+        .await;
+        match table_response {
+            Ok(response) => {
+                let object_store = self.get_object_store(&response)?;
 
-                    let response = catalog_api_api::load_table(
-                        &configuration,
-                        self.name.as_deref(),
-                        &identifier.namespace().to_string(),
-                        identifier.name(),
-                        headers,
-                        None,
+                self.cache
+                    .write()
+                    .unwrap()
+                    .insert(identifier.clone(), object_store.clone());
+
+                let table_metadata = response.metadata;
+
+                Ok(Tabular::Table(
+                    Table::new(
+                        identifier.clone(),
+                        self.clone(),
+                        object_store,
+                        table_metadata,
                     )
-                    .await
-                    .map_err(|_| Error::CatalogNotFound)?;
-
-                    let object_store = self.get_object_store(&response)?;
-
-                    self.cache
-                        .write()
-                        .unwrap()
-                        .insert(identifier.clone(), object_store.clone());
-
-                    let table_metadata = response.metadata;
-
-                    Ok(Tabular::Table(
-                        Table::new(
-                            identifier.clone(),
-                            self.clone(),
-                            object_store,
-                            table_metadata,
-                        )
-                        .await?,
-                    ))
-                } else {
-                    Err(Into::<Error>::into(apis::Error::ResponseError(content)))
+                    .await?,
+                ))
+            }
+            Err(apis::Error::ResponseError(content)) if content.status == 404 => {
+                // Not a table: it may be a view or materialized view.
+                let view_response = catalog_api_api::load_view(
+                    &configuration,
+                    self.name.as_deref(),
+                    &identifier.namespace().to_string(),
+                    identifier.name(),
+                )
+                .await;
+                match view_response.map(|x| x.metadata) {
+                    Ok(TabularMetadata::View(view)) => Ok(Tabular::View(
+                        View::new(identifier.clone(), self.clone(), view).await?,
+                    )),
+                    Ok(TabularMetadata::MaterializedView(matview)) => {
+                        Ok(Tabular::MaterializedView(
+                            MaterializedView::new(identifier.clone(), self.clone(), matview)
+                                .await?,
+                        ))
+                    }
+                    Ok(TabularMetadata::Table(_)) => Err(Error::InvalidFormat(
+                        "Entity returned from load_view cannot be a table.".to_owned(),
+                    )),
+                    Err(apis::Error::ResponseError(view_content)) if view_content.status == 404 => {
+                        Err(Error::CatalogNotFound)
+                    }
+                    Err(err) => Err(Into::<Error>::into(err)),
                 }
             }
-            _ => Err(Error::InvalidFormat(
-                "Entity returned from load_view cannot be a table.".to_owned(),
-            )),
+            Err(err) => Err(Into::<Error>::into(err)),
         }
     }
     /// Register a table with the catalog if it doesn't exist.
