@@ -328,6 +328,8 @@ async fn datafiles(
             let manifest_path = file.manifest_path.clone();
             let manifest_sequence_number = file.sequence_number;
             async move {
+                // Manifest files are immutable by path. Key by the original
+                // URI so equal store-relative paths cannot alias across stores.
                 let data = match crate::util::manifest_cache::get(&manifest_path) {
                     Some(bytes) => bytes,
                     None => {
