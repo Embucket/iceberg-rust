@@ -245,7 +245,7 @@ mod tests {
     use object_store::path::Path as ObjectPath;
     use object_store::{
         CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
-        PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as OsResult,
+        ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as OsResult,
     };
 
     /// A minimal parsed footer with a known [`memory_size`] weight is awkward
