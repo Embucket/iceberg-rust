@@ -33,7 +33,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 use tokio::sync::mpsc::{self};
-use tracing::{instrument, Instrument};
+use tracing::instrument;
 
 use crate::statistics::statistics_from_datafiles;
 use crate::{
@@ -50,18 +50,15 @@ use datafusion::{
     common::{not_impl_err, plan_err, runtime::SpawnedTask, DataFusionError, SchemaExt},
     config::TableParquetOptions,
     datasource::{
-        file_format::{
-            parquet::{ParquetFormat, ParquetSink},
-            write::demux::DemuxedStreamReceiver,
-            FileFormat,
-        },
+        file_format::{parquet::ParquetSink, write::demux::DemuxedStreamReceiver},
         listing::PartitionedFile,
         object_store::ObjectStoreUrl,
         physical_plan::{
-            parquet::source::ParquetSource, FileGroup, FileOutputMode, FileScanConfigBuilder,
-            FileSink, FileSinkConfig,
+            parquet::{source::ParquetSource, ParquetFileReaderFactory},
+            FileGroup, FileOutputMode, FileScanConfigBuilder, FileSink, FileSinkConfig,
         },
         sink::{DataSink, DataSinkExec},
+        source::DataSourceExec,
         TableProvider, ViewTable,
     },
     execution::{context::SessionState, TaskContext},
@@ -407,6 +404,17 @@ async fn table_scan(
         .runtime_env()
         .register_object_store(object_store_url.as_ref(), table.object_store());
 
+    // Serve parsed Parquet footers from a process-wide cache. Iceberg data
+    // files are immutable by path, so cached metadata never goes stale. The
+    // object-store URL namespaces cache keys so store-relative data-file paths
+    // cannot collide across tables or buckets.
+    let parquet_reader_factory: Arc<dyn ParquetFileReaderFactory> = Arc::new(
+        crate::parquet_metadata_cache::CachingParquetFileReaderFactory::new(
+            table.object_store(),
+            object_store_url.as_str(),
+        ),
+    );
+
     let enable_data_file_path_column = config
         .map(|x| x.enable_data_file_path_column)
         .unwrap_or_default();
@@ -635,7 +643,10 @@ async fn table_scan(
             file_schema.clone(),
             table_partition_cols.iter().cloned().map(Arc::new).collect(),
         );
-        Arc::new(ParquetSource::new(table_schema))
+        Arc::new(
+            ParquetSource::new(table_schema)
+                .with_parquet_file_reader_factory(parquet_reader_factory.clone()),
+        )
     };
 
     // Create plan for every partition with delete files
@@ -645,6 +656,7 @@ async fn table_scan(
             let statistics = statistics.clone();
             let schema = &schema;
             let file_source = file_source.clone();
+            let parquet_reader_factory = parquet_reader_factory.clone();
             let projection_expr = projection_expr.clone();
             let projection = projection.clone();
             let mut data_files = data_file_groups
@@ -698,6 +710,7 @@ async fn table_scan(
                         let statistics = statistics.clone();
                         let schema = &schema;
                         let file_source = file_source.clone();
+                        let parquet_reader_factory = parquet_reader_factory.clone();
                         let mut data_files = Vec::new();
                         let equality_projection = equality_projection.clone();
 
@@ -748,8 +761,12 @@ async fn table_scan(
                                 manifest_path,
                             )?;
 
-                            let delete_file_source =
-                                Arc::new(ParquetSource::new(delete_file_schema));
+                            let delete_file_source = Arc::new(
+                                ParquetSource::new(delete_file_schema)
+                                    .with_parquet_file_reader_factory(
+                                        parquet_reader_factory.clone(),
+                                    ),
+                            );
 
                             let delete_file_scan_config = FileScanConfigBuilder::new(
                                 object_store_url.clone(),
@@ -760,9 +777,11 @@ async fn table_scan(
                             .with_limit(limit)
                             .build();
 
-                            let left = ParquetFormat::default()
-                                .create_physical_plan(session, delete_file_scan_config)
-                                .await?;
+                            // Build the exec directly: `ParquetFormat::create_physical_plan`
+                            // would overwrite the caching reader factory installed on the
+                            // source with DataFusion's own runtime-env-scoped one.
+                            let left: Arc<dyn ExecutionPlan> =
+                                DataSourceExec::from_data_source(delete_file_scan_config);
 
                             let file_scan_config =
                                 FileScanConfigBuilder::new(object_store_url, file_source.clone())
@@ -772,9 +791,8 @@ async fn table_scan(
                                     .with_limit(limit)
                                     .build();
 
-                            let data_files_scan = ParquetFormat::default()
-                                .create_physical_plan(session, file_scan_config)
-                                .await?;
+                            let data_files_scan: Arc<dyn ExecutionPlan> =
+                                DataSourceExec::from_data_source(file_scan_config);
 
                             let right = if let Some(acc) = acc {
                                 UnionExec::try_new(vec![acc, data_files_scan])?
@@ -849,9 +867,8 @@ async fn table_scan(
                             .with_limit(limit)
                             .build();
 
-                    let data_files_scan = ParquetFormat::default()
-                        .create_physical_plan(session, file_scan_config)
-                        .await?;
+                    let data_files_scan: Arc<dyn ExecutionPlan> =
+                        DataSourceExec::from_data_source(file_scan_config);
 
                     plan = UnionExec::try_new(vec![plan, data_files_scan])?;
                 }
@@ -896,12 +913,9 @@ async fn table_scan(
             .with_limit(limit)
             .build();
 
-        let other_plan = ParquetFormat::default()
-            .create_physical_plan(session, file_scan_config)
-            .instrument(tracing::debug_span!(
-                "datafusion_iceberg::create_physical_plan_scan_data_files"
-            ))
-            .await?;
+        let other_plan: Arc<dyn ExecutionPlan> =
+            tracing::debug_span!("datafusion_iceberg::create_physical_plan_scan_data_files")
+                .in_scope(|| DataSourceExec::from_data_source(file_scan_config));
 
         plans.push(other_plan);
     }
@@ -1440,6 +1454,91 @@ mod tests {
     use std::sync::Arc;
 
     use crate::{catalog::catalog::IcebergCatalog, table::fake_object_store_url, DataFusionTable};
+
+    use super::{DataSourceExec, ExecutionPlan, ParquetSource, TableProvider};
+    use datafusion::datasource::physical_plan::FileScanConfig;
+
+    /// Walk `plan` and assert every parquet scan node carries the
+    /// process-wide metadata cache factory, returning how many were found.
+    /// Guards against regressions where plan construction (e.g. routing
+    /// through `ParquetFormat::create_physical_plan`) replaces the factory.
+    fn count_caching_parquet_sources(plan: &dyn ExecutionPlan) -> usize {
+        let mut found = 0;
+        if let Some(exec) = plan.as_any().downcast_ref::<DataSourceExec>() {
+            if let Some(config) = exec.data_source().as_any().downcast_ref::<FileScanConfig>() {
+                let source = config
+                    .file_source()
+                    .as_any()
+                    .downcast_ref::<ParquetSource>()
+                    .expect("iceberg scan file source should be a ParquetSource");
+                let factory = source
+                    .parquet_file_reader_factory()
+                    .expect("ParquetSource should carry a parquet file reader factory");
+                assert!(
+                    format!("{factory:?}").contains("CachingParquetFileReaderFactory"),
+                    "scan must use the process-wide parquet metadata cache factory"
+                );
+                found += 1;
+            }
+        }
+        for child in plan.children() {
+            found += count_caching_parquet_sources(child.as_ref());
+        }
+        found
+    }
+
+    #[tokio::test]
+    async fn test_scan_installs_caching_parquet_reader_factory() {
+        let object_store = ObjectStoreBuilder::memory();
+
+        let catalog: Arc<dyn Catalog> = Arc::new(
+            SqlCatalog::new("sqlite://", "test", object_store)
+                .await
+                .unwrap(),
+        );
+
+        let schema = Schema::builder()
+            .with_struct_field(StructField {
+                id: 1,
+                name: "id".to_string(),
+                required: true,
+                field_type: Type::Primitive(PrimitiveType::Long),
+                doc: None,
+            })
+            .build()
+            .unwrap();
+
+        let table = Table::builder()
+            .with_name("numbers")
+            .with_location("memory:///test/numbers")
+            .with_schema(schema)
+            .build(&["test".to_owned()], catalog)
+            .await
+            .expect("Failed to create table");
+
+        let table = Arc::new(DataFusionTable::from(table));
+
+        let ctx = SessionContext::new();
+        ctx.register_table("numbers", table.clone()).unwrap();
+
+        ctx.sql("INSERT INTO numbers (id) VALUES (1), (2), (3);")
+            .await
+            .expect("Failed to create query plan for insert")
+            .collect()
+            .await
+            .expect("Failed to insert values into table");
+
+        let state = ctx.state();
+        let plan = table
+            .scan(&state, None, &[], None)
+            .await
+            .expect("Failed to build scan plan");
+
+        assert!(
+            count_caching_parquet_sources(plan.as_ref()) > 0,
+            "expected at least one parquet scan node in the plan"
+        );
+    }
 
     #[tokio::test]
     pub async fn test_datafusion_table_insert() {
