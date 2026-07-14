@@ -32,9 +32,25 @@ scan builds, so both cold and warm queries flow through it. Only footer
 metadata (`get_metadata`) is cached; row-group/page data reads pass straight
 through to the underlying reader.
 
+Concurrent *cold* readers of the same file are collapsed by per-file
+single-flight. Without it, N queries racing on the same not-yet-cached footer
+each fetch and parse it independently (a dogpile) before the first `put` lands.
+The first reader to miss takes the file's single-flight gate — a per-key async
+mutex — and performs the sole fetch+parse+insert; the rest wait on the gate,
+then re-check the cache after acquiring it and return the winner's `Arc`. So N
+racing cold scans pay one round-trip, not N. The synchronous LRU lock is only
+taken to look up or insert an entry and is never held across the fetch await;
+only the per-file async gate is. The gate map is itself a small LRU capped at
+[`INFLIGHT_GATES_CAP`] live gates, so it stays bounded no matter how many
+distinct files the process reads; a gate evicted while a load is still in flight
+merely lets that one file be fetched twice, never breaking correctness. When
+caching is disabled (cap `0`) this path is skipped entirely — reads pass
+straight through with no gate and no lock, exactly as before single-flight.
+
 [`ParquetSource`]: datafusion::datasource::physical_plan::parquet::source::ParquetSource
 */
 
+use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::sync::{Arc, LazyLock, Mutex};
 
@@ -52,8 +68,16 @@ use futures::future::BoxFuture;
 use futures::FutureExt;
 use lru::LruCache;
 use object_store::ObjectStore;
+use tokio::sync::Mutex as AsyncMutex;
 
 const DEFAULT_CAP_MB: usize = 64;
+
+/// Upper bound on the number of distinct per-file single-flight gates kept live
+/// at once. The gate map is an LRU capped here so it stays bounded no matter how
+/// many distinct files the process reads over its lifetime; a gate evicted while
+/// a load is still in flight only weakens de-duplication for that one file (an
+/// extra fetch), never correctness.
+const INFLIGHT_GATES_CAP: usize = 1024;
 
 /// A cached parsed footer plus the file size it was parsed from.
 struct Entry {
@@ -111,37 +135,128 @@ impl ByteCappedCache {
     }
 }
 
-static CACHE: LazyLock<Option<Mutex<ByteCappedCache>>> = LazyLock::new(|| {
+/// The parsed-footer LRU together with the per-file single-flight gates that
+/// collapse concurrent cold loads of the same file into one fetch+parse.
+///
+/// A single instance backs the whole process ([`CACHE`]); the tests construct
+/// isolated instances (including disabled ones) to drive [`load`] deterministically.
+///
+/// [`load`]: MetadataCache::load
+struct MetadataCache {
+    /// Parsed footers, byte-capped. `None` when caching is disabled (cap `0`),
+    /// in which case lookups, inserts, and the single-flight gate are all
+    /// bypassed.
+    store: Option<Mutex<ByteCappedCache>>,
+    /// Per-file single-flight gates, keyed exactly like [`ByteCappedCache`]
+    /// entries. Bounded to [`INFLIGHT_GATES_CAP`] live gates by its own LRU.
+    inflight: Mutex<LruCache<String, Arc<AsyncMutex<()>>>>,
+}
+
+impl MetadataCache {
+    fn new(cap_bytes: usize) -> Self {
+        let store = if cap_bytes == 0 {
+            None
+        } else {
+            Some(Mutex::new(ByteCappedCache::new(cap_bytes)))
+        };
+        Self {
+            store,
+            inflight: Mutex::new(LruCache::new(
+                NonZeroUsize::new(INFLIGHT_GATES_CAP).expect("INFLIGHT_GATES_CAP is non-zero"),
+            )),
+        }
+    }
+
+    /// Whether caching (and therefore single-flight) is active.
+    fn enabled(&self) -> bool {
+        self.store.is_some()
+    }
+
+    /// Cached parsed footer for `key`, if present and the size stamp matches.
+    /// Takes the LRU lock only briefly and never across an await.
+    fn get(&self, key: &str, size: u64) -> Option<Arc<ParquetMetaData>> {
+        let store = self.store.as_ref()?;
+        let mut guard = store.lock().ok()?;
+        guard.lookup(key, size)
+    }
+
+    /// Insert `meta` under `key`, weighted by its in-memory size. A no-op when
+    /// caching is disabled.
+    fn put(&self, key: &str, size: u64, meta: Arc<ParquetMetaData>) {
+        let Some(store) = self.store.as_ref() else {
+            return;
+        };
+        let Ok(mut guard) = store.lock() else {
+            return;
+        };
+        let weight = meta.memory_size();
+        guard.insert(key, Entry { size, weight, meta });
+    }
+
+    /// Return the single-flight gate for `key`, creating it on first use. The
+    /// gate map is a small LRU, so live gates stay bounded to
+    /// [`INFLIGHT_GATES_CAP`]; a gate evicted while still held survives through
+    /// its holders' `Arc` clones. Takes the map lock only briefly and never
+    /// across an await.
+    fn inflight_gate(&self, key: &str) -> Arc<AsyncMutex<()>> {
+        let mut map = self
+            .inflight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(gate) = map.get(key) {
+            return Arc::clone(gate);
+        }
+        let gate = Arc::new(AsyncMutex::new(()));
+        map.put(key.to_string(), Arc::clone(&gate));
+        gate
+    }
+
+    /// Resolve the footer for `key`: serve it from cache, or fetch+parse it
+    /// through `reader` on a miss, collapsing concurrent cold misses of the same
+    /// file into a single fetch.
+    ///
+    /// When caching is disabled the fetch is issued straight through with no
+    /// gate and no lock. Otherwise the first caller to miss takes the file's
+    /// single-flight gate and performs the sole fetch+parse+insert; the rest
+    /// wait on the gate and, once it releases, re-check the cache and return the
+    /// winner's `Arc`. The synchronous LRU locks are never held across the
+    /// `reader.get_metadata` await — only the per-file async gate is.
+    async fn load(
+        &self,
+        reader: &mut (dyn AsyncFileReader + Send),
+        options: Option<&ArrowReaderOptions>,
+        key: &str,
+        size: u64,
+    ) -> ParquetResult<Arc<ParquetMetaData>> {
+        if let Some(meta) = self.get(key, size) {
+            return Ok(meta);
+        }
+        if !self.enabled() {
+            // Disabled cache: no gate, no lock overhead — read straight through.
+            return reader.get_metadata(options).await;
+        }
+        let gate = self.inflight_gate(key);
+        let _permit = gate.lock().await;
+        // The winner may have populated the cache while we waited on the gate.
+        if let Some(meta) = self.get(key, size) {
+            return Ok(meta);
+        }
+        let meta = reader.get_metadata(options).await?;
+        self.put(key, size, Arc::clone(&meta));
+        Ok(meta)
+    }
+}
+
+/// The process-wide metadata cache. Capacity comes from
+/// `ICEBERG_PARQUET_METADATA_CACHE_MB` (read once per process; default 64 MiB;
+/// `0` disables caching and single-flight entirely).
+static CACHE: LazyLock<MetadataCache> = LazyLock::new(|| {
     let cap_mb = std::env::var("ICEBERG_PARQUET_METADATA_CACHE_MB")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .unwrap_or(DEFAULT_CAP_MB);
-    if cap_mb == 0 {
-        return None;
-    }
-    Some(Mutex::new(ByteCappedCache::new(
-        cap_mb.saturating_mul(1024 * 1024),
-    )))
+    MetadataCache::new(cap_mb.saturating_mul(1024 * 1024))
 });
-
-/// Cached parsed footer for `key`, if present and the size stamp matches.
-fn get(key: &str, size: u64) -> Option<Arc<ParquetMetaData>> {
-    let cache = CACHE.as_ref()?;
-    let mut guard = cache.lock().ok()?;
-    guard.lookup(key, size)
-}
-
-/// Insert `meta` under `key`, weighted by its in-memory size.
-fn put(key: &str, size: u64, meta: Arc<ParquetMetaData>) {
-    let Some(cache) = CACHE.as_ref() else {
-        return;
-    };
-    let Ok(mut guard) = cache.lock() else {
-        return;
-    };
-    let weight = meta.memory_size();
-    guard.insert(key, Entry { size, weight, meta });
-}
 
 /// A [`ParquetFileReaderFactory`] that serves parsed footer metadata from the
 /// process-wide [`CACHE`], falling back to an inner factory (the DataFusion
@@ -215,18 +330,9 @@ impl AsyncFileReader for CachingMetadataReader {
         &'a mut self,
         options: Option<&'a ArrowReaderOptions>,
     ) -> BoxFuture<'a, ParquetResult<Arc<ParquetMetaData>>> {
-        if let Some(meta) = get(&self.key, self.size) {
-            return futures::future::ready(Ok(meta)).boxed();
-        }
-        let key = self.key.clone();
-        let size = self.size;
-        let fetch = self.inner.get_metadata(options);
-        async move {
-            let meta = fetch.await?;
-            put(&key, size, Arc::clone(&meta));
-            Ok(meta)
-        }
-        .boxed()
+        CACHE
+            .load(&mut *self.inner, options, &self.key, self.size)
+            .boxed()
     }
 }
 
@@ -235,6 +341,7 @@ mod tests {
     use super::*;
 
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     use datafusion::arrow::array::{ArrayRef, Int32Array, RecordBatch};
     use datafusion::parquet::arrow::ArrowWriter;
@@ -275,12 +382,12 @@ mod tests {
         // store-relative location with the scan's object-store URL.
         let key_a = "iceberg-rust://bucket-a/db/tbl/data/f.parquet";
         let key_b = "iceberg-rust://bucket-b/db/tbl/data/f.parquet";
-        put(key_a, 10, dummy_meta());
-        put(key_b, 20, dummy_meta());
-        assert!(get(key_a, 10).is_some());
-        assert!(get(key_b, 20).is_some());
+        CACHE.put(key_a, 10, dummy_meta());
+        CACHE.put(key_b, 20, dummy_meta());
+        assert!(CACHE.get(key_a, 10).is_some());
+        assert!(CACHE.get(key_b, 20).is_some());
         // The bare store-relative path is not a key at all.
-        assert!(get("/db/tbl/data/f.parquet", 10).is_none());
+        assert!(CACHE.get("/db/tbl/data/f.parquet", 10).is_none());
     }
 
     #[test]
@@ -329,11 +436,14 @@ mod tests {
     }
 
     /// An [`ObjectStore`] that counts `get_opts` calls (all footer/data reads
-    /// funnel through it) and delegates everything else to an inner store.
+    /// funnel through it) and delegates everything else to an inner store. An
+    /// optional per-`get` `delay` widens the window in which concurrent cold
+    /// readers overlap, making the single-flight tests deterministic.
     #[derive(Debug)]
     struct CountingStore {
         inner: Arc<dyn ObjectStore>,
         gets: Arc<AtomicUsize>,
+        delay: Option<Duration>,
     }
 
     impl std::fmt::Display for CountingStore {
@@ -366,6 +476,11 @@ mod tests {
             location: &ObjectPath,
             options: GetOptions,
         ) -> OsResult<GetResult> {
+            if let Some(delay) = self.delay {
+                // Yield while "fetching" so racing cold readers pile onto the
+                // single-flight gate before the winner inserts.
+                tokio::time::sleep(delay).await;
+            }
             self.gets.fetch_add(1, Ordering::SeqCst);
             self.inner.get_opts(location, options).await
         }
@@ -424,6 +539,7 @@ mod tests {
         let counting = Arc::new(CountingStore {
             inner,
             gets: Arc::clone(&gets),
+            delay: None,
         }) as Arc<dyn ObjectStore>;
 
         // Unique prefix so the shared process cache does not collide with
@@ -455,5 +571,208 @@ mod tests {
             Arc::ptr_eq(&cold, &warm),
             "warm scan returns the cached Arc"
         );
+    }
+
+    /// Build a counting store over a freshly written parquet file, returning the
+    /// inner store (so callers can add more files), a reader factory over the
+    /// counting wrapper, the file size, and the shared `get` counter. Each `get`
+    /// sleeps `delay` so concurrent cold readers overlap deterministically.
+    async fn counting_setup(
+        path: &str,
+        delay: Option<Duration>,
+    ) -> (
+        Arc<dyn ObjectStore>,
+        Arc<DefaultParquetFileReaderFactory>,
+        u64,
+        Arc<AtomicUsize>,
+    ) {
+        let inner = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let size = write_parquet(&inner, path).await;
+        let gets = Arc::new(AtomicUsize::new(0));
+        let store = Arc::new(CountingStore {
+            inner: Arc::clone(&inner),
+            gets: Arc::clone(&gets),
+            delay,
+        }) as Arc<dyn ObjectStore>;
+        (
+            inner,
+            Arc::new(DefaultParquetFileReaderFactory::new(store)),
+            size,
+            gets,
+        )
+    }
+
+    /// Fetch `path`'s footer once through a fresh reader and return the number
+    /// of store `get`s a single metadata parse costs (1 or 2 depending on the
+    /// footer-tail read pattern). Resets the counter afterwards.
+    async fn single_fetch_cost(
+        factory: &DefaultParquetFileReaderFactory,
+        path: &str,
+        size: u64,
+        gets: &AtomicUsize,
+    ) -> usize {
+        let cache = MetadataCache::new(64 * 1024 * 1024);
+        let metrics = ExecutionPlanMetricsSet::new();
+        let mut reader = factory
+            .create_reader(0, partitioned_file(path, size), None, &metrics)
+            .unwrap();
+        cache
+            .load(
+                &mut *reader,
+                None,
+                "iceberg-rust://cost-probe/f.parquet",
+                size,
+            )
+            .await
+            .unwrap();
+        gets.swap(0, Ordering::SeqCst)
+    }
+
+    /// N concurrent cold readers of the same file collapse to exactly one
+    /// fetch+parse, and every reader receives the winner's `Arc`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_cold_reads_single_flight_one_fetch() {
+        let path = "db/tbl/data/single_flight.parquet";
+        let (_inner, factory, size, gets) =
+            counting_setup(path, Some(Duration::from_millis(25))).await;
+
+        let per_fetch = single_fetch_cost(&factory, path, size, &gets).await;
+        assert!(per_fetch >= 1, "a cold fetch must hit the store");
+
+        let cache = Arc::new(MetadataCache::new(64 * 1024 * 1024));
+        let key = "iceberg-rust://single-flight/db/tbl/data/single_flight.parquet";
+        let n = 8;
+        let mut handles = Vec::with_capacity(n);
+        for _ in 0..n {
+            let factory = Arc::clone(&factory);
+            let cache = Arc::clone(&cache);
+            handles.push(tokio::spawn(async move {
+                let metrics = ExecutionPlanMetricsSet::new();
+                let mut reader = factory
+                    .create_reader(0, partitioned_file(path, size), None, &metrics)
+                    .unwrap();
+                cache.load(&mut *reader, None, key, size).await.unwrap()
+            }));
+        }
+        let metas: Vec<Arc<ParquetMetaData>> = futures::future::join_all(handles)
+            .await
+            .into_iter()
+            .map(|joined| joined.unwrap())
+            .collect();
+
+        assert_eq!(
+            gets.load(Ordering::SeqCst),
+            per_fetch,
+            "N concurrent cold readers must trigger exactly one underlying fetch"
+        );
+        for meta in &metas[1..] {
+            assert!(
+                Arc::ptr_eq(&metas[0], meta),
+                "every reader shares the single-flight winner's Arc"
+            );
+        }
+    }
+
+    /// Concurrent cold reads of *different* files are not serialized against
+    /// each other: both complete and each file is fetched exactly once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_reads_of_different_files_are_independent() {
+        let delay = Some(Duration::from_millis(25));
+        let path_a = "db/tbl/data/independent_a.parquet";
+        let path_b = "db/tbl/data/independent_b.parquet";
+        let (inner, factory, size, gets) = counting_setup(path_a, delay).await;
+        // A second, byte-identical file in the same store: same footer layout,
+        // so the same per-fetch cost. Writes go straight to the inner store
+        // (`put` is not counted); reads still flow through the counting wrapper.
+        let size_b = write_parquet(&inner, path_b).await;
+        assert_eq!(size, size_b, "identical content must yield identical size");
+
+        let per_fetch = single_fetch_cost(&factory, path_a, size, &gets).await;
+        assert!(per_fetch >= 1);
+
+        let cache = Arc::new(MetadataCache::new(64 * 1024 * 1024));
+        let spawn_load = |path: &'static str, key: &'static str, size: u64| {
+            let factory = Arc::clone(&factory);
+            let cache = Arc::clone(&cache);
+            tokio::spawn(async move {
+                let metrics = ExecutionPlanMetricsSet::new();
+                let mut reader = factory
+                    .create_reader(0, partitioned_file(path, size), None, &metrics)
+                    .unwrap();
+                cache.load(&mut *reader, None, key, size).await.unwrap()
+            })
+        };
+        let a = spawn_load(path_a, "iceberg-rust://independent/a", size);
+        let b = spawn_load(path_b, "iceberg-rust://independent/b", size_b);
+        let (ra, rb) = tokio::join!(a, b);
+        let meta_a = ra.unwrap();
+        let meta_b = rb.unwrap();
+
+        assert_eq!(
+            gets.load(Ordering::SeqCst),
+            per_fetch * 2,
+            "two different files are fetched once each, not deduped together"
+        );
+        assert!(
+            !Arc::ptr_eq(&meta_a, &meta_b),
+            "distinct files yield distinct metadata"
+        );
+    }
+
+    /// With caching disabled (cap `0`) there is no single-flight: concurrent
+    /// cold readers of the same file each fetch independently, and the disabled
+    /// path never touches a lock.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn disabled_cache_bypasses_single_flight() {
+        let path = "db/tbl/data/disabled.parquet";
+        let (_inner, factory, size, gets) =
+            counting_setup(path, Some(Duration::from_millis(25))).await;
+
+        let cache = Arc::new(MetadataCache::new(0));
+        assert!(!cache.enabled(), "cap 0 disables the cache");
+
+        // Cost of a single fetch straight through the disabled cache.
+        let metrics = ExecutionPlanMetricsSet::new();
+        let mut probe = factory
+            .create_reader(0, partitioned_file(path, size), None, &metrics)
+            .unwrap();
+        cache
+            .load(&mut *probe, None, "iceberg-rust://disabled/probe", size)
+            .await
+            .unwrap();
+        let per_fetch = gets.swap(0, Ordering::SeqCst);
+        assert!(per_fetch >= 1);
+
+        let key = "iceberg-rust://disabled/db/tbl/data/disabled.parquet";
+        let n = 6;
+        let mut handles = Vec::with_capacity(n);
+        for _ in 0..n {
+            let factory = Arc::clone(&factory);
+            let cache = Arc::clone(&cache);
+            handles.push(tokio::spawn(async move {
+                let metrics = ExecutionPlanMetricsSet::new();
+                let mut reader = factory
+                    .create_reader(0, partitioned_file(path, size), None, &metrics)
+                    .unwrap();
+                cache.load(&mut *reader, None, key, size).await.unwrap()
+            }));
+        }
+        let metas: Vec<Arc<ParquetMetaData>> = futures::future::join_all(handles)
+            .await
+            .into_iter()
+            .map(|joined| joined.unwrap())
+            .collect();
+
+        assert_eq!(
+            gets.load(Ordering::SeqCst),
+            per_fetch * n,
+            "disabled cache: every concurrent reader fetches (no single-flight)"
+        );
+        for meta in &metas[1..] {
+            assert!(
+                !Arc::ptr_eq(&metas[0], meta),
+                "disabled cache shares nothing between readers"
+            );
+        }
     }
 }
