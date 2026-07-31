@@ -338,18 +338,25 @@ impl TableProvider for DataFusionTable {
                     .ok()
                     .flatten()?;
 
-                // Extract total-records from the snapshot summary
-                let num_rows = snapshot
-                    .summary()
-                    .other
-                    .get("total-records")
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .map(Precision::Inexact)
-                    .unwrap_or(Precision::Absent);
+                let summary_usize = |key: &str| {
+                    snapshot
+                        .summary()
+                        .other
+                        .get(key)
+                        .and_then(|s| s.parse::<usize>().ok())
+                        .map_or(Precision::Absent, Precision::Inexact)
+                };
 
+                // `total-files-size` is the sum of the data files' on-disk sizes. It is a
+                // compressed-parquet number and so understates the in-memory footprint, but it is
+                // the only byte-scale signal available without reading manifests -- and DataFusion
+                // prefers `total_byte_size` over `num_rows` when choosing a hash join's build side
+                // (`JoinSelection::should_swap_join_order`, `supports_collect_by_thresholds`).
+                // Leaving it Absent forced those decisions onto row counts alone, which misranks a
+                // narrow table against a wide one.
                 Some(datafusion::physical_plan::Statistics {
-                    num_rows,
-                    total_byte_size: Precision::Absent,
+                    num_rows: summary_usize("total-records"),
+                    total_byte_size: summary_usize("total-files-size"),
                     column_statistics: vec![],
                 })
             }
