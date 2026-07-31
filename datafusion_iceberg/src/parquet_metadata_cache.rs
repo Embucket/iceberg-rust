@@ -26,6 +26,60 @@ The cache is byte-capped LRU, weighted by each entry's
 `ICEBERG_PARQUET_METADATA_CACHE_MB` (read once per process; default 64 MiB;
 `0` disables caching entirely). Entries larger than the cap are never inserted.
 
+# Page indexes
+
+The parquet page index is not stored inline in the footer, so a plain
+`get_metadata` does not return it. DataFusion's opener therefore loads the footer
+with [`PageIndexPolicy::Skip`], and *separately* calls its own `load_page_index`
+when a page-pruning predicate exists — which rebuilds an enriched
+[`ParquetMetaData`] locally and then drops it. The enriched copy never reaches any
+cache, so **every query re-fetches and re-parses the page index of every file it
+touches**. Measured on TPC-H SF1000, metadata loading was 44 % of total
+partition-time.
+
+A cold load therefore overrides the caller's policy to
+[`PageIndexPolicy::Optional`], so the page index is fetched in the *same*
+`get_metadata` round trip and cached with the footer. The opener's
+`load_page_index` then finds both indexes already present and short-circuits
+without any I/O. The trade is one extra range read per file on first touch — paid
+back on the second query that touches the file, and wasted only on a file no
+query ever predicates over.
+
+Measured 2026-07-30/31 on the deployed service, the trade turned out to be
+**scale-dependent**, so it is now **guarded** rather than unconditional.
+
+Where the working set fits the cache it is a large win — warm `metadata_load_time`
+collapses (TPC-H SF100 Q8: **15.1 s → 0.2 s**, 75x, at a 100 % footer hit rate
+either way, because that 15.1 s was *entirely* the uncached page index). End to end
+with 2x scan partitions: **SF1 −29 %, SF10 −15 %, ClickBench −34 %, SF100 −18 %** of
+server time.
+
+Where it does not fit, it inverts. At TPC-H SF1000 the 64 MiB cache churns, so the
+extra first-touch range read is paid on nearly every load and the warm payback
+almost never arrives. Attribution on Q10, one variable at a time, same binary:
+
+| config | Q10 |
+|---|---|
+| page index off | **393 s** (baseline was 383 s) |
+| page index on, 64 MiB | 511 s (+33 %) |
+| page index on, 2048 MiB | >1860 s (killed) |
+
+Across that suite it took Q18 from 2 078 s to a 7 200 s **timeout** and Q21 +62 %.
+Raising the cap does not rescue it — it worsens it, because gigabytes of cached
+metadata inside a fixed container compete with the query budget.
+
+Hence [`PAGE_INDEX_BACKOFF_EVICTIONS`]: widening is on by default and latches off
+once the cache demonstrates, by evicting, that the working set does not fit. The
+guard is one-way and fails safe — see [`MetadataCache::note_evictions`].
+`parquet_metadata_cache_page_index_suppressed` reports when it has engaged.
+
+# Accounting
+
+Hits, misses and evictions are reported as DataFusion plan metrics on the scan
+node, so `EXPLAIN ANALYZE VERBOSE` shows them against any deployed binary with no
+wire change. Without them a thrashing cache and a cold cache are
+indistinguishable — both just look like slow metadata loading.
+
 Interception happens through a custom [`ParquetFileReaderFactory`]
 ([`CachingParquetFileReaderFactory`]) installed on every [`ParquetSource`] the
 scan builds, so both cold and warm queries flow through it. Only footer
@@ -52,6 +106,7 @@ straight through with no gate and no lock, exactly as before single-flight.
 
 use std::num::NonZeroUsize;
 use std::ops::Range;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use bytes::Bytes;
@@ -62,8 +117,8 @@ use datafusion::datasource::physical_plan::parquet::{
 use datafusion::parquet::arrow::arrow_reader::ArrowReaderOptions;
 use datafusion::parquet::arrow::async_reader::AsyncFileReader;
 use datafusion::parquet::errors::Result as ParquetResult;
-use datafusion::parquet::file::metadata::ParquetMetaData;
-use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
+use datafusion::parquet::file::metadata::{PageIndexPolicy, ParquetMetaData};
+use datafusion::physical_plan::metrics::{Count, ExecutionPlanMetricsSet, MetricBuilder};
 use futures::future::BoxFuture;
 use futures::FutureExt;
 use lru::LruCache;
@@ -78,6 +133,20 @@ const DEFAULT_CAP_MB: usize = 64;
 /// a load is still in flight only weakens de-duplication for that one file (an
 /// extra fetch), never correctness.
 const INFLIGHT_GATES_CAP: usize = 1024;
+
+/// Cumulative evictions after which cold loads stop fetching the page index.
+///
+/// Caching page indexes only pays while the metadata working set fits: the entries
+/// it produces are much larger, so once the cache is churning we pay the extra
+/// first-touch range read on nearly every load and the warm payback never arrives.
+/// Measured at TPC-H SF1000 that inversion took Q18 from 2 078 s to a 7 200 s
+/// timeout; at SF100, where nothing evicts, the same feature is a 75x cut in warm
+/// metadata load.
+///
+/// The threshold is small but non-zero so a single oversized file cannot latch the
+/// guard, and it separates the measured cases by orders of magnitude: SF100 evicts
+/// 0, SF1000 evicts 619 on one cold run.
+const PAGE_INDEX_BACKOFF_EVICTIONS: u64 = 64;
 
 /// A cached parsed footer plus the file size it was parsed from.
 struct Entry {
@@ -115,22 +184,59 @@ impl ByteCappedCache {
 
     /// Insert `entry` under `key`, evicting least-recently-used entries until
     /// the byte cap holds. Oversized payloads are skipped.
-    fn insert(&mut self, key: &str, entry: Entry) {
+    ///
+    /// Returns how many entries this insert evicted — the direct thrashing
+    /// signal. A cache that is merely cold evicts nothing; a cache that is too
+    /// small for the working set evicts on almost every insert.
+    fn insert(&mut self, key: &str, entry: Entry) -> usize {
         let weight = entry.weight;
         if weight > self.cap_bytes {
-            return;
+            return 0;
         }
         if let Some(previous) = self.entries.put(key.to_string(), entry) {
             self.total_bytes = self.total_bytes.saturating_sub(previous.weight);
         }
         self.total_bytes += weight;
+        let mut evicted = 0;
         while self.total_bytes > self.cap_bytes {
             match self.entries.pop_lru() {
-                Some((_, evicted)) => {
-                    self.total_bytes = self.total_bytes.saturating_sub(evicted.weight);
+                Some((_, entry)) => {
+                    self.total_bytes = self.total_bytes.saturating_sub(entry.weight);
+                    evicted += 1;
                 }
                 None => break,
             }
+        }
+        evicted
+    }
+}
+
+/// Per-scan cache accounting, surfaced as plan metrics so
+/// `EXPLAIN ANALYZE VERBOSE` reports it without any wire change.
+///
+/// `evictions` counts entries pushed out by *this scan's* inserts, which is what
+/// separates "cache is cold" from "cache is too small": a cold cache misses and
+/// evicts nothing, an undersized one misses and evicts in equal measure.
+#[derive(Debug, Clone)]
+struct CacheMetrics {
+    hits: Count,
+    misses: Count,
+    evictions: Count,
+    /// Cold loads that did NOT fetch the page index because the adaptive guard had
+    /// latched. Non-zero means this deployment's working set outgrew the cache and
+    /// the optimization backed itself off.
+    page_index_suppressed: Count,
+}
+
+impl CacheMetrics {
+    fn new(metrics: &ExecutionPlanMetricsSet, partition: usize) -> Self {
+        Self {
+            hits: MetricBuilder::new(metrics).counter("parquet_metadata_cache_hits", partition),
+            misses: MetricBuilder::new(metrics).counter("parquet_metadata_cache_misses", partition),
+            evictions: MetricBuilder::new(metrics)
+                .counter("parquet_metadata_cache_evictions", partition),
+            page_index_suppressed: MetricBuilder::new(metrics)
+                .counter("parquet_metadata_cache_page_index_suppressed", partition),
         }
     }
 }
@@ -150,6 +256,11 @@ struct MetadataCache {
     /// Per-file single-flight gates, keyed exactly like [`ByteCappedCache`]
     /// entries. Bounded to [`INFLIGHT_GATES_CAP`] live gates by its own LRU.
     inflight: Mutex<LruCache<String, Arc<AsyncMutex<()>>>>,
+    /// Entries evicted over the process lifetime. Drives [`page_index_backed_off`].
+    evictions: AtomicU64,
+    /// Set once cumulative evictions pass [`PAGE_INDEX_BACKOFF_EVICTIONS`], after
+    /// which cold loads stop fetching the page index. See [`page_index_backed_off`].
+    backed_off: AtomicBool,
 }
 
 impl MetadataCache {
@@ -164,6 +275,8 @@ impl MetadataCache {
             inflight: Mutex::new(LruCache::new(
                 NonZeroUsize::new(INFLIGHT_GATES_CAP).expect("INFLIGHT_GATES_CAP is non-zero"),
             )),
+            evictions: AtomicU64::new(0),
+            backed_off: AtomicBool::new(false),
         }
     }
 
@@ -181,16 +294,47 @@ impl MetadataCache {
     }
 
     /// Insert `meta` under `key`, weighted by its in-memory size. A no-op when
-    /// caching is disabled.
-    fn put(&self, key: &str, size: u64, meta: Arc<ParquetMetaData>) {
+    /// caching is disabled. Returns how many entries the insert evicted.
+    fn put(&self, key: &str, size: u64, meta: Arc<ParquetMetaData>) -> usize {
         let Some(store) = self.store.as_ref() else {
-            return;
+            return 0;
         };
-        let Ok(mut guard) = store.lock() else {
-            return;
+        let evicted = {
+            let Ok(mut guard) = store.lock() else {
+                return 0;
+            };
+            let weight = meta.memory_size();
+            guard.insert(key, Entry { size, weight, meta })
         };
-        let weight = meta.memory_size();
-        guard.insert(key, Entry { size, weight, meta });
+        if evicted > 0 {
+            self.note_evictions(evicted as u64);
+        }
+        evicted
+    }
+
+    /// Accumulate evictions and latch the page-index guard once they pass the
+    /// threshold.
+    ///
+    /// The latch is deliberately **one-way**. Backing off makes subsequent entries
+    /// footer-sized, which stops the eviction that triggered it -- so a recovering
+    /// guard would re-enable widening, grow entries, evict again, and oscillate. A
+    /// latch also fails in the safe direction: the worst case is losing an
+    /// optimization for the life of the process, never reintroducing the cliff.
+    fn note_evictions(&self, evicted: u64) {
+        let total = self.evictions.fetch_add(evicted, Ordering::Relaxed) + evicted;
+        if total > PAGE_INDEX_BACKOFF_EVICTIONS && !self.backed_off.swap(true, Ordering::Relaxed) {
+            tracing::info!(
+                target: "datafusion_iceberg::parquet_metadata_cache",
+                evictions = total,
+                threshold = PAGE_INDEX_BACKOFF_EVICTIONS,
+                "metadata working set exceeds the cache; page-index caching backed off"
+            );
+        }
+    }
+
+    /// Whether the guard has latched. Cold loads consult this before widening.
+    fn page_index_backed_off(&self) -> bool {
+        self.backed_off.load(Ordering::Relaxed)
     }
 
     /// Return the single-flight gate for `key`, creating it on first use. The
@@ -227,34 +371,99 @@ impl MetadataCache {
         options: Option<&ArrowReaderOptions>,
         key: &str,
         size: u64,
+        metrics: &CacheMetrics,
     ) -> ParquetResult<Arc<ParquetMetaData>> {
         if let Some(meta) = self.get(key, size) {
+            metrics.hits.add(1);
             return Ok(meta);
         }
         if !self.enabled() {
             // Disabled cache: no gate, no lock overhead — read straight through.
+            metrics.misses.add(1);
             return reader.get_metadata(options).await;
         }
         let gate = self.inflight_gate(key);
         let _permit = gate.lock().await;
         // The winner may have populated the cache while we waited on the gate.
         if let Some(meta) = self.get(key, size) {
+            metrics.hits.add(1);
             return Ok(meta);
         }
-        let meta = reader.get_metadata(options).await?;
-        self.put(key, size, Arc::clone(&meta));
+        metrics.misses.add(1);
+        // Fetch the page index in this same round trip when configured, so the
+        // cached entry is complete and the opener's own `load_page_index` finds
+        // nothing left to do -- but only while the working set still fits. Once the
+        // cache is churning, the extra range read is pure cost. See the module docs.
+        let widen = *CACHE_PAGE_INDEX && !self.page_index_backed_off();
+        if *CACHE_PAGE_INDEX && !widen {
+            metrics.page_index_suppressed.add(1);
+        }
+        let widened = page_index_options(options, widen);
+        let meta = reader.get_metadata(widened.as_ref().or(options)).await?;
+        metrics
+            .evictions
+            .add(self.put(key, size, Arc::clone(&meta)));
         Ok(meta)
     }
+}
+
+/// Whether cold loads should widen the caller's page-index policy so the index is
+/// fetched and cached alongside the footer. `ICEBERG_PARQUET_METADATA_CACHE_PAGE_INDEX`,
+/// read once per process, **default on** — the [`PAGE_INDEX_BACKOFF_EVICTIONS`] guard
+/// disables it automatically on deployments whose working set does not fit, so the
+/// default no longer carries the large-scale cliff. Set to `0` to disable outright.
+static CACHE_PAGE_INDEX: LazyLock<bool> = LazyLock::new(|| {
+    std::env::var("ICEBERG_PARQUET_METADATA_CACHE_PAGE_INDEX")
+        .map(|v| !matches!(v.trim(), "0" | "false" | "FALSE" | "no" | "off"))
+        .unwrap_or(true)
+});
+
+/// The caller's options with the page-index policy raised to `Optional`, or
+/// `None` to leave the caller's options untouched.
+///
+/// Returns `None` when `enabled` is false, so the disabled path is byte-identical
+/// to not having the feature at all. Everything else on the options (decryption
+/// properties, the supplied schema) is preserved by cloning rather than rebuilding.
+///
+/// `enabled` is a parameter rather than a read of [`CACHE_PAGE_INDEX`] so the
+/// policy logic is testable without a process-wide env var.
+fn page_index_options(
+    options: Option<&ArrowReaderOptions>,
+    enabled: bool,
+) -> Option<ArrowReaderOptions> {
+    if !enabled {
+        return None;
+    }
+    let base = options.cloned().unwrap_or_default();
+    // Already asking for the index: nothing to widen, and cloning would be waste.
+    if base.column_index_policy() != PageIndexPolicy::Skip
+        && base.offset_index_policy() != PageIndexPolicy::Skip
+    {
+        return None;
+    }
+    Some(base.with_page_index_policy(PageIndexPolicy::Optional))
 }
 
 /// The process-wide metadata cache. Capacity comes from
 /// `ICEBERG_PARQUET_METADATA_CACHE_MB` (read once per process; default 64 MiB;
 /// `0` disables caching and single-flight entirely).
 static CACHE: LazyLock<MetadataCache> = LazyLock::new(|| {
-    let cap_mb = std::env::var("ICEBERG_PARQUET_METADATA_CACHE_MB")
-        .ok()
+    let raw = std::env::var("ICEBERG_PARQUET_METADATA_CACHE_MB").ok();
+    let cap_mb = raw
+        .as_deref()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .unwrap_or(DEFAULT_CAP_MB);
+    // Logged on first scan, not at startup (this is a LazyLock). Worth the line:
+    // this cache ran at its 64 MiB default across every benchmarked tier because
+    // nothing set the env var and nothing reported the resolved value, so a
+    // deploy-spec typo is indistinguishable from a deliberate default.
+    tracing::info!(
+        target: "datafusion_iceberg::parquet_metadata_cache",
+        cap_mb,
+        configured = raw.is_some(),
+        page_index_cached = *CACHE_PAGE_INDEX,
+        "parquet metadata cache initialized"
+    );
     MetadataCache::new(cap_mb.saturating_mul(1024 * 1024))
 });
 
@@ -296,13 +505,19 @@ impl ParquetFileReaderFactory for CachingParquetFileReaderFactory {
             partitioned_file.object_meta.location.as_ref()
         );
         let size = partitioned_file.object_meta.size;
+        let cache_metrics = CacheMetrics::new(metrics, partition_index);
         let inner = self.inner.create_reader(
             partition_index,
             partitioned_file,
             metadata_size_hint,
             metrics,
         )?;
-        Ok(Box::new(CachingMetadataReader { inner, key, size }))
+        Ok(Box::new(CachingMetadataReader {
+            inner,
+            key,
+            size,
+            metrics: cache_metrics,
+        }))
     }
 }
 
@@ -312,6 +527,7 @@ struct CachingMetadataReader {
     inner: Box<dyn AsyncFileReader + Send>,
     key: String,
     size: u64,
+    metrics: CacheMetrics,
 }
 
 impl AsyncFileReader for CachingMetadataReader {
@@ -331,7 +547,13 @@ impl AsyncFileReader for CachingMetadataReader {
         options: Option<&'a ArrowReaderOptions>,
     ) -> BoxFuture<'a, ParquetResult<Arc<ParquetMetaData>>> {
         CACHE
-            .load(&mut *self.inner, options, &self.key, self.size)
+            .load(
+                &mut *self.inner,
+                options,
+                &self.key,
+                self.size,
+                &self.metrics,
+            )
             .boxed()
     }
 }
@@ -364,6 +586,159 @@ mod tests {
         let descr = Arc::new(SchemaDescriptor::new(Arc::new(schema)));
         let file_meta = FileMetaData::new(1, 0, None, None, descr, None);
         Arc::new(ParquetMetaData::new(file_meta, vec![]))
+    }
+
+    /// Throwaway metric handles, for `load` call sites whose test does not inspect
+    /// them. `Count` is `Arc`-backed, so the handles stay live after the set drops.
+    fn discard_metrics() -> CacheMetrics {
+        CacheMetrics::new(&ExecutionPlanMetricsSet::new(), 0)
+    }
+
+    /// The counters must separate a cold cache from an undersized one. Without
+    /// this distinction both look identical from the outside — just slow metadata
+    /// loading — which is why SF1000's 9x per-file metadata regression went
+    /// unexplained.
+    #[tokio::test]
+    async fn load_reports_hits_then_misses() {
+        let inner = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let path = "db/tbl/data/counted.parquet";
+        let size = write_parquet(&inner, path).await;
+        let factory = CachingParquetFileReaderFactory::new(inner, "iceberg-rust://counter-test/");
+        let cache = MetadataCache::new(64 * 1024 * 1024);
+        let plan_metrics = ExecutionPlanMetricsSet::new();
+        let m = CacheMetrics::new(&plan_metrics, 0);
+        let key = "iceberg-rust://counter-test/counted.parquet";
+
+        let mut reader = factory
+            .create_reader(0, partitioned_file(path, size), None, &plan_metrics)
+            .unwrap();
+        cache.load(&mut *reader, None, key, size, &m).await.unwrap();
+        assert_eq!(
+            (m.hits.value(), m.misses.value()),
+            (0, 1),
+            "cold load is a miss"
+        );
+
+        let mut reader = factory
+            .create_reader(0, partitioned_file(path, size), None, &plan_metrics)
+            .unwrap();
+        cache.load(&mut *reader, None, key, size, &m).await.unwrap();
+        assert_eq!(
+            (m.hits.value(), m.misses.value()),
+            (1, 1),
+            "warm load is a hit"
+        );
+        assert_eq!(m.evictions.value(), 0, "a cache with room evicts nothing");
+    }
+
+    /// An undersized cache reports evictions, which is the thrashing signal a
+    /// merely-cold cache does not produce.
+    #[test]
+    fn insert_reports_how_many_entries_it_evicted() {
+        let mut cache = ByteCappedCache::new(1000);
+        assert_eq!(cache.insert("a", entry(1, 600)), 0, "fits, evicts nothing");
+        // 600 + 600 > 1000, so inserting b must push a out.
+        assert_eq!(
+            cache.insert("b", entry(1, 600)),
+            1,
+            "over cap, evicts the LRU"
+        );
+        assert_eq!(cache.total_bytes, 600);
+        assert!(cache.lookup("a", 1).is_none(), "a was the evicted entry");
+    }
+
+    /// A cold cache with room must NOT latch: cold misses are the normal case and
+    /// backing off there would disable the optimization exactly when it pays.
+    #[test]
+    fn a_cache_with_room_never_backs_off() {
+        let cache = MetadataCache::new(64 * 1024 * 1024);
+        for i in 0..500 {
+            cache.put(&format!("k{i}"), 1, dummy_meta());
+        }
+        assert!(
+            !cache.page_index_backed_off(),
+            "no eviction, so no back-off"
+        );
+        assert_eq!(cache.evictions.load(Ordering::Relaxed), 0);
+    }
+
+    /// A cache too small for its working set latches, and stays latched: recovery
+    /// would oscillate, because backing off is what stops the eviction.
+    #[test]
+    fn a_churning_cache_backs_off_and_stays_backed_off() {
+        // Room for ~2 entries, so almost every insert evicts.
+        let cache = MetadataCache::new(2_000);
+        for i in 0..(PAGE_INDEX_BACKOFF_EVICTIONS + 20) {
+            let meta = dummy_meta();
+            let weight = meta.memory_size().max(900);
+            let Some(store) = cache.store.as_ref() else {
+                unreachable!()
+            };
+            let evicted = store.lock().unwrap().insert(
+                &format!("k{i}"),
+                Entry {
+                    size: 1,
+                    weight,
+                    meta,
+                },
+            );
+            cache.note_evictions(evicted as u64);
+        }
+        assert!(
+            cache.page_index_backed_off(),
+            "a churning cache must back off; evictions={}",
+            cache.evictions.load(Ordering::Relaxed)
+        );
+        // Latched state survives further quiet activity -- one-way by design.
+        cache.note_evictions(0);
+        assert!(cache.page_index_backed_off(), "the latch must not clear");
+    }
+
+    /// Below the threshold a transient eviction must not disable the feature.
+    #[test]
+    fn a_single_eviction_does_not_latch() {
+        let cache = MetadataCache::new(64 * 1024 * 1024);
+        cache.note_evictions(1);
+        assert!(!cache.page_index_backed_off());
+        cache.note_evictions(PAGE_INDEX_BACKOFF_EVICTIONS - 1);
+        assert!(
+            !cache.page_index_backed_off(),
+            "still at the threshold, not past it"
+        );
+        cache.note_evictions(1);
+        assert!(
+            cache.page_index_backed_off(),
+            "one past the threshold latches"
+        );
+    }
+
+    #[test]
+    fn page_index_widening_is_inert_when_disabled() {
+        assert!(
+            page_index_options(None, false).is_none(),
+            "disabled must leave the caller's options untouched"
+        );
+        let skip = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Skip);
+        assert!(page_index_options(Some(&skip), false).is_none());
+    }
+
+    #[test]
+    fn page_index_widening_requests_the_index_when_enabled() {
+        let skip = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Skip);
+        let widened = page_index_options(Some(&skip), true).expect("should widen a Skip policy");
+        assert_eq!(widened.column_index_policy(), PageIndexPolicy::Optional);
+        assert_eq!(widened.offset_index_policy(), PageIndexPolicy::Optional);
+        // The opener passes Skip explicitly, so `None` must widen too.
+        let from_none = page_index_options(None, true).expect("should widen absent options");
+        assert_eq!(from_none.column_index_policy(), PageIndexPolicy::Optional);
+    }
+
+    /// A caller already asking for the index needs no widening, and cloning its
+    /// options would be pure waste on every cold load.
+    #[test]
+    fn page_index_widening_skips_a_caller_that_already_asked() {
+        let already = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Required);
+        assert!(page_index_options(Some(&already), true).is_none());
     }
 
     fn entry(size: u64, weight: usize) -> Entry {
@@ -622,6 +997,7 @@ mod tests {
                 None,
                 "iceberg-rust://cost-probe/f.parquet",
                 size,
+                &discard_metrics(),
             )
             .await
             .unwrap();
@@ -651,7 +1027,10 @@ mod tests {
                 let mut reader = factory
                     .create_reader(0, partitioned_file(path, size), None, &metrics)
                     .unwrap();
-                cache.load(&mut *reader, None, key, size).await.unwrap()
+                cache
+                    .load(&mut *reader, None, key, size, &discard_metrics())
+                    .await
+                    .unwrap()
             }));
         }
         let metas: Vec<Arc<ParquetMetaData>> = futures::future::join_all(handles)
@@ -699,7 +1078,10 @@ mod tests {
                 let mut reader = factory
                     .create_reader(0, partitioned_file(path, size), None, &metrics)
                     .unwrap();
-                cache.load(&mut *reader, None, key, size).await.unwrap()
+                cache
+                    .load(&mut *reader, None, key, size, &discard_metrics())
+                    .await
+                    .unwrap()
             })
         };
         let a = spawn_load(path_a, "iceberg-rust://independent/a", size);
@@ -737,7 +1119,13 @@ mod tests {
             .create_reader(0, partitioned_file(path, size), None, &metrics)
             .unwrap();
         cache
-            .load(&mut *probe, None, "iceberg-rust://disabled/probe", size)
+            .load(
+                &mut *probe,
+                None,
+                "iceberg-rust://disabled/probe",
+                size,
+                &discard_metrics(),
+            )
             .await
             .unwrap();
         let per_fetch = gets.swap(0, Ordering::SeqCst);
@@ -754,7 +1142,10 @@ mod tests {
                 let mut reader = factory
                     .create_reader(0, partitioned_file(path, size), None, &metrics)
                     .unwrap();
-                cache.load(&mut *reader, None, key, size).await.unwrap()
+                cache
+                    .load(&mut *reader, None, key, size, &discard_metrics())
+                    .await
+                    .unwrap()
             }));
         }
         let metas: Vec<Arc<ParquetMetaData>> = futures::future::join_all(handles)
