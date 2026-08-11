@@ -1071,12 +1071,15 @@ fn generate_partitioned_file(
         version: None,
     };
     let file = PartitionedFile {
+        // Per-file hint wins over the source-level one in the opener; without it the
+        // parquet reader prefetches an 8-byte tail and every cold metadata load costs
+        // 2-3 sequential ranged GETs instead of one.
+        metadata_size_hint: crate::parquet_metadata_cache::metadata_size_hint(object_meta.size),
         object_meta,
         partition_values,
         range: None,
         statistics: Some(Arc::new(manifest_statistics)),
         extensions: None,
-        metadata_size_hint: None,
         ordering: None,
     };
     Ok(file)

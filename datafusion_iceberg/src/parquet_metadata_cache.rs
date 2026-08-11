@@ -172,6 +172,12 @@ impl ByteCappedCache {
         }
     }
 
+    /// Current `(entry count, total bytes)` — the working-set measurement that
+    /// sizes the cap per deployment.
+    fn stats(&self) -> (usize, usize) {
+        (self.entries.len(), self.total_bytes)
+    }
+
     /// Return the cached metadata for `key`, touching its LRU position, but
     /// only if the stored size matches `size`. A size mismatch is a stale
     /// stamp and is reported as a miss.
@@ -261,6 +267,8 @@ struct MetadataCache {
     /// Set once cumulative evictions pass [`PAGE_INDEX_BACKOFF_EVICTIONS`], after
     /// which cold loads stop fetching the page index. See [`page_index_backed_off`].
     backed_off: AtomicBool,
+    /// Inserts over the process lifetime; drives the periodic working-set log.
+    inserts: AtomicU64,
 }
 
 impl MetadataCache {
@@ -277,7 +285,15 @@ impl MetadataCache {
             )),
             evictions: AtomicU64::new(0),
             backed_off: AtomicBool::new(false),
+            inserts: AtomicU64::new(0),
         }
+    }
+
+    /// Current `(entry count, total bytes)` of the store, `None` when disabled.
+    fn stats(&self) -> Option<(usize, usize)> {
+        let store = self.store.as_ref()?;
+        let guard = store.lock().ok()?;
+        Some(guard.stats())
     }
 
     /// Whether caching (and therefore single-flight) is active.
@@ -309,6 +325,22 @@ impl MetadataCache {
         if evicted > 0 {
             self.note_evictions(evicted as u64);
         }
+        // Periodic working-set snapshot: mean entry weight × distinct files is
+        // what sizes the cap per node, and nothing else reports it.
+        let inserts = self.inserts.fetch_add(1, Ordering::Relaxed) + 1;
+        if inserts.is_multiple_of(4096) {
+            if let Some((entries, total_bytes)) = self.stats() {
+                tracing::info!(
+                    target: "datafusion_iceberg::parquet_metadata_cache",
+                    inserts,
+                    entries,
+                    total_bytes,
+                    mean_entry_bytes = total_bytes.checked_div(entries).unwrap_or(0),
+                    evictions = self.evictions.load(Ordering::Relaxed),
+                    "parquet metadata cache working-set snapshot"
+                );
+            }
+        }
         evicted
     }
 
@@ -323,10 +355,14 @@ impl MetadataCache {
     fn note_evictions(&self, evicted: u64) {
         let total = self.evictions.fetch_add(evicted, Ordering::Relaxed) + evicted;
         if total > PAGE_INDEX_BACKOFF_EVICTIONS && !self.backed_off.swap(true, Ordering::Relaxed) {
+            let (entries, total_bytes) = self.stats().unwrap_or((0, 0));
             tracing::info!(
                 target: "datafusion_iceberg::parquet_metadata_cache",
                 evictions = total,
                 threshold = PAGE_INDEX_BACKOFF_EVICTIONS,
+                entries,
+                total_bytes,
+                mean_entry_bytes = total_bytes.checked_div(entries).unwrap_or(0),
                 "metadata working set exceeds the cache; page-index caching backed off"
             );
         }
@@ -418,6 +454,41 @@ static CACHE_PAGE_INDEX: LazyLock<bool> = LazyLock::new(|| {
         .unwrap_or(true)
 });
 
+/// Per-file metadata prefetch hint in bytes, from
+/// `ICEBERG_PARQUET_METADATA_SIZE_HINT_KB` (read once per process; absent or
+/// `0` disables the hint — the shipped default, byte-identical to before).
+///
+/// Without a hint the parquet reader prefetches only the 8-byte footer tail, so
+/// every cold metadata load costs two sequential ranged GETs (tail probe, then
+/// footer body) plus a third for the page index. A hint that covers
+/// footer + page index turns all three into one suffix GET whose retained
+/// remainder serves the index ranges with no further fetch.
+static METADATA_SIZE_HINT: LazyLock<Option<usize>> = LazyLock::new(|| {
+    parse_metadata_size_hint_kb(
+        std::env::var("ICEBERG_PARQUET_METADATA_SIZE_HINT_KB")
+            .ok()
+            .as_deref(),
+    )
+});
+
+fn parse_metadata_size_hint_kb(raw: Option<&str>) -> Option<usize> {
+    let kb = raw?.trim().parse::<usize>().ok()?;
+    (kb > 0).then(|| kb.saturating_mul(1024))
+}
+
+/// The configured metadata prefetch hint clamped to `file_size`, for stamping
+/// onto a `PartitionedFile`. `None` when the hint is unconfigured.
+pub(crate) fn metadata_size_hint(file_size: u64) -> Option<usize> {
+    clamp_metadata_size_hint(*METADATA_SIZE_HINT, file_size)
+}
+
+/// Split from [`metadata_size_hint`] so the clamp is testable without the
+/// process-wide env var.
+fn clamp_metadata_size_hint(hint: Option<usize>, file_size: u64) -> Option<usize> {
+    let hint = hint?;
+    Some(hint.min(usize::try_from(file_size).unwrap_or(usize::MAX)))
+}
+
 /// The caller's options with the page-index policy raised to `Optional`, or
 /// `None` to leave the caller's options untouched.
 ///
@@ -462,6 +533,7 @@ static CACHE: LazyLock<MetadataCache> = LazyLock::new(|| {
         cap_mb,
         configured = raw.is_some(),
         page_index_cached = *CACHE_PAGE_INDEX,
+        metadata_size_hint_bytes = *METADATA_SIZE_HINT,
         "parquet metadata cache initialized"
     );
     MetadataCache::new(cap_mb.saturating_mul(1024 * 1024))
@@ -1165,5 +1237,64 @@ mod tests {
                 "disabled cache shares nothing between readers"
             );
         }
+    }
+
+    #[test]
+    fn metadata_size_hint_parses_and_clamps() {
+        assert_eq!(parse_metadata_size_hint_kb(None), None);
+        assert_eq!(parse_metadata_size_hint_kb(Some("0")), None, "0 disables");
+        assert_eq!(parse_metadata_size_hint_kb(Some("garbage")), None);
+        assert_eq!(parse_metadata_size_hint_kb(Some("512")), Some(512 * 1024));
+        assert_eq!(parse_metadata_size_hint_kb(Some(" 64 ")), Some(64 * 1024));
+
+        assert_eq!(clamp_metadata_size_hint(None, 1_000), None);
+        assert_eq!(
+            clamp_metadata_size_hint(Some(512 * 1024), 1_000),
+            Some(1_000),
+            "hint never exceeds the file"
+        );
+        assert_eq!(
+            clamp_metadata_size_hint(Some(1_000), 512 * 1024),
+            Some(1_000)
+        );
+    }
+
+    /// The mechanism the hint exists for: with a suffix hint covering
+    /// footer + page index, a cold metadata load (page index included) costs
+    /// exactly ONE store GET; without it the reader probes the 8-byte tail
+    /// first and pays per piece.
+    #[tokio::test]
+    async fn size_hint_collapses_cold_metadata_load_to_one_get() {
+        let path = "db/tbl/data/hint.parquet";
+        let (_inner, factory, size, gets) = counting_setup(path, None).await;
+        let widened =
+            ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Optional);
+
+        let mut reader = factory
+            .create_reader(
+                0,
+                partitioned_file(path, size),
+                None,
+                &ExecutionPlanMetricsSet::new(),
+            )
+            .unwrap();
+        reader.get_metadata(Some(&widened)).await.unwrap();
+        let unhinted = gets.swap(0, Ordering::SeqCst);
+        assert!(
+            unhinted >= 2,
+            "unhinted cold load pays multiple GETs, saw {unhinted}"
+        );
+
+        let mut reader = factory
+            .create_reader(
+                0,
+                partitioned_file(path, size),
+                Some(size as usize),
+                &ExecutionPlanMetricsSet::new(),
+            )
+            .unwrap();
+        reader.get_metadata(Some(&widened)).await.unwrap();
+        let hinted = gets.swap(0, Ordering::SeqCst);
+        assert_eq!(hinted, 1, "hinted cold load must be a single suffix GET");
     }
 }
