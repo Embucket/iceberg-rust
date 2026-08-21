@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use arrow::datatypes::Schema;
+use arrow_schema::Schema;
 use datafusion_common::DataFusionError;
 use datafusion_sql::{
     planner::SqlToRel,

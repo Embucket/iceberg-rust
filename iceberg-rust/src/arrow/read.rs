@@ -22,12 +22,13 @@ use crate::error::Error;
 
 use iceberg_rust_spec::spec::manifest::{FileFormat, ManifestEntry};
 
-/// A minimal [`AsyncFileReader`] over a data file in an [`ObjectStore`].
-///
-/// Iceberg always knows a data file's size up front (it is tracked in the
-/// manifest entry), so unlike a general-purpose object-store reader this
-/// implementation never needs to fall back to suffix range requests to
-/// locate the Parquet footer.
+// A minimal [`AsyncFileReader`] over a data file in an [`ObjectStore`].
+//
+// Iceberg always knows a data file's size up front (it is tracked in the
+// manifest entry), so unlike a general-purpose object-store reader this
+// implementation never needs to fall back to suffix range requests to
+// locate the Parquet footer.
+// TODO: Consider wrapping this with `parquet::arrow::async_reader::SpawnedReader` at some point.
 struct DataFileReader {
     object_store: Arc<dyn ObjectStore>,
     path: Path,

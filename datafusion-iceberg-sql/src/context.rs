@@ -1,6 +1,6 @@
 use std::{collections::HashMap, sync::Arc};
 
-use arrow::datatypes::DataType;
+use arrow_schema::DataType;
 use datafusion_common::{config::ConfigOptions, DataFusionError, TableReference};
 use datafusion_execution::FunctionRegistry;
 use datafusion_expr::{

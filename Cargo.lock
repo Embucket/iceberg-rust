@@ -2488,7 +2488,7 @@ dependencies = [
 name = "datafusion-iceberg-sql"
 version = "0.10.0"
 dependencies = [
- "arrow 59.2.0",
+ "arrow-schema 59.2.0",
  "datafusion-common",
  "datafusion-execution",
  "datafusion-expr",
@@ -3798,7 +3798,7 @@ name = "iceberg-rust-spec"
 version = "0.10.0"
 dependencies = [
  "apache-avro",
- "arrow 59.2.0",
+ "arrow-schema 59.2.0",
  "chrono",
  "derive-getters",
  "derive_builder",
