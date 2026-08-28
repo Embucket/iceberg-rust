@@ -319,6 +319,7 @@ impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
             deleted_rows_count: Some(0),
             partitions: None,
             key_metadata: None,
+            first_row_id: None,
         };
 
         Ok(ManifestWriter {
@@ -819,7 +820,13 @@ fn avro_value_to_manifest_entry(
     let partition_spec = &value.1 .1;
     let format_version = &value.1 .2;
     match format_version {
-        FormatVersion::V2 | FormatVersion::V3 => ManifestEntry::try_from_v2(
+        FormatVersion::V3 => ManifestEntry::try_from_v3(
+            apache_avro::from_value::<ManifestEntryV2>(&entry)?,
+            schema,
+            partition_spec,
+        )
+        .map_err(Error::from),
+        FormatVersion::V2 => ManifestEntry::try_from_v2(
             apache_avro::from_value::<ManifestEntryV2>(&entry)?,
             schema,
             partition_spec,

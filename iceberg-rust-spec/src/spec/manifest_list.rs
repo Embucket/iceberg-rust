@@ -66,6 +66,8 @@ pub struct ManifestListEntry {
     pub partitions: Option<Vec<FieldSummary>>,
     /// Implementation-specific key metadata for encryption
     pub key_metadata: Option<ByteBuf>,
+    /// First row ID assigned to newly added rows in this Iceberg v3 data manifest.
+    pub first_row_id: Option<i64>,
 }
 
 /// Entry in manifest file.
@@ -145,6 +147,9 @@ mod _serde {
         pub partitions: Option<Vec<FieldSummarySerde>>,
         /// Implementation-specific key metadata for encryption
         pub key_metadata: Option<ByteBuf>,
+        /// First row ID assigned to newly added rows in this manifest.
+        #[serde(default)]
+        pub first_row_id: Option<i64>,
     }
 
     #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
@@ -227,6 +232,7 @@ mod _serde {
                     .partitions
                     .map(|v| v.into_iter().map(Into::into).collect()),
                 key_metadata: value.key_metadata,
+                first_row_id: value.first_row_id,
             }
         }
     }
@@ -314,6 +320,7 @@ impl ManifestListEntry {
                 })
                 .transpose()?,
             key_metadata: entry.key_metadata,
+            first_row_id: entry.first_row_id,
         })
     }
 
@@ -358,6 +365,7 @@ impl ManifestListEntry {
                 })
                 .transpose()?,
             key_metadata: entry.key_metadata,
+            first_row_id: None,
         })
     }
 }
@@ -654,6 +662,15 @@ pub fn manifest_list_schema_v2() -> &'static AvroSchema {
                     ],
                     "default": null,
                     "field-id": 519
+                },
+                {
+                    "name": "first_row_id",
+                    "type": [
+                        "null",
+                        "long"
+                    ],
+                    "default": null,
+                    "field-id": 520
                 }
             ]
         }
@@ -755,6 +772,7 @@ mod tests {
                 upper_bound: Some(Value::Int(76890)),
             }]),
             key_metadata: None,
+            first_row_id: None,
         };
 
         let schema = manifest_list_schema_v2();
@@ -830,6 +848,7 @@ mod tests {
                 upper_bound: Some(Value::Int(76890)),
             }]),
             key_metadata: None,
+            first_row_id: None,
         };
 
         let schema = manifest_list_schema_v1();

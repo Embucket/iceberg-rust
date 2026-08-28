@@ -424,8 +424,8 @@ pub mod _serde {
             partition::{PartitionField, PartitionSpec},
             schema,
             snapshot::{
-                SnapshotReference, SnapshotRetention,
-                _serde::{SnapshotV1, SnapshotV2},
+                Snapshot, SnapshotReference, SnapshotRetention,
+                _serde::{SnapshotV1, SnapshotV2, SnapshotV3},
             },
             sort,
         },
@@ -480,9 +480,9 @@ pub mod _serde {
         /// Current snapshot ID.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub current_snapshot_id: Option<i64>,
-        /// Snapshots. V3 row-lineage fields are accepted as unknown fields by SnapshotV2.
+        /// Snapshots with required Iceberg v3 row-lineage fields.
         #[serde(skip_serializing_if = "Option::is_none")]
-        pub snapshots: Option<Vec<SnapshotV2>>,
+        pub snapshots: Option<Vec<SnapshotV3>>,
         /// Snapshot log.
         #[serde(skip_serializing_if = "Vec::is_empty", default)]
         pub snapshot_log: Vec<SnapshotLog>,
@@ -675,6 +675,14 @@ pub mod _serde {
 
         fn try_from(value: TableMetadataV3) -> Result<Self, Error> {
             let next_row_id = value.next_row_id;
+            let snapshots = value
+                .snapshots
+                .unwrap_or_default()
+                .into_iter()
+                .map(Into::<Snapshot>::into)
+                .collect::<Vec<_>>();
+            let snapshots_v2 = (!snapshots.is_empty())
+                .then(|| snapshots.iter().cloned().map(Into::into).collect());
             let mut metadata: TableMetadata = TableMetadataV2 {
                 format_version: VersionNumber::<2>,
                 table_uuid: value.table_uuid,
@@ -689,7 +697,7 @@ pub mod _serde {
                 last_partition_id: value.last_partition_id,
                 properties: value.properties,
                 current_snapshot_id: value.current_snapshot_id,
-                snapshots: value.snapshots,
+                snapshots: snapshots_v2,
                 snapshot_log: value.snapshot_log,
                 metadata_log: value.metadata_log,
                 sort_orders: value.sort_orders,
@@ -699,6 +707,10 @@ pub mod _serde {
             .try_into()?;
             metadata.format_version = FormatVersion::V3;
             metadata.next_row_id = next_row_id;
+            metadata.snapshots = snapshots
+                .into_iter()
+                .map(|snapshot| (*snapshot.snapshot_id(), snapshot))
+                .collect();
             Ok(metadata)
         }
     }
