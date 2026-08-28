@@ -180,7 +180,7 @@ mod _serde {
     impl From<ManifestListEntry> for ManifestListEntryEnum {
         fn from(value: ManifestListEntry) -> Self {
             match &value.format_version {
-                FormatVersion::V2 => ManifestListEntryEnum::V2(value.into()),
+                FormatVersion::V2 | FormatVersion::V3 => ManifestListEntryEnum::V2(value.into()),
                 FormatVersion::V1 => ManifestListEntryEnum::V1(value.into()),
             }
         }
@@ -678,6 +678,14 @@ pub fn avro_value_to_manifest_list_entry(
             apache_avro::from_value::<_serde::ManifestListEntryV2>(&entry)?,
             table_metadata,
         ),
+        FormatVersion::V3 => {
+            let mut entry = ManifestListEntry::try_from_v2(
+                apache_avro::from_value::<_serde::ManifestListEntryV2>(&entry)?,
+                table_metadata,
+            )?;
+            entry.format_version = FormatVersion::V3;
+            Ok(entry)
+        }
     }
 }
 

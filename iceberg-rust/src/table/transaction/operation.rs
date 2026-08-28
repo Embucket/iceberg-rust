@@ -128,6 +128,12 @@ impl Operation {
         table_metadata: &TableMetadata,
         object_store: Arc<dyn ObjectStore>,
     ) -> Result<(Option<TableRequirement>, Vec<TableUpdate>), Error> {
+        if table_metadata.format_version == FormatVersion::V3 {
+            return Err(Error::NotSupported(
+                "writes to Iceberg v3 tables".to_string(),
+            ));
+        }
+
         match self {
             Operation::AppendSequenceGroups {
                 branch,
@@ -137,7 +143,7 @@ impl Operation {
 
                 let manifest_list_schema = match table_metadata.format_version {
                     FormatVersion::V1 => manifest_list_schema_v1(),
-                    FormatVersion::V2 => manifest_list_schema_v2(),
+                    FormatVersion::V2 | FormatVersion::V3 => manifest_list_schema_v2(),
                 };
 
                 let n_data_files = sequence_groups.iter().map(|d| d.data_files.len()).sum();
@@ -302,7 +308,7 @@ impl Operation {
 
                 let manifest_list_schema = match table_metadata.format_version {
                     FormatVersion::V1 => manifest_list_schema_v1(),
-                    FormatVersion::V2 => manifest_list_schema_v2(),
+                    FormatVersion::V2 | FormatVersion::V3 => manifest_list_schema_v2(),
                 };
 
                 let n_data_files = data_files.len();
@@ -487,7 +493,7 @@ impl Operation {
 
                 let manifest_list_schema = match table_metadata.format_version {
                     FormatVersion::V1 => manifest_list_schema_v1(),
-                    FormatVersion::V2 => manifest_list_schema_v2(),
+                    FormatVersion::V2 | FormatVersion::V3 => manifest_list_schema_v2(),
                 };
 
                 let mut manifest_list_writer =
@@ -651,7 +657,7 @@ impl Operation {
 
                 let manifest_list_schema = match table_metadata.format_version {
                     FormatVersion::V1 => manifest_list_schema_v1(),
-                    FormatVersion::V2 => manifest_list_schema_v2(),
+                    FormatVersion::V2 | FormatVersion::V3 => manifest_list_schema_v2(),
                 };
 
                 let n_data_files = data_files.len();
@@ -1327,6 +1333,15 @@ mod tests {
         let metadata = sample_metadata(&[(1, 1_000)], Some(1), &[]);
         let result = execute_operation(&metadata, None, None, true, false);
         assert!(matches!(result, Err(Error::InvalidFormat(_))));
+    }
+
+    #[test]
+    fn v3_writes_are_rejected_until_row_lineage_is_supported() {
+        let mut metadata = sample_metadata(&[(1, 1_000)], Some(1), &[]);
+        metadata.format_version = FormatVersion::V3;
+
+        let result = execute_operation(&metadata, Some(2_000), None, true, false);
+        assert!(matches!(result, Err(Error::NotSupported(_))));
     }
 
     #[test]

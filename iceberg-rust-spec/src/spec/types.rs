@@ -41,6 +41,8 @@ pub enum Type {
     List(ListType),
     /// Map type
     Map(MapType),
+    /// Semi-structured Variant type. This is an Iceberg v3 feature.
+    Variant(VariantType),
 }
 
 impl fmt::Display for Type {
@@ -50,6 +52,51 @@ impl fmt::Display for Type {
             Type::Struct(_) => write!(f, "struct"),
             Type::List(_) => write!(f, "list"),
             Type::Map(_) => write!(f, "map"),
+            Type::Variant(_) => write!(f, "variant"),
+        }
+    }
+}
+
+/// Semi-structured data encoded using the Parquet Variant binary format.
+///
+/// Variant is neither a primitive nor a nested Iceberg type and is available
+/// only for Iceberg v3 tables.
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
+pub struct VariantType;
+
+impl fmt::Display for VariantType {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "variant")
+    }
+}
+
+impl From<VariantType> for Type {
+    fn from(_: VariantType) -> Self {
+        Type::Variant(VariantType)
+    }
+}
+
+impl Serialize for VariantType {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str("variant")
+    }
+}
+
+impl<'de> Deserialize<'de> for VariantType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        if value == "variant" {
+            Ok(VariantType)
+        } else {
+            Err(D::Error::custom(format!(
+                "expected 'variant', got '{value}'"
+            )))
         }
     }
 }
@@ -498,6 +545,11 @@ mod tests {
         let raw_json_value = serde_json::from_str::<serde_json::Value>(json).unwrap();
 
         assert_eq!(parsed_json_value, raw_json_value);
+    }
+
+    #[test]
+    fn variant() {
+        check_type_serde(r#""variant""#, Type::Variant(VariantType));
     }
 
     #[test]

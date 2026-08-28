@@ -156,7 +156,7 @@ pub struct ManifestEntryV1 {
 impl From<ManifestEntry> for ManifestEntryEnum {
     fn from(value: ManifestEntry) -> Self {
         match value.format_version {
-            FormatVersion::V2 => ManifestEntryEnum::V2(value.into()),
+            FormatVersion::V2 | FormatVersion::V3 => ManifestEntryEnum::V2(value.into()),
             FormatVersion::V1 => ManifestEntryEnum::V1(value.into()),
         }
     }
@@ -228,7 +228,7 @@ impl ManifestEntry {
             ]
         }"#
             }
-            FormatVersion::V2 => {
+            FormatVersion::V2 | FormatVersion::V3 => {
                 let datafile_schema = DataFileV2::schema(partition_schema);
                 r#"{
             "type": "record",

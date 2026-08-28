@@ -220,6 +220,7 @@ impl TryInto<TableMetadata> for CreateTable {
             )]),
             default_sort_order_id: DEFAULT_SORT_ORDER_ID,
             refs: HashMap::new(),
+            next_row_id: 0,
         })
     }
 }

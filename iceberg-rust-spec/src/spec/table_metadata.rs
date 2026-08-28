@@ -50,7 +50,7 @@ pub const WRITE_DATA_PATH: &str = "write.data.path";
 pub const WRITE_METADATA_METRICS_DISTINCT_COUNTS_ENABLED: &str =
     "write.metadata.metrics.distinct-counts.enabled";
 
-pub use _serde::{TableMetadataV1, TableMetadataV2};
+pub use _serde::{TableMetadataV1, TableMetadataV2, TableMetadataV3};
 
 use _serde::TableMetadataEnum;
 
@@ -144,6 +144,9 @@ pub struct TableMetadata {
     /// even if the refs map is null.
     #[builder(default)]
     pub refs: HashMap<String, SnapshotReference>,
+    /// Next row id assigned by Iceberg v3 row lineage.
+    #[builder(default)]
+    pub next_row_id: u64,
 }
 
 impl TableMetadata {
@@ -421,8 +424,8 @@ pub mod _serde {
             partition::{PartitionField, PartitionSpec},
             schema,
             snapshot::{
-                _serde::{SnapshotV1, SnapshotV2},
                 SnapshotReference, SnapshotRetention,
+                _serde::{SnapshotV1, SnapshotV2},
             },
             sort,
         },
@@ -437,10 +440,64 @@ pub mod _serde {
     #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
     #[serde(untagged)]
     pub(super) enum TableMetadataEnum {
+        /// Version 3 of the table metadata
+        V3(TableMetadataV3),
         /// Version 2 of the table metadata
         V2(TableMetadataV2),
         /// Version 1 of the table metadata
         V1(TableMetadataV1),
+    }
+
+    #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "kebab-case")]
+    /// Fields for version 3 table metadata used by this implementation.
+    pub struct TableMetadataV3 {
+        /// Integer Version for the format.
+        pub format_version: VersionNumber<3>,
+        /// A UUID that identifies the table
+        pub table_uuid: Uuid,
+        /// Location tables base location
+        pub location: String,
+        /// The tables highest sequence number
+        pub last_sequence_number: i64,
+        /// Timestamp in milliseconds from the unix epoch when the table was last updated.
+        pub last_updated_ms: i64,
+        /// An integer; the highest assigned column ID for the table.
+        pub last_column_id: i32,
+        /// A list of schemas, stored as objects with schema-id.
+        pub schemas: Vec<schema::SchemaV2>,
+        /// ID of the table's current schema.
+        pub current_schema_id: i32,
+        /// A list of partition specs.
+        pub partition_specs: Vec<PartitionSpec>,
+        /// ID of the current partition spec.
+        pub default_spec_id: i32,
+        /// Highest assigned partition field ID.
+        pub last_partition_id: i32,
+        /// Table properties.
+        #[serde(skip_serializing_if = "HashMap::is_empty", default)]
+        pub properties: HashMap<String, String>,
+        /// Current snapshot ID.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub current_snapshot_id: Option<i64>,
+        /// Snapshots. V3 row-lineage fields are accepted as unknown fields by SnapshotV2.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub snapshots: Option<Vec<SnapshotV2>>,
+        /// Snapshot log.
+        #[serde(skip_serializing_if = "Vec::is_empty", default)]
+        pub snapshot_log: Vec<SnapshotLog>,
+        /// Metadata log.
+        #[serde(skip_serializing_if = "Vec::is_empty", default)]
+        pub metadata_log: Vec<MetadataLog>,
+        /// Sort orders.
+        pub sort_orders: Vec<sort::SortOrder>,
+        /// Default sort order ID.
+        pub default_sort_order_id: i32,
+        /// Snapshot references.
+        #[serde(skip_serializing_if = "HashMap::is_empty", default)]
+        pub refs: HashMap<String, SnapshotReference>,
+        /// Next row ID for row lineage.
+        pub next_row_id: u64,
     }
 
     #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -596,6 +653,7 @@ pub mod _serde {
         type Error = Error;
         fn try_from(value: TableMetadataEnum) -> Result<Self, Error> {
             match value {
+                TableMetadataEnum::V3(value) => value.try_into(),
                 TableMetadataEnum::V2(value) => value.try_into(),
                 TableMetadataEnum::V1(value) => value.try_into(),
             }
@@ -605,9 +663,43 @@ pub mod _serde {
     impl From<TableMetadata> for TableMetadataEnum {
         fn from(value: TableMetadata) -> Self {
             match value.format_version {
+                FormatVersion::V3 => TableMetadataEnum::V3(value.into()),
                 FormatVersion::V2 => TableMetadataEnum::V2(value.into()),
                 FormatVersion::V1 => TableMetadataEnum::V1(value.into()),
             }
+        }
+    }
+
+    impl TryFrom<TableMetadataV3> for TableMetadata {
+        type Error = Error;
+
+        fn try_from(value: TableMetadataV3) -> Result<Self, Error> {
+            let next_row_id = value.next_row_id;
+            let mut metadata: TableMetadata = TableMetadataV2 {
+                format_version: VersionNumber::<2>,
+                table_uuid: value.table_uuid,
+                location: value.location,
+                last_sequence_number: value.last_sequence_number,
+                last_updated_ms: value.last_updated_ms,
+                last_column_id: value.last_column_id,
+                schemas: value.schemas,
+                current_schema_id: value.current_schema_id,
+                partition_specs: value.partition_specs,
+                default_spec_id: value.default_spec_id,
+                last_partition_id: value.last_partition_id,
+                properties: value.properties,
+                current_snapshot_id: value.current_snapshot_id,
+                snapshots: value.snapshots,
+                snapshot_log: value.snapshot_log,
+                metadata_log: value.metadata_log,
+                sort_orders: value.sort_orders,
+                default_sort_order_id: value.default_sort_order_id,
+                refs: value.refs,
+            }
+            .try_into()?;
+            metadata.format_version = FormatVersion::V3;
+            metadata.next_row_id = next_row_id;
+            Ok(metadata)
         }
     }
 
@@ -667,6 +759,7 @@ pub mod _serde {
                 ),
                 default_sort_order_id: value.default_sort_order_id,
                 refs,
+                next_row_id: 0,
             })
         }
     }
@@ -769,6 +862,7 @@ pub mod _serde {
                         },
                     },
                 )]),
+                next_row_id: 0,
             })
         }
     }
@@ -795,6 +889,33 @@ pub mod _serde {
                 sort_orders: v.sort_orders.into_values().collect(),
                 default_sort_order_id: v.default_sort_order_id,
                 refs: v.refs,
+            }
+        }
+    }
+
+    impl From<TableMetadata> for TableMetadataV3 {
+        fn from(v: TableMetadata) -> Self {
+            TableMetadataV3 {
+                format_version: VersionNumber::<3>,
+                table_uuid: v.table_uuid,
+                location: v.location,
+                last_sequence_number: v.last_sequence_number,
+                last_updated_ms: v.last_updated_ms,
+                last_column_id: v.last_column_id,
+                schemas: v.schemas.into_values().map(Into::into).collect(),
+                current_schema_id: v.current_schema_id,
+                partition_specs: v.partition_specs.into_values().collect(),
+                default_spec_id: v.default_spec_id,
+                last_partition_id: v.last_partition_id,
+                properties: v.properties,
+                current_snapshot_id: v.current_snapshot_id,
+                snapshots: Some(v.snapshots.into_values().map(Into::into).collect()),
+                snapshot_log: v.snapshot_log,
+                metadata_log: v.metadata_log,
+                sort_orders: v.sort_orders.into_values().collect(),
+                default_sort_order_id: v.default_sort_order_id,
+                refs: v.refs,
+                next_row_id: v.next_row_id,
             }
         }
     }
@@ -887,6 +1008,8 @@ pub enum FormatVersion {
     /// Iceberg spec version 2
     #[default]
     V2 = b'2',
+    /// Iceberg spec version 3
+    V3 = b'3',
 }
 
 impl TryFrom<u8> for FormatVersion {
@@ -895,6 +1018,7 @@ impl TryFrom<u8> for FormatVersion {
         match value {
             1 => Ok(FormatVersion::V1),
             2 => Ok(FormatVersion::V2),
+            3 => Ok(FormatVersion::V3),
             _ => Err(Error::Conversion(
                 "u8".to_string(),
                 "format version".to_string(),
@@ -908,6 +1032,7 @@ impl From<FormatVersion> for u8 {
         match value {
             FormatVersion::V1 => b'1',
             FormatVersion::V2 => b'2',
+            FormatVersion::V3 => b'3',
         }
     }
 }
@@ -917,6 +1042,7 @@ impl From<FormatVersion> for i32 {
         match value {
             FormatVersion::V1 => 1,
             FormatVersion::V2 => 2,
+            FormatVersion::V3 => 3,
         }
     }
 }
@@ -936,7 +1062,7 @@ mod tests {
             snapshot::{Operation, SnapshotBuilder, SnapshotReference, SnapshotRetention, Summary},
             sort::{NullOrder, SortDirection, SortField, SortOrderBuilder},
             table_metadata::TableMetadata,
-            types::{PrimitiveType, StructField, Type},
+            types::{PrimitiveType, StructField, Type, VariantType},
         },
     };
 
@@ -950,6 +1076,49 @@ mod tests {
         let parsed_json_value = serde_json::from_str::<TableMetadata>(&sered_json).unwrap();
 
         assert_eq!(parsed_json_value, desered_type);
+    }
+
+    #[test]
+    fn test_table_metadata_v3_with_variant() {
+        let input = r#"
+        {
+          "format-version": 3,
+          "table-uuid": "9c12d441-03fe-4693-9a96-a0705ddf69c1",
+          "location": "s3://bucket/test/variant",
+          "last-sequence-number": 0,
+          "last-updated-ms": 1602638573590,
+          "last-column-id": 1,
+          "current-schema-id": 0,
+          "schemas": [{
+            "type": "struct",
+            "schema-id": 0,
+            "fields": [{
+              "id": 1,
+              "name": "payload",
+              "required": false,
+              "type": "variant"
+            }]
+          }],
+          "default-spec-id": 0,
+          "partition-specs": [{"spec-id": 0, "fields": []}],
+          "last-partition-id": 0,
+          "default-sort-order-id": 0,
+          "sort-orders": [{"order-id": 0, "fields": []}],
+          "next-row-id": 0
+        }
+        "#;
+
+        let metadata: TableMetadata = serde_json::from_str(input).unwrap();
+        assert_eq!(metadata.format_version, FormatVersion::V3);
+        assert_eq!(metadata.next_row_id, 0);
+        assert_eq!(
+            metadata.current_schema(None).unwrap().fields()[0].field_type,
+            Type::Variant(VariantType)
+        );
+
+        let output = serde_json::to_value(metadata).unwrap();
+        assert_eq!(output["format-version"], 3);
+        assert_eq!(output["schemas"][0]["fields"][0]["type"], "variant");
     }
 
     #[test]
@@ -1295,6 +1464,7 @@ mod tests {
                     },
                 },
             )]),
+            next_row_id: 0,
         };
 
         check_table_metadata_serde(&metadata, expected);
@@ -1373,6 +1543,7 @@ mod tests {
             snapshot_log: vec![],
             metadata_log: Vec::new(),
             refs: HashMap::new(),
+            next_row_id: 0,
         };
 
         check_table_metadata_serde(&metadata, expected);
@@ -1444,6 +1615,7 @@ mod tests {
                     },
                 },
             )]),
+            next_row_id: 0,
         };
 
         check_table_metadata_serde(&metadata, expected);
