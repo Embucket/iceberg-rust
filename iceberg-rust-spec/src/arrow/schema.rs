@@ -168,8 +168,8 @@ impl TryFrom<&Type> for DataType {
                 false,
             )),
             Type::Variant(_) => Ok(DataType::Struct(Fields::from(vec![
-                Field::new("metadata", DataType::Binary, false),
-                Field::new("value", DataType::Binary, true),
+                Field::new("metadata", DataType::BinaryView, false),
+                Field::new("value", DataType::BinaryView, true),
             ]))),
         }
     }
@@ -951,8 +951,8 @@ mod tests {
         assert_eq!(
             payload.data_type(),
             &DataType::Struct(Fields::from(vec![
-                Field::new("metadata", DataType::Binary, false),
-                Field::new("value", DataType::Binary, true),
+                Field::new("metadata", DataType::BinaryView, false),
+                Field::new("value", DataType::BinaryView, true),
             ]))
         );
 
@@ -972,8 +972,8 @@ mod tests {
     #[test]
     fn test_new_fields_with_ids_preserves_variant_extension() {
         let storage = DataType::Struct(Fields::from(vec![
-            Field::new("metadata", DataType::Binary, false),
-            Field::new("value", DataType::Binary, true),
+            Field::new("metadata", DataType::BinaryView, false),
+            Field::new("value", DataType::BinaryView, true),
         ]));
         let variant = Field::new("payload", storage, true).with_metadata(HashMap::from([(
             ARROW_EXTENSION_TYPE_NAME_KEY.to_string(),
