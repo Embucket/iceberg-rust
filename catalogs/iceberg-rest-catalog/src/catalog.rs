@@ -343,10 +343,16 @@ impl Catalog for RestCatalog {
             )),
             Err(apis::Error::ResponseError(content)) => {
                 if content.status == 404 {
-                    let headers = HashMap::from([(
-                        "X-Iceberg-Access-Delegation".to_owned(),
-                        "vended-credentials".to_owned(),
-                    )]);
+                    let headers = configuration
+                        .access_delegation
+                        .as_ref()
+                        .map(|value| {
+                            HashMap::from([(
+                                "X-Iceberg-Access-Delegation".to_owned(),
+                                value.clone(),
+                            )])
+                        })
+                        .unwrap_or_default();
 
                     let response = catalog_api_api::load_table(
                         &configuration,
@@ -398,7 +404,7 @@ impl Catalog for RestCatalog {
             self.name.as_deref(),
             &identifier.namespace().to_string(),
             create_table,
-            None,
+            configuration.access_delegation.as_deref(),
         )
         .map_err(Into::<Error>::into)
         .await?;
@@ -724,6 +730,7 @@ pub mod tests {
             base_path: url.to_owned(),
             user_agent: None,
             client: reqwest::Client::new(),
+            access_delegation: None,
             basic_auth: None,
             oauth_access_token: None,
             bearer_access_token: None,
