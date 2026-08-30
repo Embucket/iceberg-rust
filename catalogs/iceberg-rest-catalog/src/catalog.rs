@@ -328,12 +328,17 @@ impl Catalog for RestCatalog {
         // Tables dominate every workload, so try loadTable first and fall
         // back to loadView on 404 — the previous order paid a wasted
         // loadView round-trip (always a 404) for every table load.
+        let headers = configuration
+            .access_delegation
+            .as_ref()
+            .map(|value| HashMap::from([("X-Iceberg-Access-Delegation".to_owned(), value.clone())]))
+            .unwrap_or_default();
         let table_response = catalog_api_api::load_table(
             &configuration,
             self.name.as_deref(),
             &identifier.namespace().to_string(),
             identifier.name(),
-            configuration.access_delegation.as_deref(),
+            headers,
             None,
         )
         .await;
