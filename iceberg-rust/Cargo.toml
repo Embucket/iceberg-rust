@@ -45,6 +45,7 @@ uuid = { workspace = true }
 rstest = "0.26.1"
 chrono = { workspace = true }
 iceberg-sql-catalog = { path = "../catalogs/iceberg-sql-catalog" }
+parquet-variant-json = "59"
 
 [features]
 test-utils = []

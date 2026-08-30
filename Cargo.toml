@@ -39,7 +39,7 @@ lazy_static = "1.5.0"
 lru = "0.18.0"
 object_store = { version = "0.13", features = ["aws", "gcp", "azure"] }
 murmur3 = { version = "0.5.2" }
-parquet = { version = "59", features = ["async", "object_store"] }
+parquet = { version = "59", features = ["async", "object_store", "variant_experimental"] }
 pin-project-lite = "0.2"
 regex = "1.11.1"
 rust_decimal = "1.42.0"

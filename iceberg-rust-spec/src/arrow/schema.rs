@@ -2,7 +2,7 @@
  * Convert between datafusion and iceberg schema
 */
 
-use std::{collections::HashMap, convert::TryInto, ops::Deref, sync::Arc};
+use std::{collections::HashMap, convert::TryInto, sync::Arc};
 
 use crate::{
     spec::types::{PrimitiveType, StructField, StructType, Type},
@@ -13,6 +13,40 @@ use arrow_schema::{DataType, Field, Fields, Schema as ArrowSchema, TimeUnit};
 use crate::error::Error;
 
 pub const PARQUET_FIELD_ID_META_KEY: &str = "PARQUET:field_id";
+pub const ARROW_EXTENSION_TYPE_NAME_KEY: &str = "ARROW:extension:name";
+pub const PARQUET_VARIANT_EXTENSION_NAME: &str = "arrow.parquet.variant";
+
+fn is_variant(field_type: &Type) -> bool {
+    matches!(field_type, Type::Primitive(PrimitiveType::Variant))
+}
+
+fn arrow_field(
+    name: &str,
+    field_type: &Type,
+    nullable: bool,
+    mut metadata: HashMap<String, String>,
+) -> Result<Field, Error> {
+    if is_variant(field_type) {
+        metadata.insert(
+            ARROW_EXTENSION_TYPE_NAME_KEY.to_string(),
+            PARQUET_VARIANT_EXTENSION_NAME.to_string(),
+        );
+    }
+    Ok(Field::new(name, field_type.try_into()?, nullable).with_metadata(metadata))
+}
+
+fn iceberg_type(field: &Field) -> Result<Type, Error> {
+    if field.extension_type_name() == Some(PARQUET_VARIANT_EXTENSION_NAME) {
+        if !matches!(field.data_type(), DataType::Struct(_)) {
+            return Err(Error::NotSupported(format!(
+                "Arrow {PARQUET_VARIANT_EXTENSION_NAME} extension requires Struct storage"
+            )));
+        }
+        Ok(Type::Primitive(PrimitiveType::Variant))
+    } else {
+        field.data_type().try_into()
+    }
+}
 
 impl TryInto<ArrowSchema> for &StructType {
     type Error = Error;
@@ -31,15 +65,12 @@ impl TryInto<Fields> for &StructType {
         let fields = self
             .iter()
             .map(|field| {
-                Ok(Field::new(
+                arrow_field(
                     &field.name,
-                    (&field.field_type).try_into()?,
+                    &field.field_type,
                     !field.required,
+                    HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), field.id.to_string())]),
                 )
-                .with_metadata(HashMap::from_iter(vec![(
-                    PARQUET_FIELD_ID_META_KEY.to_string(),
-                    field.id.to_string(),
-                )])))
             })
             .collect::<Result<_, Error>>()?;
         Ok(fields)
@@ -65,7 +96,7 @@ impl TryFrom<&Fields> for StructType {
                     id: get_field_id(field)?,
                     name: field.name().to_owned(),
                     required: !field.is_nullable(),
-                    field_type: field.data_type().try_into()?,
+                    field_type: iceberg_type(field)?,
                     doc: None,
                     initial_default: None,
                     write_default: None,
@@ -106,42 +137,45 @@ impl TryFrom<&Type> for DataType {
                 PrimitiveType::Uuid => Ok(DataType::Utf8),
                 PrimitiveType::Fixed(len) => Ok(DataType::FixedSizeBinary(*len as i32)),
                 PrimitiveType::Binary => Ok(DataType::Binary),
-                PrimitiveType::Variant
-                | PrimitiveType::Geometry(_)
-                | PrimitiveType::Geography(_, _) => Ok(DataType::Binary),
+                PrimitiveType::Variant => Ok(DataType::Struct(Fields::from(vec![
+                    Field::new("metadata", DataType::BinaryView, false),
+                    Field::new("value", DataType::BinaryView, true),
+                ]))),
+                PrimitiveType::Geometry(_) | PrimitiveType::Geography(_, _) => Ok(DataType::Binary),
                 PrimitiveType::Unknown => Ok(DataType::Null),
             },
-            Type::List(list) => Ok(DataType::List(Arc::new(
-                Field::new(
-                    "item",
-                    (&list.element as &Type).try_into()?,
-                    !list.element_required,
-                )
-                .with_metadata(HashMap::from_iter(vec![(
+            Type::List(list) => Ok(DataType::List(Arc::new(arrow_field(
+                "item",
+                &list.element,
+                !list.element_required,
+                HashMap::from([(
                     PARQUET_FIELD_ID_META_KEY.to_string(),
                     list.element_id.to_string(),
-                )])),
-            ))),
+                )]),
+            )?))),
             Type::Struct(struc) => Ok(DataType::Struct(struc.try_into()?)),
             Type::Map(map) => Ok(DataType::Map(
                 Arc::new(Field::new(
                     "entries",
                     DataType::Struct(Fields::from(vec![
-                        Field::new("key", (&map.key as &Type).try_into()?, false).with_metadata(
-                            HashMap::from_iter(vec![(
+                        arrow_field(
+                            "key",
+                            &map.key,
+                            false,
+                            HashMap::from([(
                                 PARQUET_FIELD_ID_META_KEY.to_string(),
                                 map.key_id.to_string(),
                             )]),
-                        ),
-                        Field::new(
+                        )?,
+                        arrow_field(
                             "value",
-                            (&map.value as &Type).try_into()?,
+                            &map.value,
                             !map.value_required,
-                        )
-                        .with_metadata(HashMap::from_iter(vec![(
-                            PARQUET_FIELD_ID_META_KEY.to_string(),
-                            map.value_id.to_string(),
-                        )])),
+                            HashMap::from([(
+                                PARQUET_FIELD_ID_META_KEY.to_string(),
+                                map.value_id.to_string(),
+                            )]),
+                        )?,
                     ])),
                     false,
                 )),
@@ -186,7 +220,7 @@ impl TryFrom<&DataType> for Type {
             DataType::List(field) => Ok(Type::List(ListType {
                 element_id: get_field_id(field)?,
                 element_required: !field.is_nullable(),
-                element: Box::new(field.data_type().try_into()?),
+                element: Box::new(iceberg_type(field)?),
             })),
             x => Err(Error::NotSupported(format!(
                 "Arrow datatype {x} is not supported."
@@ -210,40 +244,41 @@ pub fn new_fields_with_ids(fields: &Fields, index: &mut i32) -> Fields {
         .into_iter()
         .map(|field| {
             let id = resolve_field_id(field, index);
+            let with_field_id = |field: Field, source: &Field, id: i32| {
+                let mut metadata = source.metadata().clone();
+                metadata.insert(PARQUET_FIELD_ID_META_KEY.to_string(), id.to_string());
+                field.with_metadata(metadata)
+            };
+
+            if field.extension_type_name() == Some(PARQUET_VARIANT_EXTENSION_NAME) {
+                return with_field_id(field.as_ref().clone(), field, id);
+            }
+
             match field.data_type() {
-                DataType::Struct(fields) => Field::new(
-                    field.name(),
-                    DataType::Struct(new_fields_with_ids(fields, index)),
-                    field.is_nullable(),
-                )
-                .with_metadata(HashMap::from_iter(vec![(
-                    PARQUET_FIELD_ID_META_KEY.to_string(),
-                    id.to_string(),
-                )])),
-                DataType::List(list_field) => {
-                    let element_id = resolve_field_id(list_field, index);
+                DataType::Struct(fields) => with_field_id(
                     Field::new(
                         field.name(),
-                        DataType::List(Arc::new(list_field.deref().clone().with_metadata(
-                            HashMap::from_iter(vec![(
-                                PARQUET_FIELD_ID_META_KEY.to_string(),
-                                element_id.to_string(),
-                            )]),
-                        ))),
+                        DataType::Struct(new_fields_with_ids(fields, index)),
                         field.is_nullable(),
+                    ),
+                    field,
+                    id,
+                ),
+                DataType::List(list_field) => {
+                    let element_id = resolve_field_id(list_field, index);
+                    let element =
+                        with_field_id(list_field.as_ref().clone(), list_field, element_id);
+                    with_field_id(
+                        Field::new(
+                            field.name(),
+                            DataType::List(Arc::new(element)),
+                            field.is_nullable(),
+                        ),
+                        field,
+                        id,
                     )
-                    .with_metadata(HashMap::from_iter(vec![(
-                        PARQUET_FIELD_ID_META_KEY.to_string(),
-                        id.to_string(),
-                    )]))
                 }
-                _ => field
-                    .deref()
-                    .clone()
-                    .with_metadata(HashMap::from_iter(vec![(
-                        PARQUET_FIELD_ID_META_KEY.to_string(),
-                        id.to_string(),
-                    )])),
+                _ => with_field_id(field.as_ref().clone(), field, id),
             }
         })
         .collect()
@@ -269,6 +304,59 @@ fn resolve_field_id(field: &Field, index: &mut i32) -> i32 {
 mod tests {
     use super::*;
     use crate::spec::types::MapType;
+
+    #[test]
+    fn variant_arrow_schema_roundtrip() {
+        let iceberg = StructType::new(vec![StructField::new(
+            1,
+            "payload",
+            false,
+            Type::Primitive(PrimitiveType::Variant),
+            None,
+        )]);
+        let arrow: ArrowSchema = (&iceberg).try_into().unwrap();
+        let payload = arrow.field_with_name("payload").unwrap();
+        assert_eq!(
+            payload.extension_type_name(),
+            Some(PARQUET_VARIANT_EXTENSION_NAME)
+        );
+        assert_eq!(
+            payload.data_type(),
+            &DataType::Struct(Fields::from(vec![
+                Field::new("metadata", DataType::BinaryView, false),
+                Field::new("value", DataType::BinaryView, true),
+            ]))
+        );
+        assert_eq!(StructType::try_from(&arrow).unwrap(), iceberg);
+    }
+
+    #[test]
+    fn assigning_ids_preserves_variant_extension() {
+        let variant = Field::new(
+            "payload",
+            DataType::Struct(Fields::from(vec![
+                Field::new("metadata", DataType::BinaryView, false),
+                Field::new("value", DataType::BinaryView, true),
+            ])),
+            true,
+        )
+        .with_metadata(HashMap::from([(
+            ARROW_EXTENSION_TYPE_NAME_KEY.to_string(),
+            PARQUET_VARIANT_EXTENSION_NAME.to_string(),
+        )]));
+        let fields = new_fields_with_ids(&Fields::from(vec![variant]), &mut 0);
+        assert_eq!(get_field_id(&fields[0]).unwrap(), 1);
+        assert_eq!(
+            fields[0].extension_type_name(),
+            Some(PARQUET_VARIANT_EXTENSION_NAME)
+        );
+        let DataType::Struct(storage) = fields[0].data_type() else {
+            panic!("expected Variant struct storage");
+        };
+        assert!(storage
+            .iter()
+            .all(|field| !field.metadata().contains_key(PARQUET_FIELD_ID_META_KEY)));
+    }
 
     #[test]
     fn test_struct_type_to_arrow_schema_simple() {

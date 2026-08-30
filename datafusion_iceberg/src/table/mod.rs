@@ -880,9 +880,7 @@ async fn table_scan(
                             )?;
 
                             let mut delete_source = ParquetSource::new(delete_file_schema)
-                                .with_parquet_file_reader_factory(
-                                    parquet_reader_factory.clone(),
-                                );
+                                .with_parquet_file_reader_factory(parquet_reader_factory.clone());
                             if let Some(predicate) = delete_physical_predicate {
                                 delete_source = delete_source
                                     .with_predicate(predicate)
