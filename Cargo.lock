@@ -2710,6 +2710,7 @@ dependencies = [
  "lru",
  "object_store",
  "parquet",
+ "parquet-variant-compute",
  "pin-project-lite",
  "pyo3",
  "regex",
