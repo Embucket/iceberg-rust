@@ -22,6 +22,7 @@ iceberg-rust = { path = "../iceberg-rust", version = "0.10.0" }
 itertools = { workspace = true }
 lru = { workspace = true }
 object_store = { workspace = true }
+parquet-variant-compute = "58"
 pin-project-lite = "0.2.17"
 regex = { workspace = true }
 serde_json = { workspace = true }

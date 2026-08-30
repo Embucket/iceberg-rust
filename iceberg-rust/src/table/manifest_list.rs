@@ -344,6 +344,7 @@ pub(crate) struct ManifestListWriter<'schema, 'metadata> {
     commit_uuid: String,
     manifest_count: usize,
     branch: Option<String>,
+    next_row_id: Option<u64>,
 }
 
 impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
@@ -407,6 +408,8 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
             commit_uuid,
             manifest_count: 0,
             branch: branch.map(ToOwned::to_owned),
+            next_row_id: (table_metadata.format_version == FormatVersion::V3)
+                .then_some(table_metadata.next_row_id),
         })
     }
 
@@ -475,6 +478,35 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
 
         let mut writer = AvroWriter::new(schema, Vec::new());
 
+        if table_metadata.format_version == FormatVersion::V3 {
+            let mut file_count_all_entries = 0usize;
+            for manifest in manifest_list_reader {
+                let manifest = manifest?;
+                let file_count = manifest
+                    .added_files_count
+                    .unwrap_or(0)
+                    .checked_add(manifest.existing_files_count.unwrap_or(0))
+                    .ok_or_else(|| Error::InvalidFormat("manifest file count".to_string()))?;
+                file_count_all_entries = file_count_all_entries
+                    .checked_add(file_count.try_into()?)
+                    .ok_or_else(|| Error::InvalidFormat("manifest file count".to_string()))?;
+                writer.append_ser(manifest)?;
+            }
+
+            return Ok(Self {
+                table_metadata,
+                writer,
+                selected_data_manifest: None,
+                selected_delete_manifest: None,
+                bounding_partition_values,
+                n_existing_files: file_count_all_entries,
+                commit_uuid,
+                manifest_count: 0,
+                branch: branch.map(ToOwned::to_owned),
+                next_row_id: Some(table_metadata.next_row_id),
+            });
+        }
+
         let SelectedManifest {
             data_manifest,
             delete_manifest,
@@ -499,6 +531,7 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
             commit_uuid,
             manifest_count: 0,
             branch: branch.map(ToOwned::to_owned),
+            next_row_id: None,
         })
     }
 
@@ -603,6 +636,7 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
                 commit_uuid,
                 manifest_count: 0,
                 branch: branch.map(ToOwned::to_owned),
+                next_row_id: None,
             },
             manifests,
         ))
@@ -889,7 +923,7 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
         }
 
         let (manifest, future) = manifest_writer.finish_concurrently(object_store.clone())?;
-        self.writer.append_ser(manifest)?;
+        self.append_new_manifest(manifest)?;
 
         Ok((future, filtered_stats))
     }
@@ -1178,7 +1212,7 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
             .collect::<Result<(Vec<_>, Vec<_>), _>>()?;
 
         for manifest in manifests {
-            self.writer.append_ser(manifest)?;
+            self.append_new_manifest(manifest)?;
         }
 
         let future = futures::future::try_join_all(manifest_futures).map_ok(|_| ());
@@ -1190,7 +1224,7 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
         mut self,
         snapshot_id: i64,
         object_store: Arc<dyn ObjectStore>,
-    ) -> Result<String, Error> {
+    ) -> Result<(String, Option<u64>), Error> {
         if let Some(selected_data_manifest) = self.selected_data_manifest.take() {
             self.writer.append_ser(selected_data_manifest)?;
         }
@@ -1215,7 +1249,7 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
             )
             .await?;
 
-        Ok(new_manifest_list_location)
+        Ok((new_manifest_list_location, self.next_row_id))
     }
 
     /// Processes manifests for overwrite operations by filtering out specific data files.
@@ -1342,13 +1376,29 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
             removed_stats
                 .filtered_entries
                 .extend(filtered_stats.filtered_entries);
-            self.writer.append_ser(manifest)?;
+            self.append_new_manifest(manifest)?;
         }
         Ok(removed_stats)
     }
 
     pub(crate) fn selected_data_manifest(&self) -> Option<&ManifestListEntry> {
         self.selected_data_manifest.as_ref()
+    }
+
+    fn append_new_manifest(&mut self, mut manifest: ManifestListEntry) -> Result<(), Error> {
+        if manifest.content == Content::Data {
+            if let Some(next_row_id) = self.next_row_id.as_mut() {
+                let added_rows = u64::try_from(manifest.added_rows_count.unwrap_or(0))?;
+                if added_rows > 0 {
+                    manifest.first_row_id = Some(i64::try_from(*next_row_id)?);
+                    *next_row_id = next_row_id
+                        .checked_add(added_rows)
+                        .ok_or_else(|| Error::InvalidFormat("next row id overflow".to_string()))?;
+                }
+            }
+        }
+        self.writer.append_ser(manifest)?;
+        Ok(())
     }
 
     /// Get the next manifest location, tracking and numbering preceding manifests written by this
