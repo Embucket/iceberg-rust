@@ -37,7 +37,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 use tokio::sync::mpsc::{self};
-use tracing::instrument;
+use tracing::{instrument, Instrument};
 
 use crate::statistics::statistics_from_datafiles;
 use crate::variant_schema_adapter::IcebergPhysicalExprAdapterFactory;
@@ -58,7 +58,11 @@ use datafusion::{
     common::{not_impl_err, plan_err, runtime::SpawnedTask, DataFusionError, SchemaExt},
     config::TableParquetOptions,
     datasource::{
-        file_format::{parquet::ParquetSink, write::demux::DemuxedStreamReceiver},
+        file_format::{
+            parquet::{ParquetFormat, ParquetSink},
+            write::demux::DemuxedStreamReceiver,
+            FileFormat,
+        },
         listing::PartitionedFile,
         object_store::ObjectStoreUrl,
         physical_plan::{
@@ -1719,11 +1723,10 @@ mod tests {
     /// through `ParquetFormat::create_physical_plan`) replaces the factory.
     fn count_caching_parquet_sources(plan: &dyn ExecutionPlan) -> usize {
         let mut found = 0;
-        if let Some(exec) = plan.as_any().downcast_ref::<DataSourceExec>() {
-            if let Some(config) = exec.data_source().as_any().downcast_ref::<FileScanConfig>() {
+        if let Some(exec) = plan.downcast_ref::<DataSourceExec>() {
+            if let Some(config) = exec.data_source().downcast_ref::<FileScanConfig>() {
                 let source = config
                     .file_source()
-                    .as_any()
                     .downcast_ref::<ParquetSource>()
                     .expect("iceberg scan file source should be a ParquetSource");
                 let factory = source
@@ -1759,6 +1762,8 @@ mod tests {
                 required: true,
                 field_type: Type::Primitive(PrimitiveType::Long),
                 doc: None,
+                initial_default: None,
+                write_default: None,
             })
             .build()
             .unwrap();

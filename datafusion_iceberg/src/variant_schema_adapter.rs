@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::fmt::{self, Display};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -83,7 +82,7 @@ impl PhysicalExprAdapter for IcebergPhysicalExprAdapter {
         }
 
         expr.transform_up(|expr| {
-            let Some(column) = expr.as_any().downcast_ref::<Column>() else {
+            let Some(column) = expr.downcast_ref::<Column>() else {
                 return Ok(Transformed::no(expr));
             };
 
@@ -149,10 +148,6 @@ impl Display for UnshredVariantExpr {
 }
 
 impl PhysicalExpr for UnshredVariantExpr {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn data_type(&self, _input_schema: &Schema) -> Result<DataType> {
         Ok(self.target_field.data_type().clone())
     }
@@ -259,7 +254,7 @@ mod tests {
         };
         assert_eq!(output.data_type(), target_field.data_type());
         let variant = VariantArray::try_new(output.as_ref())?;
-        assert!(variant.typed_value_field().is_none());
+        assert!(variant.typed_value_column().is_none());
         assert_eq!(format!("{:?}", variant.try_value(0)?), "BooleanTrue");
         Ok(())
     }
