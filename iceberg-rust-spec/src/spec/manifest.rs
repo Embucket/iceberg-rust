@@ -102,6 +102,16 @@ impl ManifestEntry {
         })
     }
 
+    pub fn try_from_v3(
+        value: ManifestEntryV2,
+        schema: &Schema,
+        partition_spec: &PartitionSpec,
+    ) -> Result<Self, Error> {
+        let mut entry = Self::try_from_v2(value, schema, partition_spec)?;
+        entry.format_version = FormatVersion::V3;
+        Ok(entry)
+    }
+
     pub fn try_from_v1(
         value: ManifestEntryV1,
         schema: &Schema,
@@ -156,7 +166,7 @@ pub struct ManifestEntryV1 {
 impl From<ManifestEntry> for ManifestEntryEnum {
     fn from(value: ManifestEntry) -> Self {
         match value.format_version {
-            FormatVersion::V2 => ManifestEntryEnum::V2(value.into()),
+            FormatVersion::V2 | FormatVersion::V3 => ManifestEntryEnum::V2(value.into()),
             FormatVersion::V1 => ManifestEntryEnum::V1(value.into()),
         }
     }
@@ -228,7 +238,7 @@ impl ManifestEntry {
             ]
         }"#
             }
-            FormatVersion::V2 => {
+            FormatVersion::V2 | FormatVersion::V3 => {
                 let datafile_schema = DataFileV2::schema(partition_schema);
                 r#"{
             "type": "record",
@@ -546,6 +556,18 @@ pub struct DataFile {
     /// ID representing sort order for this file
     #[builder(default)]
     sort_order_id: Option<i32>,
+    /// First row ID stored directly on this data file, if not inherited from its manifest.
+    #[builder(default)]
+    first_row_id: Option<i64>,
+    /// Data file referenced by a position-delete file or deletion vector.
+    #[builder(default)]
+    referenced_data_file: Option<String>,
+    /// Offset of deletion-vector content in its container file.
+    #[builder(default)]
+    content_offset: Option<i64>,
+    /// Length of deletion-vector content in bytes.
+    #[builder(default)]
+    content_size_in_bytes: Option<i64>,
 }
 
 impl DataFile {
@@ -586,6 +608,10 @@ impl DataFile {
             split_offsets: value.split_offsets,
             equality_ids: value.equality_ids,
             sort_order_id: value.sort_order_id,
+            first_row_id: value.first_row_id,
+            referenced_data_file: value.referenced_data_file,
+            content_offset: value.content_offset,
+            content_size_in_bytes: value.content_size_in_bytes,
         })
     }
 
@@ -620,6 +646,10 @@ impl DataFile {
             split_offsets: value.split_offsets,
             equality_ids: None,
             sort_order_id: value.sort_order_id,
+            first_row_id: None,
+            referenced_data_file: None,
+            content_offset: None,
+            content_size_in_bytes: None,
         })
     }
 }
@@ -661,6 +691,14 @@ pub struct DataFileV2 {
     pub equality_ids: Option<Vec<i32>>,
     /// ID representing sort order for this file
     pub sort_order_id: Option<i32>,
+    /// First row ID stored directly on this data file.
+    pub first_row_id: Option<i64>,
+    /// Data file referenced by this delete file.
+    pub referenced_data_file: Option<String>,
+    /// Offset of content in the referenced container.
+    pub content_offset: Option<i64>,
+    /// Length of content in bytes.
+    pub content_size_in_bytes: Option<i64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
@@ -724,6 +762,10 @@ impl From<DataFile> for DataFileV2 {
             split_offsets: value.split_offsets,
             equality_ids: value.equality_ids,
             sort_order_id: value.sort_order_id,
+            first_row_id: value.first_row_id,
+            referenced_data_file: value.referenced_data_file,
+            content_offset: value.content_offset,
+            content_size_in_bytes: value.content_size_in_bytes,
         }
     }
 }
@@ -773,6 +815,10 @@ impl From<DataFileV1> for DataFileV2 {
             split_offsets: v1.split_offsets,
             equality_ids: None,
             sort_order_id: v1.sort_order_id,
+            first_row_id: None,
+            referenced_data_file: None,
+            content_offset: None,
+            content_size_in_bytes: None,
         }
     }
 }
@@ -1350,6 +1396,30 @@ impl DataFileV2 {
                     ],
                     "default": null,
                     "field-id": 140
+                },
+                {
+                    "name": "first_row_id",
+                    "type": ["null", "long"],
+                    "default": null,
+                    "field-id": 142
+                },
+                {
+                    "name": "referenced_data_file",
+                    "type": ["null", "string"],
+                    "default": null,
+                    "field-id": 143
+                },
+                {
+                    "name": "content_offset",
+                    "type": ["null", "long"],
+                    "default": null,
+                    "field-id": 144
+                },
+                {
+                    "name": "content_size_in_bytes",
+                    "type": ["null", "long"],
+                    "default": null,
+                    "field-id": 145
                 }
             ]
         }"#
@@ -1420,6 +1490,10 @@ mod tests {
                 split_offsets: None,
                 equality_ids: None,
                 sort_order_id: None,
+                first_row_id: None,
+                referenced_data_file: None,
+                content_offset: None,
+                content_size_in_bytes: None,
             },
         };
 
@@ -1541,6 +1615,10 @@ mod tests {
                 split_offsets: None,
                 equality_ids: None,
                 sort_order_id: None,
+                first_row_id: None,
+                referenced_data_file: None,
+                content_offset: None,
+                content_size_in_bytes: None,
             },
         };
 

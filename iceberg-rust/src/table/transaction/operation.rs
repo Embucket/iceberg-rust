@@ -128,6 +128,17 @@ impl Operation {
         table_metadata: &TableMetadata,
         object_store: Arc<dyn ObjectStore>,
     ) -> Result<(Option<TableRequirement>, Vec<TableUpdate>), Error> {
+        if table_metadata.format_version == FormatVersion::V3
+            && matches!(
+                &self,
+                Operation::Replace { .. } | Operation::Overwrite { .. }
+            )
+        {
+            return Err(Error::NotSupported(
+                "Iceberg v3 manifest rewrites with row lineage".to_string(),
+            ));
+        }
+
         match self {
             Operation::AppendSequenceGroups {
                 branch,
@@ -137,7 +148,7 @@ impl Operation {
 
                 let manifest_list_schema = match table_metadata.format_version {
                     FormatVersion::V1 => manifest_list_schema_v1(),
-                    FormatVersion::V2 => manifest_list_schema_v2(),
+                    FormatVersion::V2 | FormatVersion::V3 => manifest_list_schema_v2(),
                 };
 
                 let n_data_files = sequence_groups.iter().map(|d| d.data_files.len()).sum();
@@ -227,7 +238,7 @@ impl Operation {
                     }
                 }
 
-                let new_manifest_list_location = manifest_list_writer
+                let (new_manifest_list_location, next_row_id) = manifest_list_writer
                     .finish(snapshot_id, object_store)
                     .await?;
 
@@ -269,6 +280,7 @@ impl Operation {
                 if let Some(snapshot) = old_snapshot {
                     snapshot_builder.with_parent_snapshot_id(*snapshot.snapshot_id());
                 }
+                apply_v3_row_lineage(&mut snapshot_builder, table_metadata, next_row_id)?;
                 let snapshot = snapshot_builder.build()?;
 
                 Ok((
@@ -302,7 +314,7 @@ impl Operation {
 
                 let manifest_list_schema = match table_metadata.format_version {
                     FormatVersion::V1 => manifest_list_schema_v1(),
-                    FormatVersion::V2 => manifest_list_schema_v2(),
+                    FormatVersion::V2 | FormatVersion::V3 => manifest_list_schema_v2(),
                 };
 
                 let n_data_files = data_files.len();
@@ -409,7 +421,7 @@ impl Operation {
 
                 let manifest_future = future::try_join_all(futures);
 
-                let (_, new_manifest_list_location) = future::try_join(
+                let (_, (new_manifest_list_location, next_row_id)) = future::try_join(
                     manifest_future,
                     manifest_list_writer.finish(snapshot_id, object_store),
                 )
@@ -445,6 +457,7 @@ impl Operation {
                 if let Some(snapshot) = old_snapshot {
                     snapshot_builder.with_parent_snapshot_id(*snapshot.snapshot_id());
                 }
+                apply_v3_row_lineage(&mut snapshot_builder, table_metadata, next_row_id)?;
                 let snapshot = snapshot_builder.build()?;
 
                 Ok((
@@ -487,7 +500,7 @@ impl Operation {
 
                 let manifest_list_schema = match table_metadata.format_version {
                     FormatVersion::V1 => manifest_list_schema_v1(),
-                    FormatVersion::V2 => manifest_list_schema_v2(),
+                    FormatVersion::V2 | FormatVersion::V3 => manifest_list_schema_v2(),
                 };
 
                 let mut manifest_list_writer =
@@ -651,7 +664,7 @@ impl Operation {
 
                 let manifest_list_schema = match table_metadata.format_version {
                     FormatVersion::V1 => manifest_list_schema_v1(),
-                    FormatVersion::V2 => manifest_list_schema_v2(),
+                    FormatVersion::V2 | FormatVersion::V3 => manifest_list_schema_v2(),
                 };
 
                 let n_data_files = data_files.len();
@@ -803,7 +816,7 @@ impl Operation {
                     };
                 }
 
-                let new_manifest_list_location = manifest_list_writer
+                let (new_manifest_list_location, _) = manifest_list_writer
                     .finish(snapshot_id, object_store)
                     .await?;
 
@@ -1036,6 +1049,22 @@ pub(crate) fn prefetch_manifest(
     })
 }
 
+fn apply_v3_row_lineage(
+    snapshot_builder: &mut SnapshotBuilder,
+    table_metadata: &TableMetadata,
+    next_row_id: Option<u64>,
+) -> Result<(), Error> {
+    if let Some(next_row_id) = next_row_id {
+        let added_rows = next_row_id
+            .checked_sub(table_metadata.next_row_id)
+            .ok_or_else(|| Error::InvalidFormat("next row id moved backwards".to_string()))?;
+        snapshot_builder
+            .with_first_row_id(table_metadata.next_row_id)
+            .with_added_rows(added_rows);
+    }
+    Ok(())
+}
+
 fn prefetch_manifest_list(
     old_snapshot: Option<&Snapshot>,
     object_store: &Arc<dyn ObjectStore>,
@@ -1227,9 +1256,11 @@ pub fn compute_n_splits(
 mod tests {
     use super::*;
     use futures::executor::block_on;
+    use iceberg_rust_spec::manifest::FileFormat;
     use iceberg_rust_spec::spec::schema::SchemaBuilder;
     use iceberg_rust_spec::spec::table_metadata::TableMetadataBuilder;
     use iceberg_rust_spec::spec::types::{PrimitiveType, StructField, Type};
+    use iceberg_rust_spec::values::{Struct, Value};
     use object_store::memory::InMemory;
 
     fn sample_metadata(
@@ -1327,6 +1358,111 @@ mod tests {
         let metadata = sample_metadata(&[(1, 1_000)], Some(1), &[]);
         let result = execute_operation(&metadata, None, None, true, false);
         assert!(matches!(result, Err(Error::InvalidFormat(_))));
+    }
+
+    #[test]
+    fn v3_snapshot_expiration_is_allowed() {
+        let mut metadata = sample_metadata(&[(1, 1_000)], Some(1), &[]);
+        metadata.format_version = FormatVersion::V3;
+
+        let result = execute_operation(&metadata, Some(2_000), None, true, false);
+        assert!(result.is_ok());
+    }
+
+    fn data_file(path: &str, rows: i64) -> DataFile {
+        DataFile::builder()
+            .with_content(Content::Data)
+            .with_file_path(path.to_string())
+            .with_file_format(FileFormat::Parquet)
+            .with_partition(Struct::from_iter(Vec::<(String, Option<Value>)>::new()))
+            .with_record_count(rows)
+            .with_file_size_in_bytes(100)
+            .with_column_sizes(None)
+            .with_value_counts(None)
+            .with_null_value_counts(None)
+            .with_nan_value_counts(None)
+            .with_distinct_counts(None)
+            .with_lower_bounds(None)
+            .with_upper_bounds(None)
+            .build()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn v3_appends_assign_contiguous_row_ranges() {
+        let mut metadata = sample_metadata(&[], None, &[]);
+        metadata.format_version = FormatVersion::V3;
+        metadata.next_row_id = 10;
+        let store = Arc::new(InMemory::new());
+
+        let first = Operation::Append {
+            branch: None,
+            data_files: vec![data_file("s3://tests/table/data/first.parquet", 5)],
+            delete_files: Vec::new(),
+            additional_summary: None,
+        };
+        let (_, first_updates) = first.execute(&metadata, store.clone()).await.unwrap();
+        let first_snapshot = first_updates
+            .iter()
+            .find_map(|update| match update {
+                TableUpdate::AddSnapshot { snapshot } => Some(snapshot),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(*first_snapshot.first_row_id(), Some(10));
+        assert_eq!(*first_snapshot.added_rows(), Some(5));
+        crate::catalog::commit::apply_table_updates(&mut metadata, first_updates).unwrap();
+        assert_eq!(metadata.next_row_id, 15);
+
+        let second = Operation::Append {
+            branch: None,
+            data_files: vec![data_file("s3://tests/table/data/second.parquet", 7)],
+            delete_files: Vec::new(),
+            additional_summary: None,
+        };
+        let (_, second_updates) = second.execute(&metadata, store.clone()).await.unwrap();
+        let second_snapshot = second_updates
+            .iter()
+            .find_map(|update| match update {
+                TableUpdate::AddSnapshot { snapshot } => Some(snapshot),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(*second_snapshot.first_row_id(), Some(15));
+        assert_eq!(*second_snapshot.added_rows(), Some(7));
+
+        let manifest_list_bytes = store
+            .get(&strip_prefix(second_snapshot.manifest_list()).into())
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let mut first_row_ids = ManifestListReader::new(&manifest_list_bytes[..], &metadata)
+            .unwrap()
+            .map(|entry| entry.unwrap().first_row_id)
+            .collect::<Vec<_>>();
+        first_row_ids.sort();
+        assert_eq!(first_row_ids, vec![Some(10), Some(15)]);
+
+        crate::catalog::commit::apply_table_updates(&mut metadata, second_updates).unwrap();
+        assert_eq!(metadata.next_row_id, 22);
+    }
+
+    #[tokio::test]
+    async fn v3_manifest_rewrites_remain_rejected() {
+        let mut metadata = sample_metadata(&[], None, &[]);
+        metadata.format_version = FormatVersion::V3;
+        let operation = Operation::Replace {
+            branch: None,
+            files: Vec::new(),
+            additional_summary: None,
+        };
+
+        let result = operation
+            .execute(&metadata, Arc::new(InMemory::new()))
+            .await;
+        assert!(matches!(result, Err(Error::NotSupported(_))));
     }
 
     #[test]

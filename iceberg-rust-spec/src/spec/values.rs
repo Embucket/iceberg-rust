@@ -638,6 +638,9 @@ impl Value {
                     ))
                 }
             }
+            Type::Variant(_) => Err(Error::NotSupported(
+                "Iceberg Variant literals are not represented by Value".to_string(),
+            )),
         }
     }
 
