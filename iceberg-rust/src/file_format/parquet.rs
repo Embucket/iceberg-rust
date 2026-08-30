@@ -3,7 +3,7 @@
 */
 
 use std::{
-    collections::{hash_map::Entry, HashMap},
+    collections::{hash_map::Entry, HashMap, HashSet},
     ops::Sub,
 };
 
@@ -13,7 +13,7 @@ use iceberg_rust_spec::{
         manifest::{AvroMap, Content, DataFile, FileFormat},
         partition::PartitionField,
         schema::Schema,
-        types::Type,
+        types::{PrimitiveType, Type},
         values::{PhysicalTypeHint, Struct, Value},
     },
     table_metadata::WRITE_METADATA_METRICS_DISTINCT_COUNTS_ENABLED,
@@ -111,6 +111,10 @@ pub fn parquet_to_datafile(
     let mut column_metrics_modes: HashMap<i32, MetricsMode> = HashMap::new();
 
     for row_group in file_metadata.row_groups() {
+        // Variant is one logical Iceberg field backed by multiple Parquet
+        // leaves. Count it once per row group and combine leaf null counts.
+        let mut counted_variant_values = HashSet::new();
+        let mut variant_null_counts = HashMap::<i32, i64>::new();
         for column in row_group.columns() {
             let column_name = column.column_descr().name();
             let column_path = column.column_path().parts().join(".");
@@ -118,6 +122,12 @@ pub fn parquet_to_datafile(
                 .get_name(&column_path)
                 .ok_or_else(|| Error::Schema(column_name.to_string(), "".to_string()))?
                 .id;
+            let data_type = &schema
+                .fields()
+                .get(id as usize)
+                .ok_or_else(|| Error::Schema(column_name.to_string(), "".to_string()))?
+                .field_type;
+            let is_variant = matches!(data_type, Type::Primitive(PrimitiveType::Variant));
 
             let top_level_index = column_path
                 .split('.')
@@ -132,7 +142,7 @@ pub fn parquet_to_datafile(
                 .entry(id)
                 .and_modify(|x| *x += column.compressed_size())
                 .or_insert(column.compressed_size());
-            if metrics_mode.records_counts() {
+            if metrics_mode.records_counts() && (!is_variant || counted_variant_values.insert(id)) {
                 value_counts
                     .entry(id)
                     .and_modify(|x| *x += row_group.num_rows())
@@ -144,17 +154,18 @@ pub fn parquet_to_datafile(
                     .null_count_opt()
                     .filter(|_| metrics_mode.records_counts())
                 {
-                    null_value_counts
-                        .entry(id)
-                        .and_modify(|x| *x += null_count as i64)
-                        .or_insert(null_count as i64);
+                    if is_variant {
+                        variant_null_counts
+                            .entry(id)
+                            .and_modify(|count| *count = (*count).max(null_count as i64))
+                            .or_insert(null_count as i64);
+                    } else {
+                        null_value_counts
+                            .entry(id)
+                            .and_modify(|x| *x += null_count as i64)
+                            .or_insert(null_count as i64);
+                    }
                 }
-
-                let data_type = &schema
-                    .fields()
-                    .get(id as usize)
-                    .ok_or_else(|| Error::Schema(column_name.to_string(), "".to_string()))?
-                    .field_type;
 
                 // Parquet's physical type can encode a logical type differently than
                 // the Iceberg spec: INT32/INT64 stats are native little-endian
@@ -170,7 +181,7 @@ pub fn parquet_to_datafile(
 
                 if let Some(distinct_counts) = distinct_counts
                     .as_mut()
-                    .filter(|_| metrics_mode.records_counts())
+                    .filter(|_| metrics_mode.records_counts() && !is_variant)
                 {
                     if let (Some(distinct_count), Some(min_bytes), Some(max_bytes)) = (
                         statistics.distinct_count_opt(),
@@ -238,7 +249,8 @@ pub fn parquet_to_datafile(
                     .min_bytes_opt()
                     .filter(|_| metrics_mode.records_bounds())
                 {
-                    if let Type::Primitive(_) = &data_type {
+                    if matches!(data_type, Type::Primitive(primitive) if !matches!(primitive, PrimitiveType::Variant))
+                    {
                         let new = Value::try_from_bytes_with_hint(
                             min_bytes,
                             data_type,
@@ -301,7 +313,8 @@ pub fn parquet_to_datafile(
                     .max_bytes_opt()
                     .filter(|_| metrics_mode.records_bounds())
                 {
-                    if let Type::Primitive(_) = &data_type {
+                    if matches!(data_type, Type::Primitive(primitive) if !matches!(primitive, PrimitiveType::Variant))
+                    {
                         let new = Value::try_from_bytes_with_hint(
                             max_bytes,
                             data_type,
@@ -394,6 +407,12 @@ pub fn parquet_to_datafile(
                     }
                 }
             }
+        }
+        for (id, null_count) in variant_null_counts {
+            null_value_counts
+                .entry(id)
+                .and_modify(|count| *count += null_count)
+                .or_insert(null_count);
         }
     }
     // Truncate once, after the bounds have been merged across row groups.
@@ -587,6 +606,7 @@ mod metrics_mode_tests {
     };
     use parquet::arrow::ArrowWriter;
     use parquet::file::reader::{FileReader, SerializedFileReader};
+    use parquet::variant::json_to_variant;
 
     use super::parquet_to_datafile;
 
@@ -724,6 +744,56 @@ mod metrics_mode_tests {
         // `counts` gives the other column counts but no bounds.
         assert_eq!(bound(datafile.lower_bounds(), 0), None);
         assert!(datafile.value_counts().as_ref().unwrap().get(&0).is_some());
+    }
+
+    #[test]
+    fn variant_metrics_count_the_logical_field_without_bounds() {
+        let iceberg_schema = Schema::builder()
+            .with_struct_field(StructField {
+                id: 0,
+                name: "payload".to_string(),
+                required: false,
+                field_type: Type::Primitive(PrimitiveType::Variant),
+                doc: None,
+                initial_default: None,
+                write_default: None,
+            })
+            .build()
+            .unwrap();
+        let input: ArrayRef = Arc::new(StringArray::from(vec![
+            Some(r#"{"name":"Alice","active":true}"#),
+            None,
+        ]));
+        let variant = json_to_variant(&input).unwrap();
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![variant.field("payload")]));
+        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![variant.into()]).unwrap();
+
+        let mut buffer = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut buffer, arrow_schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let file_size = buffer.len() as u64;
+        let reader = SerializedFileReader::new(bytes::Bytes::from(buffer)).unwrap();
+
+        let datafile = parquet_to_datafile(
+            "/t/data/variant.parquet",
+            file_size,
+            reader.metadata(),
+            &iceberg_schema,
+            &[],
+            None,
+            &HashMap::new(),
+        )
+        .unwrap();
+
+        assert_eq!(datafile.value_counts().as_ref().unwrap().get(&0), Some(&2));
+        assert_eq!(
+            datafile.null_value_counts().as_ref().unwrap().get(&0),
+            Some(&1)
+        );
+        assert!(datafile.column_sizes().as_ref().unwrap().get(&0).is_some());
+        assert_eq!(datafile.lower_bounds().as_ref().unwrap().get(&0), None);
+        assert_eq!(datafile.upper_bounds().as_ref().unwrap().get(&0), None);
     }
 }
 
