@@ -909,7 +909,6 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
                 let manifest_bytes = manifest_bytes.await??;
 
                 manifest.manifest_path = self.next_manifest_location();
-                manifest.added_snapshot_id = snapshot_id;
 
                 if let Some(filter) = filter {
                     let (manifest_writer, filtered_stats) =
@@ -917,6 +916,7 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
                             manifest_bytes.as_ref(),
                             manifest,
                             &filter,
+                            snapshot_id,
                             &manifest_schema,
                             self.table_metadata,
                         )?;
@@ -926,6 +926,7 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
                     let manifest_writer = ManifestWriter::from_existing(
                         manifest_reader,
                         manifest,
+                        snapshot_id,
                         &manifest_schema,
                         self.table_metadata,
                     )?;
@@ -1369,12 +1370,12 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
                     .await?;
 
                 manifest.manifest_path = manifest_location;
-                manifest.added_snapshot_id = snapshot_id;
 
                 let (manifest_writer, filtered_stats) = ManifestWriter::from_existing_with_filter(
                     &bytes,
                     manifest,
                     &data_files_to_filter,
+                    snapshot_id,
                     &manifest_schema,
                     table_metadata,
                 )?;

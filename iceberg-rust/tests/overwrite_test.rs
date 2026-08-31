@@ -461,6 +461,11 @@ async fn test_overwrite_removes_files_without_replacements() {
         .await
         .unwrap();
     assert!(!files_to_remove.is_empty());
+    let removed_paths = files_to_remove
+        .values()
+        .flatten()
+        .cloned()
+        .collect::<Vec<_>>();
 
     table
         .new_transaction(None)
@@ -523,6 +528,38 @@ async fn test_overwrite_removes_files_without_replacements() {
         .collect::<Vec<_>>();
     ids.sort_unstable();
     assert_eq!(ids, vec![3, 4]);
+
+    let appended_files = write_parquet_partitioned(
+        &table,
+        stream::iter(vec![Ok(create_overwrite_record_batch())]),
+        None,
+    )
+    .await
+    .unwrap();
+    table
+        .new_transaction(None)
+        .append_data(appended_files)
+        .commit()
+        .await
+        .expect("append after deletion-only overwrite should commit");
+
+    let manifests = table.manifests(None, None).await.unwrap();
+    let active_paths = table
+        .datafiles(&manifests, None, (None, None))
+        .await
+        .unwrap()
+        .filter_map(|result| async {
+            let entry = result.ok()?.1;
+            (*entry.status() != Status::Deleted).then(|| entry.data_file().file_path().to_owned())
+        })
+        .collect::<Vec<_>>()
+        .await;
+    assert!(
+        removed_paths
+            .iter()
+            .all(|removed| !active_paths.contains(removed)),
+        "a later append must not resurrect files deleted by an overwrite"
+    );
 }
 
 /// Helper function to create a partition spec partitioned by region
