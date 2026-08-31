@@ -625,6 +625,58 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
         ))
     }
 
+    /// Creates a manifest-list writer for an overwrite that only removes data files.
+    ///
+    /// Unlike [`Self::from_existing_without_overwrites`], this path does not select a
+    /// manifest for new files and therefore does not require partition bounds from an
+    /// added data file. Manifests containing files to remove are returned for filtering;
+    /// every other manifest is copied to the new manifest list unchanged.
+    pub(crate) fn from_existing_for_deletion(
+        bytes: &[u8],
+        manifests_to_overwrite: &HashSet<String>,
+        schema: &'schema AvroSchema,
+        table_metadata: &'metadata TableMetadata,
+    ) -> Result<(Self, Vec<ManifestListEntry>), Error> {
+        let manifest_list_reader = ManifestListReader::new(bytes, table_metadata)?;
+        let mut writer = AvroWriter::new(schema, Vec::new());
+        let mut manifests = Vec::new();
+        let mut file_count_all_entries = 0usize;
+
+        for manifest in manifest_list_reader {
+            let manifest = manifest?;
+            let file_count = manifest
+                .added_files_count
+                .unwrap_or(0)
+                .checked_add(manifest.existing_files_count.unwrap_or(0))
+                .ok_or_else(|| Error::InvalidFormat("manifest file count".to_string()))?;
+            file_count_all_entries = file_count_all_entries
+                .checked_add(file_count.try_into()?)
+                .ok_or_else(|| Error::InvalidFormat("manifest file count".to_string()))?;
+
+            if manifests_to_overwrite.contains(&manifest.manifest_path) {
+                manifests.push(manifest);
+            } else {
+                writer.append_ser(manifest)?;
+            }
+        }
+
+        Ok((
+            Self {
+                table_metadata,
+                writer,
+                selected_data_manifest: None,
+                selected_delete_manifest: None,
+                bounding_partition_values: Rectangle::new(Vec4::new(), Vec4::new()),
+                n_existing_files: file_count_all_entries,
+                commit_uuid: uuid::Uuid::new_v4().to_string(),
+                manifest_count: 0,
+                next_row_id: (table_metadata.format_version == FormatVersion::V3)
+                    .then_some(table_metadata.next_row_id),
+            },
+            manifests,
+        ))
+    }
+
     /// Calculates the optimal number of manifest splits for the given number of data files.
     ///
     /// This method determines how many manifest files should be created to optimize
@@ -864,6 +916,7 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
                             manifest_bytes.as_ref(),
                             manifest,
                             &filter,
+                            snapshot_id,
                             &manifest_schema,
                             self.table_metadata,
                         )?;
@@ -873,6 +926,7 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
                     let manifest_writer = ManifestWriter::from_existing(
                         manifest_reader,
                         manifest,
+                        snapshot_id,
                         &manifest_schema,
                         self.table_metadata,
                     )?;
@@ -893,10 +947,6 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
 
         for manifest_entry in data_files {
             manifest_writer.append(manifest_entry?)?;
-        }
-
-        if let Some(filtered_stats) = filtered_stats {
-            manifest_writer.apply_filtered_stats(&filtered_stats);
         }
 
         let (manifest, future) = manifest_writer.finish_concurrently(object_store.clone())?;
@@ -1120,6 +1170,17 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
                     Err(err) => return Some(Err(err)),
                 };
 
+                if *entry.status() == Status::Deleted {
+                    return None;
+                }
+
+                if entry.sequence_number().is_none() {
+                    *entry.sequence_number_mut() = Some(manifest.sequence_number);
+                }
+                if entry.snapshot_id().is_none() {
+                    *entry.snapshot_id_mut() = Some(manifest.added_snapshot_id);
+                }
+
                 if let (Some(files_to_filter), Some(removed_stats)) =
                     (filter.as_ref(), &mut removed_stats)
                 {
@@ -1132,16 +1193,12 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
                         removed_stats.removed_file_size_bytes +=
                             entry.data_file().file_size_in_bytes();
                         removed_stats.removed_data_files += 1;
+                        *entry.status_mut() = Status::Deleted;
+                        removed_stats.filtered_entries.push(entry);
                         return None;
                     }
                 }
                 *entry.status_mut() = Status::Existing;
-                if entry.sequence_number().is_none() {
-                    *entry.sequence_number_mut() = Some(manifest.sequence_number);
-                }
-                if entry.snapshot_id().is_none() {
-                    *entry.snapshot_id_mut() = Some(manifest.added_snapshot_id);
-                }
                 Some(Ok(entry))
             });
 
@@ -1283,6 +1340,7 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
         manifests_to_overwrite: Vec<ManifestListEntry>,
         data_files_to_filter: &HashMap<String, Vec<String>>,
         object_store: Arc<dyn ObjectStore>,
+        snapshot_id: i64,
     ) -> Result<FilteredManifestStats, Error> {
         let partition_fields = self.table_metadata.current_partition_fields()?;
 
@@ -1313,17 +1371,14 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
 
                 manifest.manifest_path = manifest_location;
 
-                let (mut manifest_writer, filtered_stats) =
-                    ManifestWriter::from_existing_with_filter(
-                        &bytes,
-                        manifest,
-                        &data_files_to_filter,
-                        &manifest_schema,
-                        table_metadata,
-                    )?;
-
-                // Apply filtered statistics
-                manifest_writer.apply_filtered_stats(&filtered_stats);
+                let (manifest_writer, filtered_stats) = ManifestWriter::from_existing_with_filter(
+                    &bytes,
+                    manifest,
+                    &data_files_to_filter,
+                    snapshot_id,
+                    &manifest_schema,
+                    table_metadata,
+                )?;
 
                 let new_manifest = manifest_writer.finish(object_store.clone()).await?;
 
@@ -1336,6 +1391,9 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
             removed_stats.removed_data_files += filtered_stats.removed_data_files;
             removed_stats.removed_records += filtered_stats.removed_records;
             removed_stats.removed_file_size_bytes += filtered_stats.removed_file_size_bytes;
+            removed_stats
+                .filtered_entries
+                .extend(filtered_stats.filtered_entries);
 
             if manifest.added_files_count.unwrap_or(0) > 0
                 || manifest.existing_files_count.unwrap_or(0) > 0
