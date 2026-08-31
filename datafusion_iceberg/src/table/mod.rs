@@ -47,8 +47,9 @@ use crate::{
     statistics::manifest_statistics,
 };
 use datafusion::arrow::compute::SortOptions;
-use datafusion::common::{NullEquality, Statistics};
+use datafusion::common::{JoinSide, NullEquality, Statistics};
 use datafusion::datasource::physical_plan::FileScanConfig;
+use datafusion::parquet::arrow::RowNumber;
 use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
 use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::ColumnStatistics;
@@ -74,14 +75,18 @@ use datafusion::{
         TableProvider, ViewTable,
     },
     execution::{context::SessionState, TaskContext},
+    logical_expr::Operator,
     logical_expr::{
         physical_planning_context::PhysicalPlanningContext, TableProviderFilterPushDown, TableType,
     },
     physical_expr::create_physical_expr,
     physical_optimizer::pruning::PruningPredicateBuilder,
     physical_plan::{
-        expressions::Column,
-        joins::{HashJoinExec, PartitionMode},
+        expressions::{BinaryExpr, Column},
+        joins::{
+            utils::{ColumnIndex, JoinFilter},
+            HashJoinExec, PartitionMode,
+        },
         metrics::MetricsSet,
         projection::ProjectionExec,
         union::UnionExec,
@@ -114,6 +119,13 @@ use iceberg_rust::{
 
 static DATA_FILE_PATH_COLUMN: &str = "__data_file_path";
 static MANIFEST_FILE_PATH_COLUMN: &str = "__manifest_file_path";
+static DATA_FILE_ROW_POSITION_COLUMN: &str = "__iceberg_file_row_position";
+static DATA_FILE_SEQUENCE_NUMBER_COLUMN: &str = "__iceberg_data_sequence_number";
+static DELETE_FILE_SEQUENCE_NUMBER_COLUMN: &str = "__iceberg_delete_sequence_number";
+static POSITION_DELETE_FILE_PATH_COLUMN: &str = "file_path";
+static POSITION_DELETE_POS_COLUMN: &str = "pos";
+const POSITION_DELETE_FILE_PATH_FIELD_ID: i32 = i32::MAX - 101;
+const POSITION_DELETE_POS_FIELD_ID: i32 = i32::MAX - 102;
 
 /// When the view tracks source arrow ids (the `overrides` map is non-empty),
 /// reshape each top-level field's `PARQUET:field_id` metadata so it matches
@@ -559,7 +571,7 @@ async fn table_scan(
     let mut delete_file_groups: HashMap<Struct, PartitionDeleteFileIndex> = HashMap::new();
 
     // Prune data & delete file and insert them into the according map
-    let (content_file_iter, statistics) = if let Some(physical_predicate) =
+    let (content_file_iter, mut statistics) = if let Some(physical_predicate) =
         physical_predicate.clone()
     {
         let partition_schema = Arc::new(ArrowSchema::new(table_partition_cols.clone()));
@@ -671,13 +683,13 @@ async fn table_scan(
     if partition_fields.is_empty() {
         let mut data_files = Vec::new();
         let mut equality_deletes = Vec::new();
-        let mut delete_vectors = Vec::new();
+        let mut position_deletes = Vec::new();
         content_file_iter
             .filter(|manifest| *manifest.1.status() != Status::Deleted)
             .for_each(|manifest| match manifest.1.data_file().content() {
                 Content::Data => data_files.push(manifest),
                 Content::EqualityDeletes => equality_deletes.push(manifest),
-                Content::PositionDeletes => delete_vectors.push(manifest),
+                Content::PositionDeletes => position_deletes.push(manifest),
             });
         if !data_files.is_empty() {
             data_file_groups.insert(
@@ -688,7 +700,7 @@ async fn table_scan(
                 data_files,
             );
         }
-        if !equality_deletes.is_empty() || !delete_vectors.is_empty() {
+        if !equality_deletes.is_empty() || !position_deletes.is_empty() {
             delete_file_groups.insert(
                 Struct {
                     fields: Vec::new(),
@@ -696,7 +708,7 @@ async fn table_scan(
                 },
                 PartitionDeleteFileIndex {
                     equality_deletes,
-                    delete_vectors,
+                    position_deletes,
                 },
             );
         }
@@ -721,7 +733,7 @@ async fn table_scan(
                         delete_file_groups
                             .entry(manifest.1.data_file().partition().clone())
                             .or_default()
-                            .delete_vectors
+                            .position_deletes
                             .push(manifest);
                     }
                 }
@@ -729,15 +741,48 @@ async fn table_scan(
         });
     }
 
-    let table_schema = TableSchema::builder(file_schema.clone())
+    let has_position_deletes = delete_file_groups
+        .values()
+        .any(|files| !files.position_deletes.is_empty());
+    let include_data_file_path_column = enable_data_file_path_column || has_position_deletes;
+
+    // Position deletes identify rows by data-file path and absolute row position. Keep both
+    // columns internal unless the caller explicitly requested the data-file path column.
+    if has_position_deletes && !enable_data_file_path_column {
+        table_partition_cols.push(Field::new(DATA_FILE_PATH_COLUMN, DataType::Utf8, false));
+        statistics
+            .column_statistics
+            .push(ColumnStatistics::new_unknown());
+    }
+    if has_position_deletes {
+        table_partition_cols.push(Field::new(
+            DATA_FILE_SEQUENCE_NUMBER_COLUMN,
+            DataType::Int64,
+            false,
+        ));
+        statistics
+            .column_statistics
+            .push(ColumnStatistics::new_unknown());
+    }
+
+    let mut table_schema_builder = TableSchema::builder(file_schema.clone())
         .with_table_partition_cols(
             table_partition_cols
                 .iter()
                 .cloned()
                 .map(Arc::new)
                 .collect::<Vec<_>>(),
-        )
-        .build();
+        );
+    if has_position_deletes {
+        table_schema_builder = table_schema_builder.with_virtual_columns(vec![Arc::new(
+            Field::new(DATA_FILE_ROW_POSITION_COLUMN, DataType::Int64, false)
+                .with_extension_type(RowNumber),
+        )]);
+        statistics
+            .column_statistics
+            .push(ColumnStatistics::new_unknown());
+    }
+    let table_schema = table_schema_builder.build();
     // File schema plus partition columns: what scan orderings are expressed on.
     let scan_schema: SchemaRef = table_schema.table_schema().clone();
     let file_source = Arc::new(
@@ -755,6 +800,7 @@ async fn table_scan(
             let parquet_reader_factory = parquet_reader_factory.clone();
             let projection_expr = projection_expr.clone();
             let projection = projection.clone();
+            let scan_schema = scan_schema.clone();
             let mut data_files = data_file_groups
                 .remove(&partition_value)
                 .unwrap_or_default();
@@ -800,6 +846,19 @@ async fn table_scan(
                         }
                     });
 
+                if !delete_files.position_deletes.is_empty() {
+                    for column_name in [
+                        DATA_FILE_PATH_COLUMN,
+                        DATA_FILE_ROW_POSITION_COLUMN,
+                        DATA_FILE_SEQUENCE_NUMBER_COLUMN,
+                    ] {
+                        let index = scan_schema.index_of(column_name)?;
+                        if !equality_projection.contains(&index) {
+                            equality_projection.push(index);
+                        }
+                    }
+                }
+
                 let mut plan = stream::iter(delete_files.equality_deletes.iter())
                     .map(Ok::<_, DataFusionError>)
                     .try_fold(None, |acc, delete_manifest| {
@@ -825,7 +884,8 @@ async fn table_scan(
                                 schema,
                                 &data_manifest.1,
                                 last_updated_ms,
-                                enable_data_file_path_column,
+                                include_data_file_path_column,
+                                has_position_deletes,
                                 manifest_path,
                             )
                             .unwrap();
@@ -881,6 +941,7 @@ async fn table_scan(
                                 &delete_manifest.1,
                                 last_updated_ms,
                                 enable_data_file_path_column,
+                                false,
                                 manifest_path,
                             )?;
 
@@ -963,11 +1024,7 @@ async fn table_scan(
                                 as Arc<dyn ExecutionPlan>))
                         }
                     })
-                    .await
-                    .transpose()
-                    .ok_or(DataFusionError::External(Box::new(Error::InvalidFormat(
-                        "Delete plan".to_owned(),
-                    ))))??;
+                    .await?;
 
                 let additional_data_files = data_file_iter
                     .map(|x| {
@@ -981,7 +1038,8 @@ async fn table_scan(
                             schema,
                             &x.1,
                             last_updated_ms,
-                            enable_data_file_path_column,
+                            include_data_file_path_column,
+                            has_position_deletes,
                             manifest_path,
                         )
                     })
@@ -989,7 +1047,7 @@ async fn table_scan(
 
                 if !additional_data_files.is_empty() {
                     let file_scan_config =
-                        FileScanConfigBuilder::new(object_store_url, file_source)
+                        FileScanConfigBuilder::new(object_store_url.clone(), file_source)
                             .with_file_group(FileGroup::new(additional_data_files))
                             .with_statistics(statistics)
                             .with_projection_indices(Some(equality_projection))?
@@ -1000,7 +1058,24 @@ async fn table_scan(
                     let data_files_scan: Arc<dyn ExecutionPlan> =
                         DataSourceExec::from_data_source(file_scan_config);
 
-                    plan = UnionExec::try_new(vec![plan, data_files_scan])?;
+                    plan = Some(if let Some(plan) = plan {
+                        UnionExec::try_new(vec![plan, data_files_scan])?
+                    } else {
+                        data_files_scan
+                    });
+                }
+
+                let mut plan = plan.ok_or(DataFusionError::External(Box::new(
+                    Error::InvalidFormat("Delete plan".to_owned()),
+                )))?;
+
+                if !delete_files.position_deletes.is_empty() {
+                    plan = apply_position_deletes(
+                        plan,
+                        delete_files.position_deletes,
+                        &object_store_url,
+                        parquet_reader_factory,
+                    )?;
                 }
 
                 Ok::<_, DataFusionError>(Arc::new(ProjectionExec::try_new(projection_expr, plan)?)
@@ -1038,7 +1113,8 @@ async fn table_scan(
                 &schema,
                 &entry,
                 last_updated_ms,
-                enable_data_file_path_column,
+                include_data_file_path_column,
+                has_position_deletes,
                 manifest_path,
             )?;
             if is_attested {
@@ -1290,6 +1366,7 @@ fn generate_partitioned_file(
     manifest: &ManifestEntry,
     last_updated_ms: i64,
     enable_data_file_path: bool,
+    include_sequence_number: bool,
     manifest_file_path: Option<ManifestPath>,
 ) -> Result<PartitionedFile, DataFusionError> {
     let manifest_statistics = manifest_statistics(schema, manifest);
@@ -1312,6 +1389,20 @@ fn generate_partitioned_file(
 
     if let Some(manifest_file_path) = manifest_file_path {
         partition_values.push(ScalarValue::Utf8(Some(manifest_file_path)));
+    }
+
+    if include_sequence_number {
+        let sequence_number = manifest
+            .sequence_number()
+            .as_ref()
+            .copied()
+            .ok_or_else(|| {
+                DataFusionError::Execution(format!(
+                    "Data file {} has no sequence number",
+                    manifest.data_file().file_path()
+                ))
+            })?;
+        partition_values.push(ScalarValue::Int64(Some(sequence_number)));
     }
 
     let object_meta = ObjectMeta {
@@ -1337,6 +1428,142 @@ fn generate_partitioned_file(
         arrow_schema: None,
     };
     Ok(file)
+}
+
+fn apply_position_deletes(
+    data_plan: Arc<dyn ExecutionPlan>,
+    delete_files: Vec<(ManifestPath, ManifestEntry)>,
+    object_store_url: &ObjectStoreUrl,
+    parquet_reader_factory: Arc<dyn ParquetFileReaderFactory>,
+) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+    let delete_schema = Arc::new(ArrowSchema::new(vec![
+        Field::new(POSITION_DELETE_FILE_PATH_COLUMN, DataType::Utf8, false).with_metadata(
+            HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                POSITION_DELETE_FILE_PATH_FIELD_ID.to_string(),
+            )]),
+        ),
+        Field::new(POSITION_DELETE_POS_COLUMN, DataType::Int64, false).with_metadata(
+            HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                POSITION_DELETE_POS_FIELD_ID.to_string(),
+            )]),
+        ),
+    ]));
+
+    let files = delete_files
+        .into_iter()
+        .map(|(_, entry)| {
+            let data_file = entry.data_file();
+            if data_file.content_offset().is_some() || data_file.content_size_in_bytes().is_some() {
+                return not_impl_err!(
+                    "Iceberg v3 deletion vectors are not supported yet; use v2 position delete files"
+                );
+            }
+            let mut file = PartitionedFile::new(
+                util::strip_prefix(data_file.file_path()),
+                u64::try_from(*data_file.file_size_in_bytes()).map_err(|_| {
+                    DataFusionError::Execution(format!(
+                        "Position delete file has a negative size: {}",
+                        data_file.file_size_in_bytes()
+                    ))
+                })?,
+            );
+            let sequence_number = entry
+                .sequence_number()
+                .as_ref()
+                .copied()
+                .ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "Position delete file {} has no sequence number",
+                        data_file.file_path()
+                    ))
+                })?;
+            file.partition_values
+                .push(ScalarValue::Int64(Some(sequence_number)));
+            Ok(file)
+        })
+        .collect::<Result<Vec<_>, DataFusionError>>()?;
+
+    let delete_table_schema = TableSchema::builder(delete_schema)
+        .with_table_partition_cols(vec![Arc::new(Field::new(
+            DELETE_FILE_SEQUENCE_NUMBER_COLUMN,
+            DataType::Int64,
+            false,
+        ))])
+        .build();
+    let delete_source = Arc::new(
+        ParquetSource::new(delete_table_schema)
+            .with_parquet_file_reader_factory(parquet_reader_factory),
+    );
+    let delete_scan_config = FileScanConfigBuilder::new(object_store_url.clone(), delete_source)
+        .with_file_group(FileGroup::new(files))
+        .build();
+    let delete_plan: Arc<dyn ExecutionPlan> = DataSourceExec::from_data_source(delete_scan_config);
+
+    let join_on = vec![
+        (
+            Arc::new(Column::new_with_schema(
+                POSITION_DELETE_FILE_PATH_COLUMN,
+                &delete_plan.schema(),
+            )?) as Arc<dyn PhysicalExpr>,
+            Arc::new(Column::new_with_schema(
+                DATA_FILE_PATH_COLUMN,
+                &data_plan.schema(),
+            )?) as Arc<dyn PhysicalExpr>,
+        ),
+        (
+            Arc::new(Column::new_with_schema(
+                POSITION_DELETE_POS_COLUMN,
+                &delete_plan.schema(),
+            )?) as Arc<dyn PhysicalExpr>,
+            Arc::new(Column::new_with_schema(
+                DATA_FILE_ROW_POSITION_COLUMN,
+                &data_plan.schema(),
+            )?) as Arc<dyn PhysicalExpr>,
+        ),
+    ];
+
+    let delete_sequence_index = delete_plan
+        .schema()
+        .index_of(DELETE_FILE_SEQUENCE_NUMBER_COLUMN)?;
+    let data_sequence_index = data_plan
+        .schema()
+        .index_of(DATA_FILE_SEQUENCE_NUMBER_COLUMN)?;
+    let filter_schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("delete_sequence_number", DataType::Int64, false),
+        Field::new("data_sequence_number", DataType::Int64, false),
+    ]));
+    let sequence_filter = JoinFilter::new(
+        Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("delete_sequence_number", 0)),
+            Operator::Gt,
+            Arc::new(Column::new("data_sequence_number", 1)),
+        )),
+        vec![
+            ColumnIndex {
+                index: delete_sequence_index,
+                side: JoinSide::Left,
+            },
+            ColumnIndex {
+                index: data_sequence_index,
+                side: JoinSide::Right,
+            },
+        ],
+        filter_schema,
+    );
+
+    Ok(Arc::new(HashJoinExec::try_new(
+        delete_plan,
+        data_plan,
+        join_on,
+        Some(sequence_filter),
+        &JoinType::RightAnti,
+        None,
+        PartitionMode::CollectLeft,
+        NullEquality::NullEqualsNothing,
+        false,
+    )?))
 }
 
 fn value_to_scalarvalue(value: &Value) -> Result<ScalarValue, DataFusionError> {
@@ -1693,7 +1920,7 @@ fn create_new_file_stream(
 #[derive(Debug, Default)]
 struct PartitionDeleteFileIndex {
     pub equality_deletes: Vec<(ManifestPath, ManifestEntry)>,
-    pub delete_vectors: Vec<(ManifestPath, ManifestEntry)>,
+    pub position_deletes: Vec<(ManifestPath, ManifestEntry)>,
 }
 
 #[cfg(test)]
