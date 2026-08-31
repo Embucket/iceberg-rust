@@ -709,15 +709,16 @@ impl Operation {
                     )?
                 };
 
+                let snapshot_id = generate_snapshot_id();
+
                 let mut filtered_stats = manifest_list_writer
                     .append_and_filter(
                         manifests_to_overwrite,
                         &files_to_overwrite,
                         object_store.clone(),
+                        snapshot_id,
                     )
                     .await?;
-
-                let snapshot_id = generate_snapshot_id();
 
                 if n_data_files > 0 {
                     let n_splits =
@@ -762,6 +763,35 @@ impl Operation {
                     };
                     if let Some(selected_filter_stats) = selected_filter_stats {
                         filtered_stats.append(selected_filter_stats);
+                    }
+                }
+
+                if !filtered_stats.filtered_entries.is_empty() {
+                    let n_filtered_files = filtered_stats.filtered_entries.len();
+                    let filtered_iter = filtered_stats.filtered_entries.clone().into_iter().map(Ok);
+                    let n_filtered_splits =
+                        manifest_list_writer.n_splits(n_filtered_files, ManifestListContent::Data);
+
+                    if n_filtered_splits == 0 {
+                        manifest_list_writer
+                            .append(
+                                filtered_iter,
+                                snapshot_id,
+                                object_store.clone(),
+                                ManifestListContent::Data,
+                            )
+                            .await?;
+                    } else {
+                        manifest_list_writer
+                            .append_multiple_concurrently(
+                                filtered_iter,
+                                snapshot_id,
+                                n_filtered_splits,
+                                object_store.clone(),
+                                ManifestListContent::Data,
+                            )
+                            .await?
+                            .await?;
                     }
                 }
 

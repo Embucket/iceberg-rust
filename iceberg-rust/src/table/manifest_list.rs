@@ -909,6 +909,7 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
                 let manifest_bytes = manifest_bytes.await??;
 
                 manifest.manifest_path = self.next_manifest_location();
+                manifest.added_snapshot_id = snapshot_id;
 
                 if let Some(filter) = filter {
                     let (manifest_writer, filtered_stats) =
@@ -945,10 +946,6 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
 
         for manifest_entry in data_files {
             manifest_writer.append(manifest_entry?)?;
-        }
-
-        if let Some(filtered_stats) = filtered_stats {
-            manifest_writer.apply_filtered_stats(&filtered_stats);
         }
 
         let (manifest, future) = manifest_writer.finish_concurrently(object_store.clone())?;
@@ -1172,6 +1169,17 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
                     Err(err) => return Some(Err(err)),
                 };
 
+                if *entry.status() == Status::Deleted {
+                    return None;
+                }
+
+                if entry.sequence_number().is_none() {
+                    *entry.sequence_number_mut() = Some(manifest.sequence_number);
+                }
+                if entry.snapshot_id().is_none() {
+                    *entry.snapshot_id_mut() = Some(manifest.added_snapshot_id);
+                }
+
                 if let (Some(files_to_filter), Some(removed_stats)) =
                     (filter.as_ref(), &mut removed_stats)
                 {
@@ -1184,16 +1192,12 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
                         removed_stats.removed_file_size_bytes +=
                             entry.data_file().file_size_in_bytes();
                         removed_stats.removed_data_files += 1;
+                        *entry.status_mut() = Status::Deleted;
+                        removed_stats.filtered_entries.push(entry);
                         return None;
                     }
                 }
                 *entry.status_mut() = Status::Existing;
-                if entry.sequence_number().is_none() {
-                    *entry.sequence_number_mut() = Some(manifest.sequence_number);
-                }
-                if entry.snapshot_id().is_none() {
-                    *entry.snapshot_id_mut() = Some(manifest.added_snapshot_id);
-                }
                 Some(Ok(entry))
             });
 
@@ -1335,6 +1339,7 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
         manifests_to_overwrite: Vec<ManifestListEntry>,
         data_files_to_filter: &HashMap<String, Vec<String>>,
         object_store: Arc<dyn ObjectStore>,
+        snapshot_id: i64,
     ) -> Result<FilteredManifestStats, Error> {
         let partition_fields = self.table_metadata.current_partition_fields()?;
 
@@ -1364,18 +1369,15 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
                     .await?;
 
                 manifest.manifest_path = manifest_location;
+                manifest.added_snapshot_id = snapshot_id;
 
-                let (mut manifest_writer, filtered_stats) =
-                    ManifestWriter::from_existing_with_filter(
-                        &bytes,
-                        manifest,
-                        &data_files_to_filter,
-                        &manifest_schema,
-                        table_metadata,
-                    )?;
-
-                // Apply filtered statistics
-                manifest_writer.apply_filtered_stats(&filtered_stats);
+                let (manifest_writer, filtered_stats) = ManifestWriter::from_existing_with_filter(
+                    &bytes,
+                    manifest,
+                    &data_files_to_filter,
+                    &manifest_schema,
+                    table_metadata,
+                )?;
 
                 let new_manifest = manifest_writer.finish(object_store.clone()).await?;
 
@@ -1388,6 +1390,9 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
             removed_stats.removed_data_files += filtered_stats.removed_data_files;
             removed_stats.removed_records += filtered_stats.removed_records;
             removed_stats.removed_file_size_bytes += filtered_stats.removed_file_size_bytes;
+            removed_stats
+                .filtered_entries
+                .extend(filtered_stats.filtered_entries);
 
             if manifest.added_files_count.unwrap_or(0) > 0
                 || manifest.existing_files_count.unwrap_or(0) > 0

@@ -13,6 +13,7 @@ use iceberg_rust::catalog::Catalog;
 use iceberg_rust::error::Error;
 use iceberg_rust::object_store::ObjectStoreBuilder;
 use iceberg_rust::table::Table;
+use iceberg_rust_spec::spec::manifest::Status;
 use iceberg_rust_spec::spec::partition::{PartitionField, PartitionSpec, Transform};
 use iceberg_rust_spec::spec::schema::Schema;
 use iceberg_rust_spec::spec::types::{PrimitiveType, StructField, Type};
@@ -176,6 +177,19 @@ async fn test_table_transaction_overwrite() {
         "Current snapshot should be an overwrite operation"
     );
 
+    let overwrite_manifests = table.manifests(None, None).await.unwrap();
+    let current_snapshot_id = *current_snapshot.snapshot_id();
+    assert!(overwrite_manifests.iter().any(|manifest| {
+        manifest.added_snapshot_id == current_snapshot_id
+            && manifest.added_files_count.unwrap_or(0) > 0
+    }));
+    assert!(overwrite_manifests.iter().any(|manifest| {
+        manifest.added_snapshot_id == current_snapshot_id
+            && manifest.deleted_files_count.unwrap_or(0) > 0
+            && manifest.added_files_count.unwrap_or(0) == 0
+            && manifest.existing_files_count.unwrap_or(0) == 0
+    }));
+
     // Count total data files in the final state
     let final_manifest_entries = table
         .manifests(None, None)
@@ -199,6 +213,9 @@ async fn test_table_transaction_overwrite() {
             .into_iter()
             .try_for_each(|result| {
                 let (_, entry) = result?;
+                if *entry.status() == Status::Deleted {
+                    return Ok(());
+                }
                 total_data_files += 1;
 
                 // Count files by partition
@@ -254,7 +271,10 @@ async fn test_table_transaction_overwrite() {
         data_files
             .into_iter()
             .try_for_each(|result| {
-                all_manifest_entries.push(result?.1);
+                let entry = result?.1;
+                if *entry.status() != Status::Deleted {
+                    all_manifest_entries.push(entry);
+                }
                 Ok::<_, Error>(())
             })
             .expect("Failed to collect manifest entries");
@@ -465,6 +485,12 @@ async fn test_overwrite_removes_files_without_replacements() {
     );
 
     let manifests = table.manifests(None, None).await.unwrap();
+    assert!(manifests.iter().any(|manifest| {
+        manifest.added_snapshot_id == *current_snapshot.snapshot_id()
+            && manifest.deleted_files_count.unwrap_or(0) > 0
+            && manifest.added_files_count.unwrap_or(0) == 0
+            && manifest.existing_files_count.unwrap_or(0) == 0
+    }));
     let entries = table
         .datafiles(&manifests, None, (None, None))
         .await
@@ -474,6 +500,7 @@ async fn test_overwrite_removes_files_without_replacements() {
     let live_entries = entries
         .into_iter()
         .map(|result| result.unwrap().1)
+        .filter(|entry| *entry.status() != Status::Deleted)
         .collect::<Vec<_>>();
     let batches = read(live_entries.into_iter(), table.object_store())
         .await
@@ -790,7 +817,9 @@ async fn test_overwrite_keeping_surviving_entries_in_filtered_manifest() {
             .await;
         entries
             .into_iter()
-            .map(|r| r.unwrap().1.data_file().file_path().to_owned())
+            .map(|r| r.unwrap().1)
+            .filter(|entry| *entry.status() != Status::Deleted)
+            .map(|entry| entry.data_file().file_path().to_owned())
             .collect()
     };
 
