@@ -17,6 +17,11 @@ impl<T> From<apis::Error<T>> for Error {
                 content,
                 entity: _,
             }) => Error::NotFound(content),
+            apis::Error::ResponseError(ResponseContent {
+                status: StatusCode::CONFLICT,
+                content,
+                entity: _,
+            }) => Error::CommitConflict(content),
             apis::Error::ResponseError(err) => Error::InvalidFormat(format!(
                 "Response status: {}, Response content: {}",
                 err.status, err.content
@@ -24,5 +29,22 @@ impl<T> From<apis::Error<T>> for Error {
             apis::Error::AWSV4SignatureError(err) => Error::External(Box::new(err)),
             apis::Error::OAuthToken(err) => err,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn response_conflict_is_structured_commit_conflict() {
+        let error: Error = apis::Error::<()>::ResponseError(ResponseContent {
+            status: StatusCode::CONFLICT,
+            content: "concurrent commit".to_string(),
+            entity: None,
+        })
+        .into();
+
+        assert!(matches!(error, Error::CommitConflict(message) if message == "concurrent commit"));
     }
 }
