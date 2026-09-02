@@ -25,7 +25,6 @@ object_store = { workspace = true }
 parquet-variant-compute = "59"
 pin-project-lite = "0.2.17"
 regex = { workspace = true }
-rust_decimal = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { version = "1.50", features = ["rt-multi-thread", "sync"] }
