@@ -4,7 +4,7 @@ on:
   push:
     branches: [ "main" ]
   pull_request:
-    branches: [ "main", "df*" ]
+    branches: [ "main", "df*", "embucket-sync-*" ]
 
 env:
   CARGO_TERM_COLOR: always
