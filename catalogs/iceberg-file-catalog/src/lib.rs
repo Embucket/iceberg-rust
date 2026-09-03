@@ -40,7 +40,7 @@ pub struct FileCatalog {
     path: String,
     object_store: ObjectStoreBuilder,
     cache: Arc<RwLock<HashMap<Identifier, (String, TabularMetadata)>>>,
-    renamed_sources: Arc<RwLock<HashSet<Identifier>>>,
+    renamed_tables: Arc<RwLock<HashMap<Identifier, Identifier>>>,
 }
 
 pub mod error;
@@ -51,7 +51,7 @@ impl FileCatalog {
             path: path.to_owned(),
             object_store,
             cache: Arc::new(RwLock::new(HashMap::new())),
-            renamed_sources: Arc::new(RwLock::new(HashSet::new())),
+            renamed_tables: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -153,9 +153,16 @@ impl Catalog for FileCatalog {
             .try_collect::<HashSet<_>>()
             .await?;
 
-        let renamed_sources = self.renamed_sources.read().unwrap();
-        identifiers.retain(|identifier| !renamed_sources.contains(identifier));
-        drop(renamed_sources);
+        let renamed_tables = self.renamed_tables.read().unwrap();
+        for (destination, source) in renamed_tables.iter() {
+            if destination != source {
+                identifiers.remove(source);
+            }
+            if destination.namespace() == namespace {
+                identifiers.insert(destination.clone());
+            }
+        }
+        drop(renamed_tables);
 
         identifiers.extend(
             self.cache
@@ -242,9 +249,11 @@ impl Catalog for FileCatalog {
         cache.insert(destination.clone(), (metadata_location, metadata));
         drop(cache);
 
-        let mut renamed_sources = self.renamed_sources.write().unwrap();
-        renamed_sources.insert(source.clone());
-        renamed_sources.remove(destination);
+        let mut renamed_tables = self.renamed_tables.write().unwrap();
+        let physical_source = renamed_tables
+            .remove(source)
+            .unwrap_or_else(|| source.clone());
+        renamed_tables.insert(destination.clone(), physical_source);
         Ok(())
     }
     async fn drop_view(&self, identifier: &Identifier) -> Result<(), IcebergError> {
@@ -336,7 +345,6 @@ impl Catalog for FileCatalog {
             identifier.clone(),
             (metadata_location.clone(), metadata.clone().into()),
         );
-        self.renamed_sources.write().unwrap().remove(&identifier);
         Ok(Table::new(
             identifier.clone(),
             self.clone(),
@@ -379,7 +387,6 @@ impl Catalog for FileCatalog {
             identifier.clone(),
             (metadata_location.clone(), metadata.clone().into()),
         );
-        self.renamed_sources.write().unwrap().remove(&identifier);
         Ok(View::new(identifier.clone(), self.clone(), metadata).await?)
     }
 
@@ -430,8 +437,6 @@ impl Catalog for FileCatalog {
             identifier.clone(),
             (metadata_location.clone(), metadata.clone().into()),
         );
-        self.renamed_sources.write().unwrap().remove(&identifier);
-
         Ok(MaterializedView::new(identifier.clone(), self.clone(), metadata).await?)
     }
 
@@ -650,19 +655,17 @@ impl FileCatalog {
         let bucket = Bucket::from_path(&self.path)?;
         let object_store = self.object_store.build(bucket)?;
 
-        let cached_location = self
-            .cache
+        let physical_identifier = self
+            .renamed_tables
             .read()
             .unwrap()
             .get(identifier)
-            .map(|(metadata_location, _)| metadata_location.clone());
-        let tabular_path = cached_location
-            .as_deref()
-            .and_then(|location| location.rsplit_once("/metadata/").map(|(path, _)| path))
-            .map_or_else(
-                || self.tabular_path(&identifier.namespace()[0], identifier.name()),
-                ToOwned::to_owned,
-            );
+            .cloned()
+            .unwrap_or_else(|| identifier.clone());
+        let tabular_path = self.tabular_path(
+            &physical_identifier.namespace()[0],
+            physical_identifier.name(),
+        );
         let prefix = strip_prefix(&tabular_path);
         let paths: Vec<_> = object_store
             .list(Some(&prefix.as_str().into()))
@@ -679,21 +682,31 @@ impl FileCatalog {
         }
 
         self.cache.write().unwrap().remove(identifier);
+        self.renamed_tables.write().unwrap().remove(identifier);
         Ok(())
     }
 
     async fn metadata_location(&self, identifier: &Identifier) -> Result<String, IcebergError> {
-        if self.renamed_sources.read().unwrap().contains(identifier) {
-            return Err(IcebergError::CatalogNotFound);
-        }
-        if let Some((metadata_location, _)) = self.cache.read().unwrap().get(identifier) {
-            return Ok(metadata_location.clone());
-        }
+        let physical_identifier = {
+            let renamed_tables = self.renamed_tables.read().unwrap();
+            if renamed_tables.values().any(|source| source == identifier)
+                && !renamed_tables.contains_key(identifier)
+            {
+                return Err(IcebergError::CatalogNotFound);
+            }
+            renamed_tables
+                .get(identifier)
+                .cloned()
+                .unwrap_or_else(|| identifier.clone())
+        };
 
         let bucket = Bucket::from_path(&self.path)?;
         let object_store = self.object_store.build(bucket)?;
 
-        let path = self.tabular_path(&identifier.namespace()[0], identifier.name()) + "/metadata";
+        let path = self.tabular_path(
+            &physical_identifier.namespace()[0],
+            physical_identifier.name(),
+        ) + "/metadata";
         let mut files: Vec<String> = object_store
             .list(Some(&strip_prefix(&path).into()))
             .map_ok(|x| x.location.to_string())
@@ -901,7 +914,7 @@ impl CatalogList for FileCatalogList {
             path: self.path.clone() + "/" + name,
             object_store: self.object_store.clone(),
             cache: Arc::new(RwLock::new(HashMap::new())),
-            renamed_sources: Arc::new(RwLock::new(HashSet::new())),
+            renamed_tables: Arc::new(RwLock::new(HashMap::new())),
         }))
     }
     async fn list_catalogs(&self) -> Vec<String> {
