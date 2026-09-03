@@ -298,6 +298,20 @@ impl Catalog for RestCatalog {
         .await
         .map_err(Into::<Error>::into)
     }
+    /// Rename a table through the Iceberg REST catalog's atomic endpoint.
+    async fn rename_table(
+        &self,
+        source: &Identifier,
+        destination: &Identifier,
+    ) -> Result<(), Error> {
+        catalog_api_api::rename_table(
+            &self.configuration,
+            self.name.as_deref(),
+            models::RenameTableRequest::new(source.clone(), destination.clone()),
+        )
+        .await
+        .map_err(Into::<Error>::into)
+    }
     /// Drop a table and delete all data and metadata files.
     async fn drop_view(&self, identifier: &Identifier) -> Result<(), Error> {
         let configuration = self.configuration.clone();

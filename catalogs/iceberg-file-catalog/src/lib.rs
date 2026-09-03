@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     convert::identity,
     sync::{Arc, RwLock},
 };
@@ -40,6 +40,7 @@ pub struct FileCatalog {
     path: String,
     object_store: ObjectStoreBuilder,
     cache: Arc<RwLock<HashMap<Identifier, (String, TabularMetadata)>>>,
+    renamed_tables: Arc<RwLock<HashMap<Identifier, Identifier>>>,
 }
 
 pub mod error;
@@ -50,6 +51,7 @@ impl FileCatalog {
             path: path.to_owned(),
             object_store,
             cache: Arc::new(RwLock::new(HashMap::new())),
+            renamed_tables: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -139,7 +141,7 @@ impl Catalog for FileCatalog {
         let bucket = Bucket::from_path(&self.path)?;
         let object_store = self.object_store.build(bucket)?;
 
-        object_store
+        let mut identifiers: HashSet<Identifier> = object_store
             .list(Some(
                 &strip_prefix(&self.namespace_path(&namespace[0])).into(),
             ))
@@ -148,8 +150,32 @@ impl Catalog for FileCatalog {
                 let path = x.location.as_ref();
                 self.identifier(path)
             })
-            .try_collect()
-            .await
+            .try_collect::<HashSet<_>>()
+            .await?;
+
+        let renamed_tables = self.renamed_tables.read().unwrap();
+        for (destination, source) in renamed_tables.iter() {
+            if destination != source {
+                identifiers.remove(source);
+            }
+            if destination.namespace() == namespace {
+                identifiers.insert(destination.clone());
+            }
+        }
+        drop(renamed_tables);
+
+        identifiers.extend(
+            self.cache
+                .read()
+                .unwrap()
+                .keys()
+                .filter(|identifier| identifier.namespace() == namespace)
+                .cloned(),
+        );
+
+        let mut identifiers = identifiers.into_iter().collect::<Vec<_>>();
+        identifiers.sort_by_key(ToString::to_string);
+        Ok(identifiers)
     }
     async fn list_namespaces(&self, _parent: Option<&str>) -> Result<Vec<Namespace>, IcebergError> {
         let bucket = Bucket::from_path(&self.path)?;
@@ -174,6 +200,61 @@ impl Catalog for FileCatalog {
     }
     async fn drop_table(&self, identifier: &Identifier) -> Result<(), IcebergError> {
         self.drop_tabular(identifier).await
+    }
+    async fn rename_table(
+        &self,
+        source: &Identifier,
+        destination: &Identifier,
+    ) -> Result<(), IcebergError> {
+        if !matches!(self.object_store, ObjectStoreBuilder::Memory(_)) {
+            return Err(IcebergError::NotSupported(
+                "rename table in persistent file catalogs".to_string(),
+            ));
+        }
+        if source == destination {
+            return Ok(());
+        }
+        if self.tabular_exists(destination).await? {
+            return Err(IcebergError::InvalidFormat(format!(
+                "Destination table {destination} already exists"
+            )));
+        }
+
+        let metadata_location = self.metadata_location(source).await?;
+        let cached_metadata = {
+            let cache = self.cache.read().unwrap();
+            cache.get(source).map(|(_, metadata)| metadata.clone())
+        };
+        let metadata = if let Some(metadata) = cached_metadata {
+            metadata
+        } else {
+            let bucket = Bucket::from_path(&self.path)?;
+            let object_store = self.object_store.build(bucket)?;
+            let bytes = object_store
+                .get(&strip_prefix(&metadata_location).as_str().into())
+                .await
+                .map_err(|_| IcebergError::CatalogNotFound)?
+                .bytes()
+                .await?;
+            serde_json::from_slice(&bytes)?
+        };
+        if !matches!(metadata, TabularMetadata::Table(_)) {
+            return Err(IcebergError::InvalidFormat(format!(
+                "Source {source} is not a table"
+            )));
+        }
+
+        let mut cache = self.cache.write().unwrap();
+        cache.remove(source);
+        cache.insert(destination.clone(), (metadata_location, metadata));
+        drop(cache);
+
+        let mut renamed_tables = self.renamed_tables.write().unwrap();
+        let physical_source = renamed_tables
+            .remove(source)
+            .unwrap_or_else(|| source.clone());
+        renamed_tables.insert(destination.clone(), physical_source);
+        Ok(())
     }
     async fn drop_view(&self, identifier: &Identifier) -> Result<(), IcebergError> {
         self.drop_tabular(identifier).await
@@ -356,7 +437,6 @@ impl Catalog for FileCatalog {
             identifier.clone(),
             (metadata_location.clone(), metadata.clone().into()),
         );
-
         Ok(MaterializedView::new(identifier.clone(), self.clone(), metadata).await?)
     }
 
@@ -575,8 +655,18 @@ impl FileCatalog {
         let bucket = Bucket::from_path(&self.path)?;
         let object_store = self.object_store.build(bucket)?;
 
-        let prefix =
-            strip_prefix(&self.tabular_path(&identifier.namespace()[0], identifier.name()));
+        let physical_identifier = self
+            .renamed_tables
+            .read()
+            .unwrap()
+            .get(identifier)
+            .cloned()
+            .unwrap_or_else(|| identifier.clone());
+        let tabular_path = self.tabular_path(
+            &physical_identifier.namespace()[0],
+            physical_identifier.name(),
+        );
+        let prefix = strip_prefix(&tabular_path);
         let paths: Vec<_> = object_store
             .list(Some(&prefix.as_str().into()))
             .map_ok(|x| x.location)
@@ -592,14 +682,31 @@ impl FileCatalog {
         }
 
         self.cache.write().unwrap().remove(identifier);
+        self.renamed_tables.write().unwrap().remove(identifier);
         Ok(())
     }
 
     async fn metadata_location(&self, identifier: &Identifier) -> Result<String, IcebergError> {
+        let physical_identifier = {
+            let renamed_tables = self.renamed_tables.read().unwrap();
+            if renamed_tables.values().any(|source| source == identifier)
+                && !renamed_tables.contains_key(identifier)
+            {
+                return Err(IcebergError::CatalogNotFound);
+            }
+            renamed_tables
+                .get(identifier)
+                .cloned()
+                .unwrap_or_else(|| identifier.clone())
+        };
+
         let bucket = Bucket::from_path(&self.path)?;
         let object_store = self.object_store.build(bucket)?;
 
-        let path = self.tabular_path(&identifier.namespace()[0], identifier.name()) + "/metadata";
+        let path = self.tabular_path(
+            &physical_identifier.namespace()[0],
+            physical_identifier.name(),
+        ) + "/metadata";
         let mut files: Vec<String> = object_store
             .list(Some(&strip_prefix(&path).into()))
             .map_ok(|x| x.location.to_string())
@@ -807,6 +914,7 @@ impl CatalogList for FileCatalogList {
             path: self.path.clone() + "/" + name,
             object_store: self.object_store.clone(),
             cache: Arc::new(RwLock::new(HashMap::new())),
+            renamed_tables: Arc::new(RwLock::new(HashMap::new())),
         }))
     }
     async fn list_catalogs(&self) -> Vec<String> {
@@ -843,9 +951,13 @@ pub mod tests {
     };
     use futures::StreamExt;
     use iceberg_rust::{
-        catalog::{namespace::Namespace, Catalog},
+        catalog::{create::CreateTableBuilder, namespace::Namespace, Catalog},
         object_store::{Bucket, ObjectStoreBuilder},
-        spec::util::strip_prefix,
+        spec::{
+            schema::Schema,
+            types::{PrimitiveType, StructField, Type},
+            util::strip_prefix,
+        },
     };
     use object_store::ObjectStoreExt;
     use std::{sync::Arc, time::Duration};
@@ -856,6 +968,49 @@ pub mod tests {
     // use testcontainers_modules::localstack::LocalStack;
 
     use crate::FileCatalog;
+
+    #[tokio::test]
+    async fn rename_table_in_memory_moves_catalog_identity() {
+        let catalog = Arc::new(
+            FileCatalog::new("/dev/embucket", ObjectStoreBuilder::memory())
+                .await
+                .unwrap(),
+        );
+        let namespace = Namespace::try_new(&["public".to_string()]).unwrap();
+        let source = iceberg_rust::catalog::identifier::Identifier::new(&namespace, "source_table");
+        let destination =
+            iceberg_rust::catalog::identifier::Identifier::new(&namespace, "destination_table");
+        let schema = Schema::builder()
+            .with_struct_field(StructField {
+                id: 1,
+                name: "id".to_string(),
+                required: true,
+                field_type: Type::Primitive(PrimitiveType::Long),
+                doc: None,
+                initial_default: None,
+                write_default: None,
+            })
+            .build()
+            .unwrap();
+        let mut builder = CreateTableBuilder::default();
+        builder
+            .with_name(source.name())
+            .with_schema(schema)
+            .build(&namespace, catalog.clone())
+            .await
+            .unwrap();
+
+        catalog.rename_table(&source, &destination).await.unwrap();
+
+        assert!(!catalog.tabular_exists(&source).await.unwrap());
+        assert!(catalog.tabular_exists(&destination).await.unwrap());
+        assert_eq!(
+            catalog.list_tabulars(&namespace).await.unwrap(),
+            vec![destination.clone()]
+        );
+        let tabular = catalog.clone().load_tabular(&destination).await.unwrap();
+        assert_eq!(tabular.identifier(), &destination);
+    }
 
     #[tokio::test]
     async fn test_create_update_drop_table() {
