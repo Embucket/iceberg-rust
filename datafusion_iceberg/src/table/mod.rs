@@ -385,12 +385,16 @@ impl TableProvider for DataFusionTable {
         if !self.schema().equivalent_names_and_types(&input.schema()) {
             return plan_err!("Inserting query must have the same schema with the table.");
         }
-        let InsertOp::Append = insert_op else {
-            return not_impl_err!("Overwrite not implemented for MemoryTable yet");
+        let write_operation = match insert_op {
+            InsertOp::Append => IcebergWriteOperation::Append,
+            InsertOp::Overwrite => IcebergWriteOperation::Overwrite,
+            InsertOp::Replace => {
+                return not_impl_err!("REPLACE INTO is not implemented for Iceberg tables");
+            }
         };
         Ok(Arc::new(DataSinkExec::new(
             input,
-            Arc::new(self.clone().into_data_sink()),
+            Arc::new(self.clone().into_data_sink(write_operation)),
             None,
         )))
     }
@@ -1291,18 +1295,30 @@ impl DisplayAs for DataFusionTable {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum IcebergWriteOperation {
+    Append,
+    Overwrite,
+}
+
 #[derive(Debug)]
-pub(crate) struct IcebergDataSink(DataFusionTable);
+pub(crate) struct IcebergDataSink {
+    table: DataFusionTable,
+    operation: IcebergWriteOperation,
+}
 
 impl DataFusionTable {
-    pub(crate) fn into_data_sink(self) -> IcebergDataSink {
-        IcebergDataSink(self)
+    fn into_data_sink(self, operation: IcebergWriteOperation) -> IcebergDataSink {
+        IcebergDataSink {
+            table: self,
+            operation,
+        }
     }
 }
 
 impl DisplayAs for IcebergDataSink {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt_as(t, f)
+        self.table.fmt_as(t, f)
     }
 }
 
@@ -1315,7 +1331,7 @@ impl DataSink for IcebergDataSink {
     ) -> Result<u64, DataFusionError> {
         // Clone the table from the read lock
         let mut table = {
-            let lock = self.0.tabular.read().unwrap();
+            let lock = self.table.tabular.read().unwrap();
             if let Tabular::Table(table) = lock.deref() {
                 Ok(table.clone())
             } else {
@@ -1325,7 +1341,7 @@ impl DataSink for IcebergDataSink {
         };
 
         let metadata_files =
-            write_parquet_data_files(&table, data, context, self.0.branch.as_deref()).await?;
+            write_parquet_data_files(&table, data, context, self.table.branch.as_deref()).await?;
         let written_rows = metadata_files.iter().try_fold(0_u64, |total, file| {
             let file_rows = u64::try_from(*file.record_count()).map_err(|_| {
                 DataFusionError::Execution(format!(
@@ -1340,15 +1356,18 @@ impl DataSink for IcebergDataSink {
             })
         })?;
 
-        table
-            .new_transaction(self.0.branch.as_deref())
-            .append_data(metadata_files)
+        let transaction = table.new_transaction(self.table.branch.as_deref());
+        let transaction = match self.operation {
+            IcebergWriteOperation::Append => transaction.append_data(metadata_files),
+            IcebergWriteOperation::Overwrite => transaction.replace(metadata_files),
+        };
+        transaction
             .commit()
             .await
             .map_err(DataFusionIcebergError::from)?;
 
         // Acquire write lock and overwrite the old table with the new one
-        let mut lock = self.0.tabular.write().unwrap();
+        let mut lock = self.table.tabular.write().unwrap();
         *lock = Tabular::Table(table);
 
         Ok(written_rows)
@@ -1357,7 +1376,7 @@ impl DataSink for IcebergDataSink {
         None
     }
     fn schema(&self) -> &SchemaRef {
-        &self.0.schema
+        &self.table.schema
     }
 }
 
