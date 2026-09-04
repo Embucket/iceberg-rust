@@ -4,9 +4,8 @@
 //!
 //! Notes on divergences:
 //! - DataFusion + iceberg-rust supports `INSERT INTO ... VALUES`,
-//!   `INSERT INTO ... SELECT`, but does not currently support
-//!   `INSERT OVERWRITE` or partition-targeted overwrites. Those upstream
-//!   scenarios are documented in `integration_df_dml_unsupported.rs`.
+//!   `INSERT INTO ... SELECT`, and full-table `INSERT OVERWRITE`.
+//!   Partition-targeted overwrites are not currently supported.
 //! - DELETE / UPDATE / MERGE are not supported by iceberg-rust yet — they
 //!   live in `integration_df_unsupported_row_dml.rs`.
 
@@ -168,4 +167,78 @@ async fn integration_df_insert_then_select_specific_column() {
     .await;
     let sum = execute_scalar_i64(&ctx, "SELECT SUM(id) FROM warehouse.dml_select_col.t").await;
     assert_eq!(sum, 60);
+}
+
+#[tokio::test]
+async fn integration_df_insert_overwrite_replaces_all_rows() {
+    let ctx = boot_df_stack().await;
+    setup_target_table(&ctx, "dml_overwrite", "target").await;
+    setup_target_table(&ctx, "dml_overwrite", "source").await;
+    execute_sql(
+        &ctx,
+        "INSERT INTO warehouse.dml_overwrite.target VALUES \
+         (1, 'old-a'), (2, 'old-b'), (3, 'old-c')",
+    )
+    .await;
+    execute_sql(
+        &ctx,
+        "INSERT INTO warehouse.dml_overwrite.source VALUES \
+         (20, 'new-a'), (30, 'new-b')",
+    )
+    .await;
+
+    execute_sql(
+        &ctx,
+        "INSERT OVERWRITE INTO warehouse.dml_overwrite.target \
+         SELECT id, label FROM warehouse.dml_overwrite.source",
+    )
+    .await;
+
+    let count =
+        execute_scalar_i64(&ctx, "SELECT COUNT(*) FROM warehouse.dml_overwrite.target").await;
+    let sum = execute_scalar_i64(&ctx, "SELECT SUM(id) FROM warehouse.dml_overwrite.target").await;
+    let exact_rows = execute_scalar_i64(
+        &ctx,
+        "SELECT COUNT(*) FROM warehouse.dml_overwrite.target \
+         WHERE (id = 20 AND label = 'new-a') OR (id = 30 AND label = 'new-b')",
+    )
+    .await;
+    let old_rows = execute_scalar_i64(
+        &ctx,
+        "SELECT COUNT(*) FROM warehouse.dml_overwrite.target WHERE id IN (1, 2, 3)",
+    )
+    .await;
+    assert_eq!((count, sum, exact_rows, old_rows), (2, 50, 2, 0));
+}
+
+#[tokio::test]
+async fn integration_df_insert_overwrite_can_empty_table() {
+    let ctx = boot_df_stack().await;
+    setup_target_table(&ctx, "dml_overwrite_empty", "target").await;
+    setup_target_table(&ctx, "dml_overwrite_empty", "source").await;
+    execute_sql(
+        &ctx,
+        "INSERT INTO warehouse.dml_overwrite_empty.target VALUES \
+         (1, 'old-a'), (2, 'old-b')",
+    )
+    .await;
+    execute_sql(
+        &ctx,
+        "INSERT INTO warehouse.dml_overwrite_empty.source VALUES (10, 'source')",
+    )
+    .await;
+
+    execute_sql(
+        &ctx,
+        "INSERT OVERWRITE INTO warehouse.dml_overwrite_empty.target \
+         SELECT id, label FROM warehouse.dml_overwrite_empty.source WHERE id < 0",
+    )
+    .await;
+
+    let count = execute_scalar_i64(
+        &ctx,
+        "SELECT COUNT(*) FROM warehouse.dml_overwrite_empty.target",
+    )
+    .await;
+    assert_eq!(count, 0);
 }
