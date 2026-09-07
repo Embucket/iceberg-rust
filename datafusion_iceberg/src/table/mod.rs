@@ -207,6 +207,9 @@ pub struct DataFusionTableConfig {
     /// With this option, an additional "__data_file_path" column is added to the output of the
     /// TableProvider that contains the path of the data-file the row originates from.
     enable_data_file_path_column: bool,
+    /// With this option, an additional "__iceberg_file_row_position" column is added to the output
+    /// of the TableProvider that contains the zero-based position within the data file.
+    enable_data_file_row_position_column: bool,
     /// With this option, an additional "__manifest_file_path" column is added to the output of the
     /// TableProvider that contains the path of the manifest-file for the data-file the row originates from.
     enable_manifest_file_path_column: bool,
@@ -248,6 +251,16 @@ impl DataFusionTable {
                     .unwrap_or_default()
                 {
                     builder.push(Field::new(MANIFEST_FILE_PATH_COLUMN, DataType::Utf8, true));
+                }
+                if config
+                    .as_ref()
+                    .map(|x| x.enable_data_file_row_position_column)
+                    .unwrap_or_default()
+                {
+                    builder.push(
+                        Field::new(DATA_FILE_ROW_POSITION_COLUMN, DataType::Int64, true)
+                            .with_extension_type(RowNumber),
+                    );
                 }
                 Arc::new(builder.finish())
             }
@@ -504,6 +517,10 @@ async fn table_scan(
         .map(|x| x.enable_data_file_path_column)
         .unwrap_or_default();
 
+    let enable_data_file_row_position_column = config
+        .map(|x| x.enable_data_file_row_position_column)
+        .unwrap_or_default();
+
     let enable_manifest_file_path_column = config
         .map(|x| x.enable_manifest_file_path_column)
         .unwrap_or_default();
@@ -545,11 +562,11 @@ async fn table_scan(
         .and_then(|order| declared_output_ordering(order, &schema, &file_schema));
 
     // If no projection was specified default to projecting all the fields
-    let projection = projection
+    let requested_projection = projection
         .cloned()
         .unwrap_or((0..arrow_schema.fields().len()).collect_vec());
 
-    let projection_expr: Vec<_> = projection
+    let projection_expr: Vec<_> = requested_projection
         .iter()
         .enumerate()
         .map(|(i, id)| {
@@ -777,7 +794,7 @@ async fn table_scan(
                 .map(Arc::new)
                 .collect::<Vec<_>>(),
         );
-    if has_position_deletes {
+    if has_position_deletes || enable_data_file_row_position_column {
         table_schema_builder = table_schema_builder.with_virtual_columns(vec![Arc::new(
             Field::new(DATA_FILE_ROW_POSITION_COLUMN, DataType::Int64, false)
                 .with_extension_type(RowNumber),
@@ -789,6 +806,10 @@ async fn table_scan(
     let table_schema = table_schema_builder.build();
     // File schema plus partition columns: what scan orderings are expressed on.
     let scan_schema: SchemaRef = table_schema.table_schema().clone();
+    let scan_projection = requested_projection
+        .iter()
+        .map(|index| scan_schema.index_of(arrow_schema.field(*index).name()))
+        .collect::<Result<Vec<_>, _>>()?;
     let file_source = Arc::new(
         ParquetSource::new(table_schema)
             .with_parquet_file_reader_factory(parquet_reader_factory.clone()),
@@ -803,7 +824,7 @@ async fn table_scan(
             let file_source = file_source.clone();
             let parquet_reader_factory = parquet_reader_factory.clone();
             let projection_expr = projection_expr.clone();
-            let projection = projection.clone();
+            let scan_projection = scan_projection.clone();
             let scan_schema = scan_schema.clone();
             let mut data_files = data_file_groups
                 .remove(&partition_value)
@@ -829,7 +850,7 @@ async fn table_scan(
                 // each equality delete file may have different deletion columns.
                 // And since we need to reconcile them all with data files using joins and unions,
                 // we need to make sure their schemas are fully compatible in all intermediate nodes.
-                let mut equality_projection = projection.clone();
+                let mut equality_projection = scan_projection.clone();
                 delete_files
                     .equality_deletes
                     .iter()
@@ -1140,7 +1161,7 @@ async fn table_scan(
             FileScanConfigBuilder::new(object_store_url.clone(), file_source.clone())
                 .with_file_groups(unattested_groups)
                 .with_statistics(statistics.clone())
-                .with_projection_indices(Some(projection.clone()))?
+                .with_projection_indices(Some(scan_projection.clone()))?
                 .with_expr_adapter(Some(Arc::new(IcebergPhysicalExprAdapterFactory)))
                 .with_limit(limit)
                 .build();
@@ -1159,7 +1180,7 @@ async fn table_scan(
             .with_file_groups(file_groups)
             .with_statistics(statistics)
             .with_output_ordering(vec![ordering.clone()])
-            .with_projection_indices(Some(projection.clone()))?
+            .with_projection_indices(Some(scan_projection.clone()))?
             .with_expr_adapter(Some(Arc::new(IcebergPhysicalExprAdapterFactory)))
             .with_limit(limit)
             .build();
@@ -1176,7 +1197,7 @@ async fn table_scan(
 
     match plans.len() {
         0 => {
-            let projected_schema = arrow_schema.project(&projection)?;
+            let projected_schema = arrow_schema.project(&requested_projection)?;
             Ok(Arc::new(EmptyExec::new(Arc::new(projected_schema))))
         }
         1 => Ok(plans.remove(0)),
@@ -3339,6 +3360,7 @@ mod tests {
 
         let config = crate::table::DataFusionTableConfigBuilder::default()
             .enable_data_file_path_column(true)
+            .enable_data_file_row_position_column(true)
             .enable_manifest_file_path_column(true)
             .build()
             .unwrap();
@@ -3385,6 +3407,10 @@ mod tests {
                     .schema()
                     .column_with_name("__manifest_file_path")
                     .is_some());
+                assert!(batch
+                    .schema()
+                    .column_with_name("__iceberg_file_row_position")
+                    .is_some());
 
                 let data_file_path_column = batch
                     .column_by_name("__data_file_path")
@@ -3393,6 +3419,10 @@ mod tests {
                 let manifest_file_path_column = batch
                     .column_by_name("__manifest_file_path")
                     .expect("Data file path column should exist");
+
+                let row_position_column = batch
+                    .column_by_name("__iceberg_file_row_position")
+                    .expect("Data file row position column should exist");
 
                 for i in 0..batch.num_rows() {
                     let value = data_file_path_column
@@ -3415,6 +3445,12 @@ mod tests {
                         value.contains(".avro"),
                         "Manifest file path should contain .avro"
                     );
+                    let value = row_position_column
+                        .as_any()
+                        .downcast_ref::<datafusion::arrow::array::Int64Array>()
+                        .unwrap()
+                        .value(i);
+                    assert!(value >= 0, "Data file row position should be non-negative");
                 }
             }
         }
