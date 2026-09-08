@@ -1457,12 +1457,15 @@ fn generate_partitioned_file(
         version: None,
     };
     let file = PartitionedFile {
+        // Per-file hint wins over the source-level one in the opener; without it the
+        // parquet reader prefetches an 8-byte tail and every cold metadata load costs
+        // 2-3 sequential ranged GETs instead of one.
+        metadata_size_hint: crate::parquet_metadata_cache::metadata_size_hint(object_meta.size),
         object_meta,
         partition_values,
         range: None,
         statistics: Some(Arc::new(manifest_statistics)),
         extensions: Default::default(),
-        metadata_size_hint: None,
         ordering: None,
         table_reference: None,
         arrow_schema: None,
@@ -1509,6 +1512,10 @@ fn apply_position_deletes(
                     ))
                 })?,
             );
+            // Same footer prefetch hint as data files: a cold metadata load of a
+            // delete file should also cost one ranged read, not two or three.
+            file.metadata_size_hint =
+                crate::parquet_metadata_cache::metadata_size_hint(file.object_meta.size);
             let sequence_number = entry
                 .sequence_number()
                 .as_ref()
