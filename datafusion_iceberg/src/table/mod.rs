@@ -1512,6 +1512,10 @@ fn apply_position_deletes(
                     ))
                 })?,
             );
+            // Same footer prefetch hint as data files: a cold metadata load of a
+            // delete file should also cost one ranged read, not two or three.
+            file.metadata_size_hint =
+                crate::parquet_metadata_cache::metadata_size_hint(file.object_meta.size);
             let sequence_number = entry
                 .sequence_number()
                 .as_ref()
