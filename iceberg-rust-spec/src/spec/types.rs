@@ -546,6 +546,11 @@ impl StructType {
             .map(|x| x.0.to_owned())
             .sorted()
     }
+
+    /// Returns the largest field ID in this struct, including nested fields.
+    pub fn max_field_id(&self) -> Option<i32> {
+        self.fields.iter().map(StructField::max_field_id).max()
+    }
 }
 
 impl Index<usize> for StructType {
@@ -611,6 +616,13 @@ impl StructField {
             write_default: None,
         }
     }
+
+    /// Returns the largest field ID in this field and its nested type.
+    pub fn max_field_id(&self) -> i32 {
+        self.field_type
+            .max_nested_field_id()
+            .map_or(self.id, |nested_id| self.id.max(nested_id))
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
@@ -648,6 +660,31 @@ pub struct MapType {
 }
 
 impl Type {
+    fn max_nested_field_id(&self) -> Option<i32> {
+        match self {
+            Self::Primitive(_) => None,
+            Self::Struct(struct_type) => struct_type.max_field_id(),
+            Self::List(list_type) => Some(
+                list_type
+                    .element
+                    .max_nested_field_id()
+                    .map_or(list_type.element_id, |nested_id| {
+                        list_type.element_id.max(nested_id)
+                    }),
+            ),
+            Self::Map(map_type) => {
+                let mut max_id = map_type.key_id.max(map_type.value_id);
+                if let Some(nested_id) = map_type.key.max_nested_field_id() {
+                    max_id = max_id.max(nested_id);
+                }
+                if let Some(nested_id) = map_type.value.max_nested_field_id() {
+                    max_id = max_id.max(nested_id);
+                }
+                Some(max_id)
+            }
+        }
+    }
+
     /// Perform a partition transformation for the given type
     pub fn tranform(&self, transform: &Transform) -> Result<Type, Error> {
         match transform {
@@ -666,6 +703,35 @@ impl Type {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn max_field_id_includes_nested_collection_fields() {
+        let struct_type = StructType::new(vec![StructField::new(
+            2,
+            "attributes",
+            false,
+            Type::Map(MapType {
+                key_id: 3,
+                key: Box::new(Type::Primitive(PrimitiveType::String)),
+                value_id: 4,
+                value_required: false,
+                value: Box::new(Type::List(ListType {
+                    element_id: 5,
+                    element_required: false,
+                    element: Box::new(Type::Struct(StructType::new(vec![StructField::new(
+                        6,
+                        "nested",
+                        false,
+                        Type::Primitive(PrimitiveType::Long),
+                        None,
+                    )]))),
+                })),
+            }),
+            None,
+        )]);
+
+        assert_eq!(struct_type.max_field_id(), Some(6));
+    }
 
     fn check_type_serde(json: &str, expected_type: Type) {
         let desered_type: Type = serde_json::from_str(json).unwrap();

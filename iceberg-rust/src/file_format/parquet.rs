@@ -113,7 +113,7 @@ pub fn parquet_to_datafile(
     for row_group in file_metadata.row_groups() {
         // Variant is one logical Iceberg field backed by multiple Parquet
         // leaves. Count it once per row group and combine leaf null counts.
-        let mut counted_variant_values = HashSet::new();
+        let mut counted_logical_values = HashSet::new();
         let mut variant_null_counts = HashMap::<i32, i64>::new();
         for column in row_group.columns() {
             let column_name = column.column_descr().name();
@@ -128,6 +128,8 @@ pub fn parquet_to_datafile(
                 .ok_or_else(|| Error::Schema(column_name.to_string(), "".to_string()))?
                 .field_type;
             let is_variant = matches!(data_type, Type::Primitive(PrimitiveType::Variant));
+            let is_container = matches!(data_type, Type::List(_) | Type::Map(_) | Type::Struct(_));
+            let is_multi_leaf_logical_field = is_variant || is_container;
 
             let top_level_index = column_path
                 .split('.')
@@ -142,7 +144,9 @@ pub fn parquet_to_datafile(
                 .entry(id)
                 .and_modify(|x| *x += column.compressed_size())
                 .or_insert(column.compressed_size());
-            if metrics_mode.records_counts() && (!is_variant || counted_variant_values.insert(id)) {
+            if metrics_mode.records_counts()
+                && (!is_multi_leaf_logical_field || counted_logical_values.insert(id))
+            {
                 value_counts
                     .entry(id)
                     .and_modify(|x| *x += row_group.num_rows())
@@ -159,7 +163,7 @@ pub fn parquet_to_datafile(
                             .entry(id)
                             .and_modify(|count| *count = (*count).max(null_count as i64))
                             .or_insert(null_count as i64);
-                    } else {
+                    } else if !is_container {
                         null_value_counts
                             .entry(id)
                             .and_modify(|x| *x += null_count as i64)
@@ -181,7 +185,10 @@ pub fn parquet_to_datafile(
 
                 if let Some(distinct_counts) = distinct_counts
                     .as_mut()
-                    .filter(|_| metrics_mode.records_counts() && !is_variant)
+                    .filter(|_| {
+                        metrics_mode.records_counts()
+                            && matches!(data_type, Type::Primitive(primitive) if !matches!(primitive, PrimitiveType::Variant))
+                    })
                 {
                     if let (Some(distinct_count), Some(min_bytes), Some(max_bytes)) = (
                         statistics.distinct_count_opt(),
@@ -595,11 +602,12 @@ mod metrics_mode_tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use arrow::array::{ArrayRef, StringArray};
+    use arrow::array::{ArrayRef, Int64Array, MapArray, StringArray, StructArray};
+    use arrow::buffer::OffsetBuffer;
     use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use arrow::record_batch::RecordBatch;
     use iceberg_rust_spec::spec::schema::Schema;
-    use iceberg_rust_spec::spec::types::{PrimitiveType, StructField, Type};
+    use iceberg_rust_spec::spec::types::{MapType, PrimitiveType, StructField, Type};
     use iceberg_rust_spec::spec::values::Value;
     use iceberg_rust_spec::table_metadata::{
         WRITE_METADATA_METRICS_COLUMN_PREFIX, WRITE_METADATA_METRICS_DEFAULT,
@@ -794,6 +802,79 @@ mod metrics_mode_tests {
         assert!(datafile.column_sizes().as_ref().unwrap().get(&0).is_some());
         assert_eq!(datafile.lower_bounds().as_ref().unwrap().get(&0), None);
         assert_eq!(datafile.upper_bounds().as_ref().unwrap().get(&0), None);
+    }
+
+    #[test]
+    fn map_metrics_do_not_treat_empty_maps_as_null_maps() {
+        let iceberg_schema = Schema::builder()
+            .with_struct_field(StructField::new(
+                2,
+                "attrs",
+                false,
+                Type::Map(MapType {
+                    key_id: 3,
+                    key: Box::new(Type::Primitive(PrimitiveType::String)),
+                    value_id: 4,
+                    value: Box::new(Type::Primitive(PrimitiveType::Long)),
+                    value_required: false,
+                }),
+                None,
+            ))
+            .build()
+            .unwrap();
+        let entry_fields = arrow::datatypes::Fields::from(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("value", DataType::Int64, true),
+        ]);
+        let entries = StructArray::try_new(
+            entry_fields.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["alpha", "beta"])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![10, 20])) as ArrayRef,
+            ],
+            None,
+        )
+        .unwrap();
+        let entries_field = Arc::new(Field::new("entries", DataType::Struct(entry_fields), false));
+        let attrs = Arc::new(
+            MapArray::try_new(
+                Arc::clone(&entries_field),
+                OffsetBuffer::new(vec![0, 2, 2].into()),
+                entries,
+                None,
+                false,
+            )
+            .unwrap(),
+        ) as ArrayRef;
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "attrs",
+            DataType::Map(entries_field, false),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(Arc::clone(&arrow_schema), vec![attrs]).unwrap();
+
+        let mut buffer = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut buffer, arrow_schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let file_size = buffer.len() as u64;
+        let reader = SerializedFileReader::new(bytes::Bytes::from(buffer)).unwrap();
+        let datafile = parquet_to_datafile(
+            "/t/data/map.parquet",
+            file_size,
+            reader.metadata(),
+            &iceberg_schema,
+            &[],
+            None,
+            &HashMap::new(),
+        )
+        .unwrap();
+
+        assert_eq!(datafile.value_counts().as_ref().unwrap().get(&2), Some(&2));
+        assert_eq!(datafile.null_value_counts().as_ref().unwrap().get(&2), None);
+        assert!(datafile.column_sizes().as_ref().unwrap().get(&2).is_some());
+        assert_eq!(datafile.lower_bounds().as_ref().unwrap().get(&2), None);
+        assert_eq!(datafile.upper_bounds().as_ref().unwrap().get(&2), None);
     }
 }
 

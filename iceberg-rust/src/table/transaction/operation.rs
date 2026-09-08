@@ -875,7 +875,7 @@ impl Operation {
                     "Executing AddSchema operation: schema_id={:?}",
                     schema.schema_id()
                 );
-                let last_column_id = schema.fields().iter().map(|x| x.id).max();
+                let last_column_id = schema.fields().max_field_id();
                 Ok((
                     None,
                     vec![TableUpdate::AddSchema {
