@@ -115,7 +115,11 @@ impl Operation {
                         .unwrap()
                         .schema_id()
                 };
-                let last_column_id = schema.iter().map(|x| x.id).max().unwrap_or(0);
+                let last_column_id = schema
+                    .iter()
+                    .map(iceberg_rust_spec::spec::types::StructField::max_field_id)
+                    .max()
+                    .unwrap_or(0);
 
                 let version = Version {
                     version_id,

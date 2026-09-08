@@ -198,7 +198,7 @@ impl TryInto<TableMetadata> for CreateTable {
             .map(FormatVersion::try_from)
             .transpose()?
             .unwrap_or_default();
-        let last_column_id = self.schema.fields().iter().map(|x| x.id).max().unwrap_or(0);
+        let last_column_id = self.schema.fields().max_field_id().unwrap_or(0);
 
         let last_partition_id = self
             .partition_spec
