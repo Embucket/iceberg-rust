@@ -594,17 +594,17 @@ impl PrefetchPlan {
         let Some(&(group, position)) = self.index.get(location) else {
             return Vec::new();
         };
-        self.scheduled[group][position] = true;
         let files = &self.groups[group];
+        let scheduled = &mut self.scheduled[group];
+        scheduled[position] = true;
         let end = position.saturating_add(ahead).min(files.len() - 1);
-        let mut next = Vec::new();
-        for candidate in position + 1..=end {
-            if !self.scheduled[group][candidate] {
-                self.scheduled[group][candidate] = true;
-                next.push(files[candidate].clone());
-            }
-        }
-        next
+        files
+            .iter()
+            .zip(scheduled.iter_mut())
+            .take(end + 1)
+            .skip(position + 1)
+            .filter_map(|(file, flag)| (!std::mem::replace(flag, true)).then(|| file.clone()))
+            .collect()
     }
 }
 
