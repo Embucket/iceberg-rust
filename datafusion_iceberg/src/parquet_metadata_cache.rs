@@ -73,6 +73,28 @@ once the cache demonstrates, by evicting, that the working set does not fit. The
 guard is one-way and fails safe — see [`MetadataCache::note_evictions`].
 `parquet_metadata_cache_page_index_suppressed` reports when it has engaged.
 
+# Look-ahead prefetch
+
+DataFusion's morsel-driven `FileStream` (55.0) opens files strictly one after
+another per partition: the footer (and page index) of file *N+1* is fetched only
+once file *N* has been fully consumed, so on a cold cache every file pays its
+metadata round trip on the query's critical path. Measured on TPC-H SF100 Q1
+(929 lineitem files, 5 partitions) that is ~82 s of serialized `metadata_load_time`
+against ~2 s when the loads were overlapped with scanning.
+
+When `ICEBERG_PARQUET_METADATA_PREFETCH_FILES` is set to `k > 0` (read once per
+process; default `0`, disabled), the scan registers each file group in consumption
+order with its [`CachingParquetFileReaderFactory`]; every time the opener creates a
+reader for a file, the next `k` not-yet-scheduled files of that group are loaded
+into the cache by detached tasks, at most
+`ICEBERG_PARQUET_METADATA_PREFETCH_CONCURRENCY` (default 8) in flight process-wide.
+The opener's own `get_metadata` then finds the entry (or joins the in-flight
+single-flight gate). Memory is bounded by the cache cap as usual: the window is
+`k` entries per active reader, and nothing is retained outside the LRU. When the
+cache is disabled (cap `0`) prefetching is a no-op. Prefetched loads count as
+`parquet_metadata_cache_misses` plus `parquet_metadata_prefetched`; the opener's
+subsequent lookups count as hits.
+
 # Accounting
 
 Hits, misses and evictions are reported as DataFusion plan metrics on the scan
@@ -104,6 +126,7 @@ straight through with no gate and no lock, exactly as before single-flight.
 [`ParquetSource`]: datafusion::datasource::physical_plan::parquet::source::ParquetSource
 */
 
+use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -124,6 +147,7 @@ use futures::FutureExt;
 use lru::LruCache;
 use object_store::ObjectStore;
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::Semaphore;
 
 const DEFAULT_CAP_MB: usize = 64;
 
@@ -232,6 +256,9 @@ struct CacheMetrics {
     /// latched. Non-zero means this deployment's working set outgrew the cache and
     /// the optimization backed itself off.
     page_index_suppressed: Count,
+    /// Footers loaded into the cache by the look-ahead prefetcher rather than by
+    /// the opener that needed them.
+    prefetched: Count,
 }
 
 impl CacheMetrics {
@@ -243,6 +270,8 @@ impl CacheMetrics {
                 .counter("parquet_metadata_cache_evictions", partition),
             page_index_suppressed: MetricBuilder::new(metrics)
                 .counter("parquet_metadata_cache_page_index_suppressed", partition),
+            prefetched: MetricBuilder::new(metrics)
+                .counter("parquet_metadata_prefetched", partition),
         }
     }
 }
@@ -515,6 +544,70 @@ fn page_index_options(
     Some(base.with_page_index_policy(PageIndexPolicy::Optional))
 }
 
+/// Look-ahead depth of the metadata prefetcher: how many files past each opened
+/// one are loaded into the cache ahead of time. `ICEBERG_PARQUET_METADATA_PREFETCH_FILES`,
+/// read once per process; `0` (the default) disables prefetching. See the module docs.
+static PREFETCH_FILES: LazyLock<usize> = LazyLock::new(|| {
+    std::env::var("ICEBERG_PARQUET_METADATA_PREFETCH_FILES")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(0)
+});
+
+/// Process-wide cap on concurrent prefetch loads,
+/// `ICEBERG_PARQUET_METADATA_PREFETCH_CONCURRENCY` (default 8, minimum 1).
+static PREFETCH_CONCURRENCY: LazyLock<usize> = LazyLock::new(|| {
+    std::env::var("ICEBERG_PARQUET_METADATA_PREFETCH_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(8)
+        .max(1)
+});
+
+static PREFETCH_SEMAPHORE: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(*PREFETCH_CONCURRENCY)));
+
+/// The files of one scan in consumption order, grouped as the scan groups them,
+/// plus which of them have already been opened or scheduled for prefetch.
+#[derive(Debug, Default)]
+struct PrefetchPlan {
+    groups: Vec<Vec<PartitionedFile>>,
+    /// Store-relative location -> (group, position in group).
+    index: HashMap<String, (usize, usize)>,
+    scheduled: Vec<Vec<bool>>,
+}
+
+impl PrefetchPlan {
+    fn add_group(&mut self, files: &[PartitionedFile]) {
+        let group = self.groups.len();
+        for (position, file) in files.iter().enumerate() {
+            self.index
+                .insert(file.object_meta.location.to_string(), (group, position));
+        }
+        self.groups.push(files.to_vec());
+        self.scheduled.push(vec![false; files.len()]);
+    }
+
+    /// Mark the file at `location` as opened and return the up-to-`ahead`
+    /// following files of its group that nobody has scheduled yet.
+    fn take_next(&mut self, location: &str, ahead: usize) -> Vec<PartitionedFile> {
+        let Some(&(group, position)) = self.index.get(location) else {
+            return Vec::new();
+        };
+        self.scheduled[group][position] = true;
+        let files = &self.groups[group];
+        let end = position.saturating_add(ahead).min(files.len() - 1);
+        let mut next = Vec::new();
+        for candidate in position + 1..=end {
+            if !self.scheduled[group][candidate] {
+                self.scheduled[group][candidate] = true;
+                next.push(files[candidate].clone());
+            }
+        }
+        next
+    }
+}
+
 /// The process-wide metadata cache. Capacity comes from
 /// `ICEBERG_PARQUET_METADATA_CACHE_MB` (read once per process; default 64 MiB;
 /// `0` disables caching and single-flight entirely).
@@ -550,6 +643,8 @@ static CACHE: LazyLock<MetadataCache> = LazyLock::new(|| {
 pub(crate) struct CachingParquetFileReaderFactory {
     inner: Arc<dyn ParquetFileReaderFactory>,
     key_prefix: Arc<str>,
+    /// Files registered for look-ahead prefetch; empty unless configured.
+    prefetch: Mutex<PrefetchPlan>,
 }
 
 impl CachingParquetFileReaderFactory {
@@ -559,6 +654,79 @@ impl CachingParquetFileReaderFactory {
         Self {
             inner: Arc::new(DefaultParquetFileReaderFactory::new(store)),
             key_prefix: Arc::from(key_prefix),
+            prefetch: Mutex::new(PrefetchPlan::default()),
+        }
+    }
+
+    /// Register `files`, in the order the scan will consume them, as one
+    /// prefetch group. A no-op unless `ICEBERG_PARQUET_METADATA_PREFETCH_FILES`
+    /// is set and the cache is enabled.
+    pub(crate) fn register_prefetch_group(&self, files: &[PartitionedFile]) {
+        if *PREFETCH_FILES == 0 || !CACHE.enabled() || files.is_empty() {
+            return;
+        }
+        if let Ok(mut plan) = self.prefetch.lock() {
+            plan.add_group(files);
+        }
+    }
+
+    /// Kick off cache loads for the files following `opened` in its group.
+    /// Runs on the opener's path, so it only takes the plan lock briefly and
+    /// spawns the I/O onto the current runtime.
+    fn schedule_prefetch(
+        &self,
+        opened: &str,
+        partition_index: usize,
+        metrics: &ExecutionPlanMetricsSet,
+    ) {
+        let ahead = *PREFETCH_FILES;
+        if ahead == 0 || !CACHE.enabled() {
+            return;
+        }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let targets = match self.prefetch.lock() {
+            Ok(mut plan) => plan.take_next(opened, ahead),
+            Err(_) => return,
+        };
+        for file in targets {
+            let inner = Arc::clone(&self.inner);
+            let key = format!("{}{}", self.key_prefix, file.object_meta.location.as_ref());
+            let metrics = metrics.clone();
+            let semaphore = Arc::clone(&PREFETCH_SEMAPHORE);
+            handle.spawn(async move {
+                let Ok(_permit) = semaphore.acquire_owned().await else {
+                    return;
+                };
+                let size = file.object_meta.size;
+                // The opener may have reached this file while we waited for a permit.
+                if CACHE.get(&key, size).is_some() {
+                    return;
+                }
+                let cache_metrics = CacheMetrics::new(&metrics, partition_index);
+                let hint = file.metadata_size_hint;
+                let mut reader = match inner.create_reader(partition_index, file, hint, &metrics) {
+                    Ok(reader) => reader,
+                    Err(err) => {
+                        tracing::debug!(
+                            target: "datafusion_iceberg::parquet_metadata_cache",
+                            key, %err, "parquet metadata prefetch: reader creation failed"
+                        );
+                        return;
+                    }
+                };
+                match CACHE
+                    .load(&mut *reader, None, &key, size, &cache_metrics)
+                    .await
+                {
+                    Ok(_) => cache_metrics.prefetched.add(1),
+                    Err(err) => tracing::debug!(
+                        target: "datafusion_iceberg::parquet_metadata_cache",
+                        key, %err, "parquet metadata prefetch failed"
+                    ),
+                }
+            });
         }
     }
 }
@@ -577,6 +745,7 @@ impl ParquetFileReaderFactory for CachingParquetFileReaderFactory {
             partitioned_file.object_meta.location.as_ref()
         );
         let size = partitioned_file.object_meta.size;
+        let location = partitioned_file.object_meta.location.to_string();
         let cache_metrics = CacheMetrics::new(metrics, partition_index);
         let inner = self.inner.create_reader(
             partition_index,
@@ -584,6 +753,7 @@ impl ParquetFileReaderFactory for CachingParquetFileReaderFactory {
             metadata_size_hint,
             metrics,
         )?;
+        self.schedule_prefetch(&location, partition_index, metrics);
         Ok(Box::new(CachingMetadataReader {
             inner,
             key,
@@ -670,6 +840,36 @@ mod tests {
     /// this distinction both look identical from the outside — just slow metadata
     /// loading — which is why SF1000's 9x per-file metadata regression went
     /// unexplained.
+    fn plan_file(name: &str) -> PartitionedFile {
+        PartitionedFile::new(name.to_string(), 1024)
+    }
+
+    /// The look-ahead window follows the opener within a group, never hands out
+    /// a file twice, and stops at the group boundary.
+    #[test]
+    fn prefetch_plan_windows_follow_opened_files_within_a_group() {
+        let mut plan = PrefetchPlan::default();
+        plan.add_group(&["a", "b", "c", "d", "e"].map(plan_file));
+        plan.add_group(&["x", "y"].map(plan_file));
+
+        let names = |files: Vec<PartitionedFile>| {
+            files
+                .iter()
+                .map(|f| f.object_meta.location.to_string())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(names(plan.take_next("a", 2)), ["b", "c"]);
+        // b was already scheduled; opening it only extends the window.
+        assert_eq!(names(plan.take_next("b", 2)), ["d"]);
+        // Window clamps at the end of the group and skips scheduled files.
+        assert_eq!(names(plan.take_next("d", 10)), ["e"]);
+        assert!(plan.take_next("e", 3).is_empty());
+        // Other groups are independent; unknown files schedule nothing.
+        assert_eq!(names(plan.take_next("x", 5)), ["y"]);
+        assert!(plan.take_next("nope", 5).is_empty());
+    }
+
     #[tokio::test]
     async fn load_reports_hits_then_misses() {
         let inner = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;

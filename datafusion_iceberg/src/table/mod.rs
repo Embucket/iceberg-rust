@@ -506,12 +506,13 @@ async fn table_scan(
     // files are immutable by path, so cached metadata never goes stale. The
     // object-store URL namespaces cache keys so store-relative data-file paths
     // cannot collide across tables or buckets.
-    let parquet_reader_factory: Arc<dyn ParquetFileReaderFactory> = Arc::new(
+    let caching_reader_factory = Arc::new(
         crate::parquet_metadata_cache::CachingParquetFileReaderFactory::new(
             table.object_store(),
             object_store_url.as_str(),
         ),
     );
+    let parquet_reader_factory: Arc<dyn ParquetFileReaderFactory> = caching_reader_factory.clone();
 
     let enable_data_file_path_column = config
         .map(|x| x.enable_data_file_path_column)
@@ -823,6 +824,7 @@ async fn table_scan(
             let schema = &schema;
             let file_source = file_source.clone();
             let parquet_reader_factory = parquet_reader_factory.clone();
+            let caching_reader_factory = caching_reader_factory.clone();
             let projection_expr = projection_expr.clone();
             let scan_projection = scan_projection.clone();
             let scan_schema = scan_schema.clone();
@@ -892,6 +894,7 @@ async fn table_scan(
                         let schema = &schema;
                         let file_source = file_source.clone();
                         let parquet_reader_factory = parquet_reader_factory.clone();
+                        let caching_reader_factory = caching_reader_factory.clone();
                         let mut data_files = Vec::new();
                         let equality_projection = equality_projection.clone();
 
@@ -997,7 +1000,10 @@ async fn table_scan(
 
                             let file_scan_config =
                                 FileScanConfigBuilder::new(object_store_url, file_source.clone())
-                                    .with_file_group(FileGroup::new(data_files))
+                                    .with_file_group({
+                                        caching_reader_factory.register_prefetch_group(&data_files);
+                                        FileGroup::new(data_files)
+                                    })
                                     .with_statistics(statistics)
                                     .with_projection_indices(Some(equality_projection))?
                                     .with_expr_adapter(Some(Arc::new(
@@ -1071,6 +1077,7 @@ async fn table_scan(
                     .collect::<Result<Vec<_>, _>>()?;
 
                 if !additional_data_files.is_empty() {
+                    caching_reader_factory.register_prefetch_group(&additional_data_files);
                     let file_scan_config =
                         FileScanConfigBuilder::new(object_store_url.clone(), file_source)
                             .with_file_group(FileGroup::new(additional_data_files))
@@ -1157,6 +1164,9 @@ async fn table_scan(
     }
 
     if !unattested_groups.is_empty() {
+        for group in &unattested_groups {
+            caching_reader_factory.register_prefetch_group(group.files());
+        }
         let file_scan_config =
             FileScanConfigBuilder::new(object_store_url.clone(), file_source.clone())
                 .with_file_groups(unattested_groups)
@@ -1176,6 +1186,9 @@ async fn table_scan(
     if let (false, Some((_, ordering))) = (attested_groups.is_empty(), &declared_ordering) {
         let file_groups =
             regroup_attested_files_by_statistics(session, &scan_schema, attested_groups, ordering);
+        for group in &file_groups {
+            caching_reader_factory.register_prefetch_group(group.files());
+        }
         let file_scan_config = FileScanConfigBuilder::new(object_store_url, file_source)
             .with_file_groups(file_groups)
             .with_statistics(statistics)
