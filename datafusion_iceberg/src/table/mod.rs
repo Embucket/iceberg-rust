@@ -819,9 +819,8 @@ async fn table_scan(
         .iter()
         .flat_map(|f| f.column_refs().into_iter().cloned())
         .collect();
-    let pushdown_filters = requested_projection.len() >= 8
-        && !filter_columns.is_empty()
-        && filter_columns.len() <= 2;
+    let pushdown_filters =
+        requested_projection.len() >= 8 && !filter_columns.is_empty() && filter_columns.len() <= 2;
     let file_source = Arc::new(
         ParquetSource::new(table_schema)
             .with_parquet_file_reader_factory(parquet_reader_factory.clone())
