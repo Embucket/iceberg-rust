@@ -473,6 +473,30 @@ fn fake_object_store_url(table_location_url: &str) -> ObjectStoreUrl {
     .expect("Invalid object store url.")
 }
 
+/// Minimum number of projected columns for a scan to count as "wide" and be eligible for
+/// parquet row-filter pushdown.
+const WIDE_SCAN_MIN_PROJECTED_COLUMNS: usize = 8;
+
+/// Maximum number of distinct columns a predicate may reference and still count as "narrow".
+const NARROW_PREDICATE_MAX_COLUMNS: usize = 2;
+
+/// Decides whether parquet row-filter pushdown is enabled for a scan.
+///
+/// Row-filter pushdown (predicate evaluated inside the parquet decoder, late materialization
+/// of the remaining columns, TopK / join dynamic filters reaching the scan) pays off only when
+/// the scan is wide and the predicate narrow: `SELECT * ... WHERE url LIKE ... ORDER BY t LIMIT n`
+/// decodes 100+ columns for the few surviving rows. On narrow scans the same machinery costs
+/// more than the vectorized `FilterExec` it replaces, so it stays off there. A scan without any
+/// filter columns has nothing to push down and is always `false`.
+///
+/// `projected_columns` is the number of columns the scan materializes; `filter_columns` is the
+/// number of *distinct* columns referenced across all pushed filters (deduplicated by the caller).
+fn use_parquet_row_filter_pushdown(projected_columns: usize, filter_columns: usize) -> bool {
+    projected_columns >= WIDE_SCAN_MIN_PROJECTED_COLUMNS
+        && filter_columns > 0
+        && filter_columns <= NARROW_PREDICATE_MAX_COLUMNS
+}
+
 #[allow(clippy::too_many_arguments)]
 #[instrument(name = "datafusion_iceberg::table_scan", level = "debug", skip(arrow_schema, session, filters), fields(
     table_identifier = %table.identifier(),
@@ -810,17 +834,13 @@ async fn table_scan(
         .iter()
         .map(|index| scan_schema.index_of(arrow_schema.field(*index).name()))
         .collect::<Result<Vec<_>, _>>()?;
-    // Row-filter pushdown (predicate evaluated inside the parquet decoder, late materialization
-    // of the remaining columns, TopK / join dynamic filters reaching the scan) pays off only when
-    // the scan is wide and the predicate narrow: `SELECT * ... WHERE url LIKE ... ORDER BY t LIMIT n`
-    // decodes 100+ columns for the few surviving rows. On narrow scans the same machinery costs
-    // more than the vectorized FilterExec it replaces, so it stays off there.
+    // See `use_parquet_row_filter_pushdown` for the wide-scan / narrow-predicate rationale.
     let filter_columns: std::collections::HashSet<_> = filters
         .iter()
         .flat_map(|f| f.column_refs().into_iter().cloned())
         .collect();
     let pushdown_filters =
-        requested_projection.len() >= 8 && !filter_columns.is_empty() && filter_columns.len() <= 2;
+        use_parquet_row_filter_pushdown(requested_projection.len(), filter_columns.len());
     let file_source = Arc::new(
         ParquetSource::new(table_schema)
             .with_parquet_file_reader_factory(parquet_reader_factory.clone())
@@ -3497,5 +3517,77 @@ mod tests {
             fake_object_store_url("s3://a/table-2Fpath"),
             fake_object_store_url("s3://a/table/path"),
         );
+    }
+}
+
+#[cfg(test)]
+mod pushdown_heuristic_tests {
+    use super::{
+        use_parquet_row_filter_pushdown, NARROW_PREDICATE_MAX_COLUMNS,
+        WIDE_SCAN_MIN_PROJECTED_COLUMNS,
+    };
+    use datafusion::prelude::{col, lit, Expr};
+    use std::collections::HashSet;
+
+    #[test]
+    fn constants_match_documented_thresholds() {
+        assert_eq!(WIDE_SCAN_MIN_PROJECTED_COLUMNS, 8);
+        assert_eq!(NARROW_PREDICATE_MAX_COLUMNS, 2);
+    }
+
+    #[test]
+    fn no_filter_columns_is_never_pushed_down() {
+        for projected in [0, 1, 7, 8, 9, 100] {
+            assert!(
+                !use_parquet_row_filter_pushdown(projected, 0),
+                "projected={projected}"
+            );
+        }
+    }
+
+    #[test]
+    fn wide_scan_with_narrow_predicate_is_pushed_down() {
+        assert!(use_parquet_row_filter_pushdown(8, 1));
+        assert!(use_parquet_row_filter_pushdown(8, 2));
+        assert!(use_parquet_row_filter_pushdown(100, 2));
+    }
+
+    #[test]
+    fn wide_scan_with_wide_predicate_is_not_pushed_down() {
+        assert!(!use_parquet_row_filter_pushdown(8, 3));
+        assert!(!use_parquet_row_filter_pushdown(100, 3));
+    }
+
+    #[test]
+    fn narrow_scan_is_not_pushed_down() {
+        assert!(!use_parquet_row_filter_pushdown(7, 1));
+        assert!(!use_parquet_row_filter_pushdown(7, 2));
+        assert!(!use_parquet_row_filter_pushdown(0, 1));
+    }
+
+    /// Mirrors the call site in `table_scan`: the filter-column set is built from
+    /// `Expr::column_refs` across all filters and must count distinct columns, so two
+    /// predicates on the same column count as one.
+    #[test]
+    fn filter_column_set_is_deduplicated_across_filters() {
+        let filters: Vec<Expr> = vec![col("url").like(lit("%foo%")), col("url").not_eq(lit("bar"))];
+        let filter_columns: HashSet<_> = filters
+            .iter()
+            .flat_map(|f| f.column_refs().into_iter().cloned())
+            .collect();
+        assert_eq!(filter_columns.len(), 1);
+        assert!(use_parquet_row_filter_pushdown(8, filter_columns.len()));
+
+        let filters: Vec<Expr> = vec![
+            col("a").eq(lit(1)),
+            col("b").eq(lit(2)).and(col("a").gt(lit(0))),
+            col("c").is_null(),
+        ];
+        let filter_columns: HashSet<_> = filters
+            .iter()
+            .flat_map(|f| f.column_refs().into_iter().cloned())
+            .collect();
+        assert_eq!(filter_columns.len(), 3);
+        assert!(!use_parquet_row_filter_pushdown(8, filter_columns.len()));
     }
 }
