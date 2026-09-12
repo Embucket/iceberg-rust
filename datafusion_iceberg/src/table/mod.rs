@@ -810,9 +810,22 @@ async fn table_scan(
         .iter()
         .map(|index| scan_schema.index_of(arrow_schema.field(*index).name()))
         .collect::<Result<Vec<_>, _>>()?;
+    // Row-filter pushdown (predicate evaluated inside the parquet decoder, late materialization
+    // of the remaining columns, TopK / join dynamic filters reaching the scan) pays off only when
+    // the scan is wide and the predicate narrow: `SELECT * ... WHERE url LIKE ... ORDER BY t LIMIT n`
+    // decodes 100+ columns for the few surviving rows. On narrow scans the same machinery costs
+    // more than the vectorized FilterExec it replaces, so it stays off there.
+    let filter_columns: std::collections::HashSet<_> = filters
+        .iter()
+        .flat_map(|f| f.column_refs().into_iter().cloned())
+        .collect();
+    let pushdown_filters = requested_projection.len() >= 8
+        && !filter_columns.is_empty()
+        && filter_columns.len() <= 2;
     let file_source = Arc::new(
         ParquetSource::new(table_schema)
-            .with_parquet_file_reader_factory(parquet_reader_factory.clone()),
+            .with_parquet_file_reader_factory(parquet_reader_factory.clone())
+            .with_pushdown_filters(pushdown_filters),
     );
 
     // Create plan for every partition with delete files
