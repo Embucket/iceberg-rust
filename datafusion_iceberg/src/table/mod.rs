@@ -8,7 +8,6 @@ use datafusion::arrow::array::RecordBatch;
 use datafusion::config::ConfigField;
 use datafusion::datasource::table_schema::TableSchema;
 use datafusion::execution::RecordBatchStream;
-use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion_expr::{dml::InsertOp, utils::conjunction, JoinType};
 use derive_builder::Builder;
 use futures::stream;
@@ -820,34 +819,9 @@ async fn table_scan(
         .iter()
         .flat_map(|f| f.column_refs().into_iter().cloned())
         .collect();
-    // A leading-wildcard LIKE (`%google%`) is a substring scan over every value of a string
-    // column; evaluated inside the decoder it lets the reader skip decoding the other
-    // projected columns for the rows it rejects, which is the common ClickBench shape
-    // (`WHERE Title LIKE '%Google%' ... GROUP BY SearchPhrase`).
-    let leading_wildcard_like = filters.iter().any(|f| {
-        let mut found = false;
-        let _ = f.apply(|e| {
-            if let Expr::Like(like) = e {
-                if let Expr::Literal(
-                    ScalarValue::Utf8(Some(p))
-                    | ScalarValue::Utf8View(Some(p))
-                    | ScalarValue::LargeUtf8(Some(p)),
-                    _,
-                ) = like.pattern.as_ref()
-                {
-                    if p.starts_with('%') {
-                        found = true;
-                    }
-                }
-            }
-            Ok(if found { TreeNodeRecursion::Stop } else { TreeNodeRecursion::Continue })
-        });
-        found
-    });
-    let pushdown_filters = (requested_projection.len() >= 8
+    let pushdown_filters = requested_projection.len() >= 8
         && !filter_columns.is_empty()
-        && filter_columns.len() <= 2)
-        || (leading_wildcard_like && requested_projection.len() >= 4);
+        && filter_columns.len() <= 2;
     let file_source = Arc::new(
         ParquetSource::new(table_schema)
             .with_parquet_file_reader_factory(parquet_reader_factory.clone())
