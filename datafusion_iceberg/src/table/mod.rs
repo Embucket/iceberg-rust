@@ -127,11 +127,19 @@ static MANIFEST_FILE_PATH_COLUMN: &str = "__manifest_file_path";
 static DATA_FILE_ROW_POSITION_COLUMN: &str = "__iceberg_file_row_position";
 static DATA_FILE_SEQUENCE_NUMBER_COLUMN: &str = "__iceberg_data_sequence_number";
 static DELETE_FILE_SEQUENCE_NUMBER_COLUMN: &str = "__iceberg_delete_sequence_number";
+pub const CHANGE_FILE_STATUS_COLUMN: &str = "__iceberg_change_file_status";
 static POSITION_DELETE_FILE_PATH_COLUMN: &str = "file_path";
 static POSITION_DELETE_POS_COLUMN: &str = "pos";
 const POSITION_DELETE_FILE_PATH_FIELD_ID: i32 = i32::MAX - 101;
 const POSITION_DELETE_POS_FIELD_ID: i32 = i32::MAX - 102;
 type PhysicalProjection = Vec<(Arc<dyn PhysicalExpr>, String)>;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct PartitionedFileMetadataColumns {
+    first_row_id: bool,
+    sequence_number: bool,
+    change_status: bool,
+}
 
 fn row_lineage_field(name: &str, field_id: i32) -> Field {
     Field::new(name, DataType::Int64, true).with_metadata(HashMap::from([(
@@ -232,6 +240,9 @@ pub struct DataFusionTableConfig {
     /// Expose the Iceberg v3 `_last_updated_sequence_number` metadata column.
     #[builder(default)]
     enable_last_updated_sequence_number_column: bool,
+    /// Scan only data files added or deleted by the selected snapshot range.
+    #[builder(default)]
+    scan_changed_data_files: bool,
 }
 
 impl DataFusionTable {
@@ -297,6 +308,13 @@ impl DataFusionTable {
                         LAST_UPDATED_SEQUENCE_NUMBER_COLUMN,
                         LAST_UPDATED_SEQUENCE_NUMBER_FIELD_ID,
                     ));
+                }
+                if config
+                    .as_ref()
+                    .map(|x| x.scan_changed_data_files)
+                    .unwrap_or_default()
+                {
+                    builder.push(Field::new(CHANGE_FILE_STATUS_COLUMN, DataType::Utf8, false));
                 }
                 Arc::new(builder.finish())
             }
@@ -593,6 +611,10 @@ async fn table_scan(
 
     let enable_row_lineage = enable_row_id_column || enable_last_updated_sequence_number_column;
 
+    let scan_changed_data_files = config
+        .map(|x| x.scan_changed_data_files)
+        .unwrap_or_default();
+
     let partition_fields = &snapshot_range
         .1
         .and_then(|snapshot_id| table.metadata().partition_fields(snapshot_id).ok())
@@ -603,6 +625,13 @@ async fn table_scan(
         .map(|x| x.and_then(|y| table.metadata().sequence_number(y)))
         .collect_tuple::<(Option<i64>, Option<i64>)>()
         .unwrap();
+    let manifest_entry_sequence_range = if scan_changed_data_files {
+        // The enclosing manifest is already constrained to the snapshot range. Deleted
+        // entries retain the data file's original sequence number and must not be removed.
+        (None, None)
+    } else {
+        sequence_number_range
+    };
 
     // If there is a filter expression the manifests to read are pruned based on the pruning statistics available in the manifest_list file.
     // Row lineage values may be synthesized from manifest metadata, so they must not be
@@ -712,7 +741,11 @@ async fn table_scan(
                     pruning_predicate.prune(&PruneManifests::new(partition_fields, &manifests))?;
 
                 table
-                    .datafiles(&manifests, Some(manifests_to_prune), sequence_number_range)
+                    .datafiles(
+                        &manifests,
+                        Some(manifests_to_prune),
+                        manifest_entry_sequence_range,
+                    )
                     .await
                     .map_err(DataFusionIcebergError::from)?
                     .try_collect()
@@ -720,7 +753,7 @@ async fn table_scan(
                     .map_err(DataFusionIcebergError::from)?
             } else {
                 table
-                    .datafiles(&manifests, None, sequence_number_range)
+                    .datafiles(&manifests, None, manifest_entry_sequence_range)
                     .await
                     .map_err(DataFusionIcebergError::from)?
                     .try_collect()
@@ -762,7 +795,7 @@ async fn table_scan(
             .await
             .map_err(DataFusionIcebergError::from)?;
         let data_files: Vec<_> = table
-            .datafiles(&manifests, None, sequence_number_range)
+            .datafiles(&manifests, None, manifest_entry_sequence_range)
             .await
             .map_err(DataFusionIcebergError::from)?
             .try_collect()
@@ -794,7 +827,7 @@ async fn table_scan(
         let mut equality_deletes = Vec::new();
         let mut position_deletes = Vec::new();
         content_file_iter
-            .filter(|manifest| *manifest.1.status() != Status::Deleted)
+            .filter(|manifest| scan_manifest_entry(&manifest.1, scan_changed_data_files))
             .for_each(|manifest| match manifest.1.data_file().content() {
                 Content::Data => data_files.push(manifest),
                 Content::EqualityDeletes => equality_deletes.push(manifest),
@@ -823,7 +856,7 @@ async fn table_scan(
         }
     } else {
         content_file_iter.for_each(|manifest| {
-            if *manifest.1.status() != Status::Deleted {
+            if scan_manifest_entry(&manifest.1, scan_changed_data_files) {
                 match manifest.1.data_file().content() {
                     Content::Data => {
                         data_file_groups
@@ -875,6 +908,12 @@ async fn table_scan(
             DataType::Int64,
             false,
         ));
+        statistics
+            .column_statistics
+            .push(ColumnStatistics::new_unknown());
+    }
+    if scan_changed_data_files {
+        table_partition_cols.push(Field::new(CHANGE_FILE_STATUS_COLUMN, DataType::Utf8, false));
         statistics
             .column_statistics
             .push(ColumnStatistics::new_unknown());
@@ -1014,8 +1053,12 @@ async fn table_scan(
                                 &data_manifest.1,
                                 last_updated_ms,
                                 include_data_file_path_column,
-                                enable_row_lineage,
-                                has_position_deletes || enable_last_updated_sequence_number_column,
+                                PartitionedFileMetadataColumns {
+                                    first_row_id: enable_row_lineage,
+                                    sequence_number: has_position_deletes
+                                        || enable_last_updated_sequence_number_column,
+                                    change_status: scan_changed_data_files,
+                                },
                                 manifest_path,
                             )
                             .unwrap();
@@ -1071,8 +1114,7 @@ async fn table_scan(
                                 &delete_manifest.1,
                                 last_updated_ms,
                                 enable_data_file_path_column,
-                                false,
-                                false,
+                                PartitionedFileMetadataColumns::default(),
                                 manifest_path,
                             )?;
 
@@ -1170,8 +1212,12 @@ async fn table_scan(
                             &x.1,
                             last_updated_ms,
                             include_data_file_path_column,
-                            enable_row_lineage,
-                            has_position_deletes || enable_last_updated_sequence_number_column,
+                            PartitionedFileMetadataColumns {
+                                first_row_id: enable_row_lineage,
+                                sequence_number: has_position_deletes
+                                    || enable_last_updated_sequence_number_column,
+                                change_status: scan_changed_data_files,
+                            },
                             manifest_path,
                         )
                     })
@@ -1246,8 +1292,12 @@ async fn table_scan(
                 &entry,
                 last_updated_ms,
                 include_data_file_path_column,
-                enable_row_lineage,
-                has_position_deletes || enable_last_updated_sequence_number_column,
+                PartitionedFileMetadataColumns {
+                    first_row_id: enable_row_lineage,
+                    sequence_number: has_position_deletes
+                        || enable_last_updated_sequence_number_column,
+                    change_status: scan_changed_data_files,
+                },
                 manifest_path,
             )?;
             if is_attested {
@@ -1324,6 +1374,55 @@ async fn table_scan(
         }
         1 => Ok(plans.remove(0)),
         _ => Ok(UnionExec::try_new(plans)?),
+    }
+}
+
+fn scan_manifest_entry(entry: &ManifestEntry, scan_changed_data_files: bool) -> bool {
+    scan_manifest_status(
+        *entry.status(),
+        entry.data_file().content(),
+        scan_changed_data_files,
+    )
+}
+
+fn scan_manifest_status(status: Status, content: &Content, scan_changed_data_files: bool) -> bool {
+    if scan_changed_data_files {
+        content == &Content::Data && matches!(status, Status::Added | Status::Deleted)
+    } else {
+        status != Status::Deleted
+    }
+}
+
+#[cfg(test)]
+mod changed_scan_tests {
+    use super::{scan_manifest_status, Content, Status};
+
+    #[test]
+    fn changed_scan_includes_only_added_and_deleted_data_files() {
+        assert!(scan_manifest_status(Status::Added, &Content::Data, true));
+        assert!(scan_manifest_status(Status::Deleted, &Content::Data, true));
+        assert!(!scan_manifest_status(
+            Status::Existing,
+            &Content::Data,
+            true
+        ));
+        assert!(!scan_manifest_status(
+            Status::Added,
+            &Content::PositionDeletes,
+            true
+        ));
+
+        assert!(scan_manifest_status(Status::Added, &Content::Data, false));
+        assert!(scan_manifest_status(
+            Status::Existing,
+            &Content::Data,
+            false
+        ));
+        assert!(!scan_manifest_status(
+            Status::Deleted,
+            &Content::Data,
+            false
+        ));
     }
 }
 
@@ -1595,8 +1694,7 @@ fn generate_partitioned_file(
     manifest: &ManifestEntry,
     last_updated_ms: i64,
     enable_data_file_path: bool,
-    include_first_row_id: bool,
-    include_sequence_number: bool,
+    metadata_columns: PartitionedFileMetadataColumns,
     manifest_file_path: Option<ManifestPath>,
 ) -> Result<PartitionedFile, DataFusionError> {
     let manifest_statistics = manifest_statistics(schema, manifest);
@@ -1621,11 +1719,11 @@ fn generate_partitioned_file(
         partition_values.push(ScalarValue::Utf8(Some(manifest_file_path)));
     }
 
-    if include_first_row_id {
+    if metadata_columns.first_row_id {
         partition_values.push(ScalarValue::Int64(*manifest.data_file().first_row_id()));
     }
 
-    if include_sequence_number {
+    if metadata_columns.sequence_number {
         let sequence_number = manifest
             .sequence_number()
             .as_ref()
@@ -1637,6 +1735,15 @@ fn generate_partitioned_file(
                 ))
             })?;
         partition_values.push(ScalarValue::Int64(Some(sequence_number)));
+    }
+
+    if metadata_columns.change_status {
+        let status = match manifest.status() {
+            Status::Added => "ADDED",
+            Status::Existing => "EXISTING",
+            Status::Deleted => "DELETED",
+        };
+        partition_values.push(ScalarValue::Utf8(Some(status.to_owned())));
     }
 
     let object_meta = ObjectMeta {
@@ -2168,7 +2275,9 @@ struct PartitionDeleteFileIndex {
 mod tests {
 
     use datafusion::{
-        arrow::array::Int64Array, execution::object_store::ObjectStoreUrl, prelude::SessionContext,
+        arrow::array::{Int64Array, StringArray},
+        execution::object_store::ObjectStoreUrl,
+        prelude::SessionContext,
         scalar::ScalarValue,
     };
     use iceberg_rust::{
@@ -2328,6 +2437,13 @@ mod tests {
             };
             table.clone()
         };
+        let first_snapshot_id = updated_table
+            .metadata()
+            .current_snapshot(None)
+            .expect("read current snapshot")
+            .expect("first snapshot")
+            .snapshot_id()
+            .to_owned();
         let config = super::DataFusionTableConfigBuilder::default()
             .enable_data_file_path_column(false)
             .enable_data_file_row_position_column(false)
@@ -2371,6 +2487,84 @@ mod tests {
         assert_eq!(values(0), vec![Some(20), Some(30)]);
         assert_eq!(values(1), vec![Some(1), Some(2)]);
         assert_eq!(values(2), vec![Some(1), Some(1)]);
+
+        ctx.deregister_table("lineage_numbers")
+            .expect("deregister lineage table");
+        ctx.register_table("lineage_numbers", writable.clone())
+            .expect("restore writable table");
+        ctx.sql("INSERT INTO lineage_numbers (id) VALUES (40), (50)")
+            .await
+            .expect("plan second v3 append")
+            .collect()
+            .await
+            .expect("append more v3 rows");
+        let (appended_table, second_snapshot_id) = {
+            let tabular = writable.tabular.read().expect("read appended table");
+            let Tabular::Table(table) = &*tabular else {
+                panic!("expected an Iceberg table");
+            };
+            let snapshot_id = table
+                .metadata()
+                .current_snapshot(None)
+                .expect("read second snapshot")
+                .expect("second snapshot")
+                .snapshot_id()
+                .to_owned();
+            (table.clone(), snapshot_id)
+        };
+        let changes_config = super::DataFusionTableConfigBuilder::default()
+            .enable_data_file_path_column(false)
+            .enable_data_file_row_position_column(false)
+            .enable_manifest_file_path_column(false)
+            .enable_row_id_column(true)
+            .enable_last_updated_sequence_number_column(true)
+            .scan_changed_data_files(true)
+            .build()
+            .expect("build change file scan config");
+        let changes = Arc::new(DataFusionTable::new_with_config(
+            Tabular::Table(appended_table),
+            Some(first_snapshot_id),
+            Some(second_snapshot_id),
+            None,
+            Some(changes_config),
+        ));
+        ctx.deregister_table("lineage_numbers")
+            .expect("deregister writable table");
+        ctx.register_table("lineage_numbers", changes)
+            .expect("register changed-file table");
+
+        let batches = ctx
+            .sql(
+                "SELECT id, _row_id, _last_updated_sequence_number, \
+                        __iceberg_change_file_status \
+                 FROM lineage_numbers ORDER BY __iceberg_change_file_status, id",
+            )
+            .await
+            .expect("plan changed-file scan")
+            .collect()
+            .await
+            .expect("scan changed files");
+        let batch = batches.first().expect("changed-file result batch");
+        let int_values = |column: usize| {
+            batch
+                .column(column)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("Int64 change result")
+                .iter()
+                .collect::<Vec<_>>()
+        };
+        let statuses = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("Utf8 change status")
+            .iter()
+            .collect::<Vec<_>>();
+        assert_eq!(int_values(0), vec![Some(40), Some(50)]);
+        assert_eq!(int_values(1), vec![Some(3), Some(4)]);
+        assert_eq!(int_values(2), vec![Some(2), Some(2)]);
+        assert_eq!(statuses, vec![Some("ADDED"), Some("ADDED")]);
     }
 
     #[tokio::test]
