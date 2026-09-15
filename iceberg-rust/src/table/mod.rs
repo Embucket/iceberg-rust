@@ -237,6 +237,73 @@ impl Table {
             None => iter.collect(),
         }
     }
+
+    /// Returns manifests that contain file changes committed by snapshots in `(start, end]`.
+    ///
+    /// Unlike [`Self::manifests`], this walks every snapshot in the range. A final snapshot's
+    /// manifest list is sufficient for a table-state scan, but it can no longer contain file
+    /// events from an intermediate rewrite. Only manifests written for each visited snapshot's
+    /// sequence are returned, so callers can build a changelog without scanning inherited table
+    /// state.
+    pub async fn change_manifests(
+        &self,
+        start: Option<i64>,
+        end: Option<i64>,
+    ) -> Result<Vec<ManifestListEntry>, Error> {
+        let metadata = self.metadata();
+        let mut current_snapshot_id = match end {
+            Some(snapshot_id) => {
+                if !metadata.snapshots.contains_key(&snapshot_id) {
+                    return Err(Error::NotFound(format!("snapshot {snapshot_id}")));
+                }
+                snapshot_id
+            }
+            None => match metadata.current_snapshot(None)? {
+                Some(snapshot) => *snapshot.snapshot_id(),
+                None => return Ok(Vec::new()),
+            },
+        };
+        let mut snapshot_ids = Vec::new();
+        loop {
+            if Some(current_snapshot_id) == start {
+                break;
+            }
+            let snapshot = metadata
+                .snapshots
+                .get(&current_snapshot_id)
+                .ok_or_else(|| Error::NotFound(format!("snapshot {current_snapshot_id}")))?;
+            snapshot_ids.push(current_snapshot_id);
+            match snapshot.parent_snapshot_id() {
+                Some(parent_snapshot_id) => current_snapshot_id = *parent_snapshot_id,
+                None if start.is_none() => break,
+                None => {
+                    return Err(Error::InvalidFormat(
+                        "change scan start snapshot is not an ancestor of the end snapshot"
+                            .to_owned(),
+                    ));
+                }
+            }
+        }
+        snapshot_ids.reverse();
+
+        let mut manifests = Vec::new();
+        for snapshot_id in snapshot_ids {
+            let snapshot = metadata
+                .snapshots
+                .get(&snapshot_id)
+                .ok_or_else(|| Error::NotFound(format!("snapshot {snapshot_id}")))?;
+            for manifest in read_snapshot(snapshot, metadata, self.object_store().clone()).await? {
+                let manifest = manifest?;
+                if manifest.sequence_number == *snapshot.sequence_number()
+                    && (manifest.added_files_count != Some(0)
+                        || manifest.deleted_files_count != Some(0))
+                {
+                    manifests.push(manifest);
+                }
+            }
+        }
+        Ok(manifests)
+    }
     /// Returns a stream of manifest entries for the given manifest list entries
     ///
     /// # Arguments
