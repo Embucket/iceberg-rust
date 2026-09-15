@@ -1,6 +1,7 @@
 pub mod catalog;
 pub mod error;
 pub mod materialized_view;
+mod parquet_data_cache;
 mod parquet_metadata_cache;
 pub mod planner;
 mod pruning_statistics;
