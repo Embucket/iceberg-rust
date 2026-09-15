@@ -14,7 +14,13 @@ use datafusion::physical_expr_adapter::{
 use datafusion::physical_plan::expressions::Column;
 use datafusion::physical_plan::PhysicalExpr;
 use datafusion_expr::ColumnarValue;
+use iceberg_rust::spec::arrow::schema::PARQUET_FIELD_ID_META_KEY;
 use parquet_variant_compute::{unshred_variant, VariantArray};
+
+use crate::row_lineage::{
+    LAST_UPDATED_SEQUENCE_NUMBER_FIELD_ID, PHYSICAL_LAST_UPDATED_SEQUENCE_NUMBER_COLUMN,
+    PHYSICAL_ROW_ID_COLUMN, ROW_ID_FIELD_ID,
+};
 
 const PARQUET_VARIANT_EXTENSION_NAME: &str = "arrow.parquet.variant";
 
@@ -70,14 +76,55 @@ impl IcebergPhysicalExprAdapter {
             Arc::new(logical_field.clone()),
         )))
     }
+
+    fn row_lineage_field_id(name: &str) -> Option<i32> {
+        match name {
+            PHYSICAL_ROW_ID_COLUMN => Some(ROW_ID_FIELD_ID),
+            PHYSICAL_LAST_UPDATED_SEQUENCE_NUMBER_COLUMN => {
+                Some(LAST_UPDATED_SEQUENCE_NUMBER_FIELD_ID)
+            }
+            _ => None,
+        }
+    }
+
+    fn rewrite_row_lineage_column(
+        &self,
+        _column: &Column,
+        field_id: i32,
+    ) -> Result<Option<Arc<dyn PhysicalExpr>>> {
+        let physical = self
+            .physical_file_schema
+            .fields()
+            .iter()
+            .enumerate()
+            .find(|(_, field)| {
+                field
+                    .metadata()
+                    .get(PARQUET_FIELD_ID_META_KEY)
+                    .and_then(|id| id.parse::<i32>().ok())
+                    == Some(field_id)
+            });
+        let Some((index, field)) = physical else {
+            return Ok(None);
+        };
+        if field.data_type() != &DataType::Int64 {
+            return internal_err!(
+                "Iceberg row lineage field id {field_id} must be Int64, got {}",
+                field.data_type()
+            );
+        }
+        Ok(Some(Arc::new(Column::new(field.name(), index))))
+    }
 }
 
 impl PhysicalExprAdapter for IcebergPhysicalExprAdapter {
     fn rewrite(&self, expr: Arc<dyn PhysicalExpr>) -> Result<Arc<dyn PhysicalExpr>> {
-        let contains_variant = collect_columns(&expr)
-            .iter()
-            .any(|column| self.is_logical_variant_column(column.name()));
-        if !contains_variant {
+        let columns = collect_columns(&expr);
+        let requires_iceberg_rewrite = columns.iter().any(|column| {
+            self.is_logical_variant_column(column.name())
+                || Self::row_lineage_field_id(column.name()).is_some()
+        });
+        if !requires_iceberg_rewrite {
             return self.default.rewrite(expr);
         }
 
@@ -85,6 +132,13 @@ impl PhysicalExprAdapter for IcebergPhysicalExprAdapter {
             let Some(column) = expr.downcast_ref::<Column>() else {
                 return Ok(Transformed::no(expr));
             };
+
+            if let Some(field_id) = Self::row_lineage_field_id(column.name()) {
+                if let Some(physical) = self.rewrite_row_lineage_column(column, field_id)? {
+                    return Ok(Transformed::yes(physical));
+                }
+                return self.default.rewrite(expr).map(Transformed::yes);
+            }
 
             if self.is_logical_variant_column(column.name()) {
                 return self.rewrite_variant_column(column).map(Transformed::yes);
@@ -256,6 +310,37 @@ mod tests {
         let variant = VariantArray::try_new(output.as_ref())?;
         assert!(variant.typed_value_column().is_none());
         assert_eq!(format!("{:?}", variant.try_value(0)?), "BooleanTrue");
+        Ok(())
+    }
+
+    #[test]
+    fn maps_physical_row_lineage_by_reserved_field_id() -> Result<()> {
+        let logical_schema = Arc::new(Schema::new(vec![Arc::new(
+            Field::new(PHYSICAL_ROW_ID_COLUMN, DataType::Int64, true).with_metadata(
+                [(
+                    PARQUET_FIELD_ID_META_KEY.to_owned(),
+                    ROW_ID_FIELD_ID.to_string(),
+                )]
+                .into(),
+            ),
+        )]));
+        let physical_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("writer_specific_row_id", DataType::Int64, true).with_metadata(
+                [(
+                    PARQUET_FIELD_ID_META_KEY.to_owned(),
+                    ROW_ID_FIELD_ID.to_string(),
+                )]
+                .into(),
+            ),
+        ]));
+        let adapter = IcebergPhysicalExprAdapterFactory.create(logical_schema, physical_schema)?;
+        let rewritten = adapter.rewrite(Arc::new(Column::new(PHYSICAL_ROW_ID_COLUMN, 0)))?;
+        let column = rewritten
+            .downcast_ref::<Column>()
+            .expect("physical lineage column");
+        assert_eq!(column.name(), "writer_specific_row_id");
+        assert_eq!(column.index(), 1);
         Ok(())
     }
 }
