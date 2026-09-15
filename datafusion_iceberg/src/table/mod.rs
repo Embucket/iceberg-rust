@@ -128,6 +128,8 @@ static DATA_FILE_ROW_POSITION_COLUMN: &str = "__iceberg_file_row_position";
 static DATA_FILE_SEQUENCE_NUMBER_COLUMN: &str = "__iceberg_data_sequence_number";
 static DELETE_FILE_SEQUENCE_NUMBER_COLUMN: &str = "__iceberg_delete_sequence_number";
 pub const CHANGE_FILE_STATUS_COLUMN: &str = "__iceberg_change_file_status";
+pub const CHANGE_SNAPSHOT_SEQUENCE_NUMBER_COLUMN: &str =
+    "__iceberg_change_snapshot_sequence_number";
 static POSITION_DELETE_FILE_PATH_COLUMN: &str = "file_path";
 static POSITION_DELETE_POS_COLUMN: &str = "pos";
 const POSITION_DELETE_FILE_PATH_FIELD_ID: i32 = i32::MAX - 101;
@@ -139,6 +141,7 @@ struct PartitionedFileMetadataColumns {
     first_row_id: bool,
     sequence_number: bool,
     change_status: bool,
+    change_snapshot_sequence_number: Option<i64>,
 }
 
 fn row_lineage_field(name: &str, field_id: i32) -> Field {
@@ -315,6 +318,11 @@ impl DataFusionTable {
                     .unwrap_or_default()
                 {
                     builder.push(Field::new(CHANGE_FILE_STATUS_COLUMN, DataType::Utf8, false));
+                    builder.push(Field::new(
+                        CHANGE_SNAPSHOT_SEQUENCE_NUMBER_COLUMN,
+                        DataType::Int64,
+                        false,
+                    ));
                 }
                 Arc::new(builder.finish())
             }
@@ -632,10 +640,6 @@ async fn table_scan(
     } else {
         sequence_number_range
     };
-    let change_snapshot_ids = scan_changed_data_files
-        .then(|| snapshot_ids_in_range(table.metadata(), snapshot_range.0, snapshot_range.1))
-        .transpose()?;
-
     // If there is a filter expression the manifests to read are pruned based on the pruning statistics available in the manifest_list file.
     // Row lineage values may be synthesized from manifest metadata, so they must not be
     // evaluated by the Parquet reader against only the physically stored columns.
@@ -697,6 +701,23 @@ async fn table_scan(
     let mut data_file_groups: HashMap<Struct, Vec<(ManifestPath, ManifestEntry)>> = HashMap::new();
     let mut delete_file_groups: HashMap<Struct, PartitionDeleteFileIndex> = HashMap::new();
 
+    let manifests = if scan_changed_data_files {
+        table
+            .change_manifests(snapshot_range.0, snapshot_range.1)
+            .await
+    } else {
+        table.manifests(snapshot_range.0, snapshot_range.1).await
+    }
+    .map_err(DataFusionIcebergError::from)?;
+    let change_manifest_sequence_numbers = scan_changed_data_files.then(|| {
+        Arc::new(
+            manifests
+                .iter()
+                .map(|manifest| (manifest.manifest_path.clone(), manifest.sequence_number))
+                .collect::<HashMap<_, _>>(),
+        )
+    });
+
     // Prune data & delete file and insert them into the according map
     let (content_file_iter, mut statistics) = if let Some(physical_predicate) =
         physical_predicate.clone()
@@ -722,11 +743,6 @@ async fn table_scan(
                 .cloned()
                 .map(|x| transform_predicate(x, partition_fields).unwrap()),
         );
-
-        let manifests = table
-            .manifests(snapshot_range.0, snapshot_range.1)
-            .await
-            .map_err(DataFusionIcebergError::from)?;
 
         // If there is a filter expression on the partition column, the manifest files to read are pruned.
         let data_files: Vec<(ManifestPath, ManifestEntry)> =
@@ -763,7 +779,7 @@ async fn table_scan(
                     .await
                     .map_err(DataFusionIcebergError::from)?
             };
-        let data_files = prepare_changed_data_files(data_files, change_snapshot_ids.as_ref());
+        let data_files = prepare_changed_data_files(data_files, scan_changed_data_files);
 
         let pruning_predicate = PruningPredicateBuilder::new()
             .with_file_schema(arrow_schema.clone())
@@ -794,10 +810,6 @@ async fn table_scan(
             .filter_map(|(manifest, prune_file)| if prune_file { Some(manifest) } else { None });
         (itertools::Either::Left(iter), statistics)
     } else {
-        let manifests = table
-            .manifests(snapshot_range.0, snapshot_range.1)
-            .await
-            .map_err(DataFusionIcebergError::from)?;
         let data_files: Vec<_> = table
             .datafiles(&manifests, None, manifest_entry_sequence_range)
             .await
@@ -805,7 +817,7 @@ async fn table_scan(
             .try_collect()
             .await
             .map_err(DataFusionIcebergError::from)?;
-        let data_files = prepare_changed_data_files(data_files, change_snapshot_ids.as_ref());
+        let data_files = prepare_changed_data_files(data_files, scan_changed_data_files);
 
         let mut statistics = statistics_from_datafiles(&schema, &data_files);
         for _ in 0..usize::from(enable_row_id_column)
@@ -922,6 +934,14 @@ async fn table_scan(
         statistics
             .column_statistics
             .push(ColumnStatistics::new_unknown());
+        table_partition_cols.push(Field::new(
+            CHANGE_SNAPSHOT_SEQUENCE_NUMBER_COLUMN,
+            DataType::Int64,
+            false,
+        ));
+        statistics
+            .column_statistics
+            .push(ColumnStatistics::new_unknown());
     }
 
     let mut table_schema_builder = TableSchema::builder(file_schema.clone())
@@ -974,6 +994,7 @@ async fn table_scan(
             let projection_expr = projection_expr.clone();
             let scan_projection = scan_projection.clone();
             let scan_schema = scan_schema.clone();
+            let change_manifest_sequence_numbers = change_manifest_sequence_numbers.clone();
             let mut data_files = data_file_groups
                 .remove(&partition_value)
                 .unwrap_or_default();
@@ -1063,6 +1084,11 @@ async fn table_scan(
                                     sequence_number: has_position_deletes
                                         || enable_last_updated_sequence_number_column,
                                     change_status: scan_changed_data_files,
+                                    change_snapshot_sequence_number:
+                                        change_manifest_sequence_numbers
+                                            .as_ref()
+                                            .and_then(|sequences| sequences.get(&data_manifest.0))
+                                            .copied(),
                                 },
                                 manifest_path,
                             )
@@ -1207,6 +1233,10 @@ async fn table_scan(
                 let additional_data_files = data_file_iter
                     .map(|x| {
                         let last_updated_ms = table.metadata().last_updated_ms;
+                        let change_snapshot_sequence_number = change_manifest_sequence_numbers
+                            .as_ref()
+                            .and_then(|sequences| sequences.get(&x.0))
+                            .copied();
                         let manifest_path = if enable_manifest_file_path_column {
                             Some(x.0)
                         } else {
@@ -1222,6 +1252,7 @@ async fn table_scan(
                                 sequence_number: has_position_deletes
                                     || enable_last_updated_sequence_number_column,
                                 change_status: scan_changed_data_files,
+                                change_snapshot_sequence_number,
                             },
                             manifest_path,
                         )
@@ -1284,7 +1315,11 @@ async fn table_scan(
         let mut unattested = Vec::new();
         for (manifest_path, entry) in entries {
             let last_updated_ms = table.metadata().last_updated_ms;
-            let manifest_path = if enable_manifest_file_path_column {
+            let change_snapshot_sequence_number = change_manifest_sequence_numbers
+                .as_ref()
+                .and_then(|sequences| sequences.get(&manifest_path))
+                .copied();
+            let projected_manifest_path = if enable_manifest_file_path_column {
                 Some(manifest_path)
             } else {
                 None
@@ -1302,8 +1337,9 @@ async fn table_scan(
                     sequence_number: has_position_deletes
                         || enable_last_updated_sequence_number_column,
                     change_status: scan_changed_data_files,
+                    change_snapshot_sequence_number,
                 },
-                manifest_path,
+                projected_manifest_path,
             )?;
             if is_attested {
                 attested.push(file);
@@ -1390,63 +1426,18 @@ fn scan_manifest_entry(entry: &ManifestEntry, scan_changed_data_files: bool) -> 
     )
 }
 
-fn snapshot_ids_in_range(
-    metadata: &TableMetadata,
-    start_snapshot_id: Option<i64>,
-    end_snapshot_id: Option<i64>,
-) -> Result<HashSet<i64>, DataFusionError> {
-    let mut current = match end_snapshot_id {
-        Some(snapshot_id) => Some(snapshot_id),
-        None => metadata
-            .current_snapshot(None)
-            .map_err(DataFusionIcebergError::from)?
-            .map(|snapshot| *snapshot.snapshot_id()),
-    }
-    .ok_or_else(|| DataFusionError::Plan("Iceberg table has no snapshot".to_owned()))?;
-    let mut snapshots = HashSet::new();
-    loop {
-        if Some(current) == start_snapshot_id {
-            return Ok(snapshots);
-        }
-        snapshots.insert(current);
-        let snapshot = metadata.snapshots.get(&current).ok_or_else(|| {
-            DataFusionError::Plan(format!(
-                "Iceberg snapshot {current} is missing from metadata"
-            ))
-        })?;
-        match snapshot.parent_snapshot_id() {
-            Some(parent) => current = *parent,
-            None if start_snapshot_id.is_none() => return Ok(snapshots),
-            None => {
-                return plan_err!(
-                    "Iceberg scan start snapshot is not an ancestor of the end snapshot"
-                );
-            }
-        }
-    }
-}
-
 fn prepare_changed_data_files(
     data_files: Vec<(ManifestPath, ManifestEntry)>,
-    change_snapshot_ids: Option<&HashSet<i64>>,
+    scan_changed_data_files: bool,
 ) -> Vec<(ManifestPath, ManifestEntry)> {
-    let Some(change_snapshot_ids) = change_snapshot_ids else {
+    if !scan_changed_data_files {
         return data_files;
-    };
+    }
     data_files
         .into_iter()
-        .filter_map(|(path, mut entry)| {
-            let is_changed_data_file = entry.data_file().content() == &Content::Data
-                && entry
-                    .snapshot_id()
-                    .is_some_and(|snapshot_id| change_snapshot_ids.contains(&snapshot_id));
-            if !is_changed_data_file {
-                return None;
-            }
-            if *entry.status() == Status::Existing {
-                *entry.status_mut() = Status::Added;
-            }
-            Some((path, entry))
+        .filter(|(_, entry)| {
+            entry.data_file().content() == &Content::Data
+                && matches!(entry.status(), Status::Added | Status::Deleted)
         })
         .collect()
 }
@@ -1810,6 +1801,9 @@ fn generate_partitioned_file(
             Status::Deleted => "DELETED",
         };
         partition_values.push(ScalarValue::Utf8(Some(status.to_owned())));
+    }
+    if let Some(sequence_number) = metadata_columns.change_snapshot_sequence_number {
+        partition_values.push(ScalarValue::Int64(Some(sequence_number)));
     }
 
     let object_meta = ObjectMeta {
@@ -2353,6 +2347,7 @@ mod tests {
             namespace::Namespace,
             partition::{PartitionField, Transform},
             schema::Schema,
+            snapshot::SnapshotBuilder,
             types::{PrimitiveType, StructField, Type},
         },
     };
@@ -2622,7 +2617,8 @@ mod tests {
         let batches = ctx
             .sql(
                 "SELECT id, _row_id, _last_updated_sequence_number, \
-                        __iceberg_change_file_status \
+                        __iceberg_change_file_status, \
+                        __iceberg_change_snapshot_sequence_number \
                  FROM lineage_numbers ORDER BY __iceberg_change_file_status, id",
             )
             .await
@@ -2651,6 +2647,210 @@ mod tests {
         assert_eq!(int_values(1), vec![Some(3), Some(4), Some(5)]);
         assert_eq!(int_values(2), vec![Some(2), Some(2), Some(3)]);
         assert_eq!(statuses, vec![Some("ADDED"), Some("ADDED"), Some("ADDED")]);
+        assert_eq!(int_values(4), vec![Some(2), Some(2), Some(3)]);
+    }
+
+    #[tokio::test]
+    async fn test_changed_file_scan_preserves_intermediate_snapshot_manifests() {
+        let object_store = ObjectStoreBuilder::memory();
+        let catalog: Arc<dyn Catalog> = Arc::new(
+            SqlCatalog::new("sqlite://", "test", object_store)
+                .await
+                .expect("create catalog"),
+        );
+        let schema = Schema::builder()
+            .with_struct_field(StructField {
+                id: 1,
+                name: "id".to_owned(),
+                required: true,
+                field_type: Type::Primitive(PrimitiveType::Long),
+                doc: None,
+                initial_default: None,
+                write_default: None,
+            })
+            .build()
+            .expect("build schema");
+        let table = Table::builder()
+            .with_name("rewrite_numbers")
+            .with_location("memory:///test/rewrite_numbers")
+            .with_schema(schema)
+            .build(&["test".to_owned()], catalog)
+            .await
+            .expect("create table");
+        let writable = Arc::new(DataFusionTable::from(table));
+        let ctx = SessionContext::new();
+        ctx.register_table("rewrite_numbers", writable.clone())
+            .expect("register writable table");
+
+        ctx.sql("INSERT INTO rewrite_numbers (id) VALUES (10), (20)")
+            .await
+            .expect("plan baseline insert")
+            .collect()
+            .await
+            .expect("write baseline rows");
+        let first_snapshot_id = {
+            let tabular = writable.tabular.read().expect("read baseline table");
+            let Tabular::Table(table) = &*tabular else {
+                panic!("expected an Iceberg table");
+            };
+            *table
+                .metadata()
+                .current_snapshot(None)
+                .expect("read baseline snapshot")
+                .expect("baseline snapshot")
+                .snapshot_id()
+        };
+
+        ctx.sql("INSERT OVERWRITE INTO rewrite_numbers (id) VALUES (30), (40)")
+            .await
+            .expect("plan first overwrite")
+            .collect()
+            .await
+            .expect("write first overwrite");
+        let second_snapshot_id = {
+            let tabular = writable.tabular.read().expect("read first overwrite");
+            let Tabular::Table(table) = &*tabular else {
+                panic!("expected an Iceberg table");
+            };
+            *table
+                .metadata()
+                .current_snapshot(None)
+                .expect("read first overwrite snapshot")
+                .expect("first overwrite snapshot")
+                .snapshot_id()
+        };
+        ctx.sql("INSERT OVERWRITE INTO rewrite_numbers (id) VALUES (50), (60)")
+            .await
+            .expect("plan second overwrite")
+            .collect()
+            .await
+            .expect("write second overwrite");
+
+        let (rewritten_table, end_snapshot_id) = {
+            let tabular = writable.tabular.read().expect("read rewritten table");
+            let Tabular::Table(table) = &*tabular else {
+                panic!("expected an Iceberg table");
+            };
+            let snapshot_id = *table
+                .metadata()
+                .current_snapshot(None)
+                .expect("read final snapshot")
+                .expect("final snapshot")
+                .snapshot_id();
+            (table.clone(), snapshot_id)
+        };
+        // The in-memory SQL test catalog does not preserve snapshot parents on reload. Rebuild
+        // only those links so this fixture exercises a real three-snapshot changelog range.
+        let mut metadata = rewritten_table.metadata().clone();
+        for (snapshot_id, parent_snapshot_id) in [
+            (first_snapshot_id, None),
+            (second_snapshot_id, Some(first_snapshot_id)),
+            (end_snapshot_id, Some(second_snapshot_id)),
+        ] {
+            let snapshot = metadata
+                .snapshots
+                .get(&snapshot_id)
+                .expect("snapshot exists")
+                .clone();
+            let mut builder = SnapshotBuilder::default();
+            builder
+                .with_snapshot_id(snapshot_id)
+                .with_sequence_number(*snapshot.sequence_number())
+                .with_timestamp_ms(*snapshot.timestamp_ms())
+                .with_manifest_list(snapshot.manifest_list().clone())
+                .with_summary(snapshot.summary().clone());
+            if let Some(parent_snapshot_id) = parent_snapshot_id {
+                builder.with_parent_snapshot_id(parent_snapshot_id);
+            }
+            if let Some(schema_id) = *snapshot.schema_id() {
+                builder.with_schema_id(schema_id);
+            }
+            metadata.snapshots.insert(
+                snapshot_id,
+                builder.build().expect("rebuild snapshot ancestry"),
+            );
+        }
+        let rewritten_table = Table::new(
+            rewritten_table.identifier().clone(),
+            rewritten_table.catalog(),
+            rewritten_table.object_store(),
+            metadata,
+        )
+        .await
+        .expect("rebuild table snapshot ancestry");
+        let changes_config = super::DataFusionTableConfigBuilder::default()
+            .enable_data_file_path_column(false)
+            .enable_data_file_row_position_column(false)
+            .enable_manifest_file_path_column(false)
+            .scan_changed_data_files(true)
+            .build()
+            .expect("build changed-file scan config");
+        let changes = Arc::new(DataFusionTable::new_with_config(
+            Tabular::Table(rewritten_table),
+            Some(first_snapshot_id),
+            Some(end_snapshot_id),
+            None,
+            Some(changes_config),
+        ));
+        ctx.deregister_table("rewrite_numbers")
+            .expect("deregister writable table");
+        ctx.register_table("rewrite_numbers", changes)
+            .expect("register changed-file table");
+
+        let batches = ctx
+            .sql(
+                "SELECT id, __iceberg_change_file_status, \
+                        __iceberg_change_snapshot_sequence_number \
+                 FROM rewrite_numbers \
+                 ORDER BY __iceberg_change_snapshot_sequence_number, \
+                          __iceberg_change_file_status, id",
+            )
+            .await
+            .expect("plan multi-rewrite changed-file scan")
+            .collect()
+            .await
+            .expect("scan multi-rewrite changed files");
+        let rows = batches
+            .iter()
+            .flat_map(|batch| {
+                let ids = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("Int64 id");
+                let statuses = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("Utf8 change status");
+                let sequences = batch
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("Int64 snapshot sequence");
+                (0..batch.num_rows())
+                    .map(|row| {
+                        (
+                            ids.value(row),
+                            statuses.value(row).to_owned(),
+                            sequences.value(row),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        // This local overwrite writer does not emit DELETED manifest entries. The assertion is
+        // intentionally scoped to proving that additions from both intermediate snapshots are
+        // retained and carry their event sequence; external writers cover delete events.
+        assert_eq!(
+            rows,
+            vec![
+                (30, "ADDED".to_owned(), 2),
+                (40, "ADDED".to_owned(), 2),
+                (50, "ADDED".to_owned(), 3),
+                (60, "ADDED".to_owned(), 3),
+            ]
+        );
     }
 
     #[tokio::test]
