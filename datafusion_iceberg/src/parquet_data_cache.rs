@@ -251,12 +251,24 @@ mod tests {
         };
         let file = Arc::from("s3://bucket/file");
         assert!(cache
-            .read(&mut reader, &file, 4, vec![0..4], &metrics)
+            .read(
+                &mut reader,
+                &file,
+                4,
+                std::iter::once(0..4).collect(),
+                &metrics
+            )
             .await
             .is_err());
         reader.truncate = false;
         let retry = cache
-            .read(&mut reader, &file, 4, vec![0..4], &metrics)
+            .read(
+                &mut reader,
+                &file,
+                4,
+                std::iter::once(0..4).collect(),
+                &metrics,
+            )
             .await
             .unwrap();
         assert_eq!(retry, vec![Bytes::from_static(b"abcd")]);
