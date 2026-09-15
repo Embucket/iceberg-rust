@@ -39,6 +39,11 @@ use std::{
 use tokio::sync::mpsc::{self};
 use tracing::{instrument, Instrument};
 
+use crate::row_lineage::{
+    RowLineageExpr, RowLineageKind, FIRST_ROW_ID_COLUMN, LAST_UPDATED_SEQUENCE_NUMBER_COLUMN,
+    LAST_UPDATED_SEQUENCE_NUMBER_FIELD_ID, PHYSICAL_LAST_UPDATED_SEQUENCE_NUMBER_COLUMN,
+    PHYSICAL_ROW_ID_COLUMN, ROW_ID_COLUMN, ROW_ID_FIELD_ID,
+};
 use crate::statistics::statistics_from_datafiles;
 use crate::variant_schema_adapter::IcebergPhysicalExprAdapterFactory;
 use crate::{
@@ -126,6 +131,14 @@ static POSITION_DELETE_FILE_PATH_COLUMN: &str = "file_path";
 static POSITION_DELETE_POS_COLUMN: &str = "pos";
 const POSITION_DELETE_FILE_PATH_FIELD_ID: i32 = i32::MAX - 101;
 const POSITION_DELETE_POS_FIELD_ID: i32 = i32::MAX - 102;
+type PhysicalProjection = Vec<(Arc<dyn PhysicalExpr>, String)>;
+
+fn row_lineage_field(name: &str, field_id: i32) -> Field {
+    Field::new(name, DataType::Int64, true).with_metadata(HashMap::from([(
+        PARQUET_FIELD_ID_META_KEY.to_owned(),
+        field_id.to_string(),
+    )]))
+}
 
 /// When the view tracks source arrow ids (the `overrides` map is non-empty),
 /// reshape each top-level field's `PARQUET:field_id` metadata so it matches
@@ -213,6 +226,12 @@ pub struct DataFusionTableConfig {
     /// With this option, an additional "__manifest_file_path" column is added to the output of the
     /// TableProvider that contains the path of the manifest-file for the data-file the row originates from.
     enable_manifest_file_path_column: bool,
+    /// Expose the Iceberg v3 `_row_id` metadata column.
+    #[builder(default)]
+    enable_row_id_column: bool,
+    /// Expose the Iceberg v3 `_last_updated_sequence_number` metadata column.
+    #[builder(default)]
+    enable_last_updated_sequence_number_column: bool,
 }
 
 impl DataFusionTable {
@@ -261,6 +280,23 @@ impl DataFusionTable {
                         Field::new(DATA_FILE_ROW_POSITION_COLUMN, DataType::Int64, true)
                             .with_extension_type(RowNumber),
                     );
+                }
+                if config
+                    .as_ref()
+                    .map(|x| x.enable_row_id_column)
+                    .unwrap_or_default()
+                {
+                    builder.push(row_lineage_field(ROW_ID_COLUMN, ROW_ID_FIELD_ID));
+                }
+                if config
+                    .as_ref()
+                    .map(|x| x.enable_last_updated_sequence_number_column)
+                    .unwrap_or_default()
+                {
+                    builder.push(row_lineage_field(
+                        LAST_UPDATED_SEQUENCE_NUMBER_COLUMN,
+                        LAST_UPDATED_SEQUENCE_NUMBER_FIELD_ID,
+                    ));
                 }
                 Arc::new(builder.finish())
             }
@@ -549,6 +585,14 @@ async fn table_scan(
         .map(|x| x.enable_manifest_file_path_column)
         .unwrap_or_default();
 
+    let enable_row_id_column = config.map(|x| x.enable_row_id_column).unwrap_or_default();
+
+    let enable_last_updated_sequence_number_column = config
+        .map(|x| x.enable_last_updated_sequence_number_column)
+        .unwrap_or_default();
+
+    let enable_row_lineage = enable_row_id_column || enable_last_updated_sequence_number_column;
+
     let partition_fields = &snapshot_range
         .1
         .and_then(|snapshot_id| table.metadata().partition_fields(snapshot_id).ok())
@@ -561,7 +605,14 @@ async fn table_scan(
         .unwrap();
 
     // If there is a filter expression the manifests to read are pruned based on the pruning statistics available in the manifest_list file.
-    let physical_predicate = conjunction(filters.iter().cloned())
+    // Row lineage values may be synthesized from manifest metadata, so they must not be
+    // evaluated by the Parquet reader against only the physically stored columns.
+    let parquet_filters = filters.iter().filter(|expr| {
+        expr.column_refs().iter().all(|column| {
+            column.name != ROW_ID_COLUMN && column.name != LAST_UPDATED_SEQUENCE_NUMBER_COLUMN
+        })
+    });
+    let physical_predicate = conjunction(parquet_filters.clone().cloned())
         .map(|predicate| {
             create_physical_expr(
                 &predicate,
@@ -574,7 +625,18 @@ async fn table_scan(
 
     let mut table_partition_cols = datafusion_partition_columns(partition_fields)?;
 
-    let file_schema: SchemaRef = Arc::new((schema.fields()).try_into().unwrap());
+    let mut file_schema_builder =
+        SchemaBuilder::from(TryInto::<ArrowSchema>::try_into(schema.fields()).unwrap());
+    if enable_row_id_column {
+        file_schema_builder.push(row_lineage_field(PHYSICAL_ROW_ID_COLUMN, ROW_ID_FIELD_ID));
+    }
+    if enable_last_updated_sequence_number_column {
+        file_schema_builder.push(row_lineage_field(
+            PHYSICAL_LAST_UPDATED_SEQUENCE_NUMBER_COLUMN,
+            LAST_UPDATED_SEQUENCE_NUMBER_FIELD_ID,
+        ));
+    }
+    let file_schema: SchemaRef = Arc::new(file_schema_builder.finish());
 
     // The ordering the table declares, if any, expressed on the file schema.
     // Files attest it individually (manifest `sort_order_id`), so the claim is
@@ -589,18 +651,6 @@ async fn table_scan(
     let requested_projection = projection
         .cloned()
         .unwrap_or((0..arrow_schema.fields().len()).collect_vec());
-
-    let projection_expr: Vec<_> = requested_projection
-        .iter()
-        .enumerate()
-        .map(|(i, id)| {
-            let name = arrow_schema.fields[*id].name();
-            (
-                Arc::new(Column::new(name, i)) as Arc<dyn PhysicalExpr>,
-                name.to_owned(),
-            )
-        })
-        .collect();
 
     if enable_data_file_path_column {
         table_partition_cols.push(Field::new(DATA_FILE_PATH_COLUMN, DataType::Utf8, false));
@@ -686,6 +736,13 @@ async fn table_scan(
             pruning_predicate.prune(&PruneDataFiles::new(&schema, &arrow_schema, &data_files))?;
 
         let mut statistics = statistics_from_datafiles(&schema, &data_files);
+        for _ in 0..usize::from(enable_row_id_column)
+            + usize::from(enable_last_updated_sequence_number_column)
+        {
+            statistics
+                .column_statistics
+                .push(ColumnStatistics::new_unknown());
+        }
         // Add placeholder statistics for partition/metadata columns
         // This prevents index out of bounds when projecting statistics
         for _ in &table_partition_cols {
@@ -713,6 +770,13 @@ async fn table_scan(
             .map_err(DataFusionIcebergError::from)?;
 
         let mut statistics = statistics_from_datafiles(&schema, &data_files);
+        for _ in 0..usize::from(enable_row_id_column)
+            + usize::from(enable_last_updated_sequence_number_column)
+        {
+            statistics
+                .column_statistics
+                .push(ColumnStatistics::new_unknown());
+        }
         // Add placeholder statistics for partition/metadata columns
         // This prevents index out of bounds when projecting statistics
         for _ in &table_partition_cols {
@@ -799,7 +863,13 @@ async fn table_scan(
             .column_statistics
             .push(ColumnStatistics::new_unknown());
     }
-    if has_position_deletes {
+    if enable_row_lineage {
+        table_partition_cols.push(Field::new(FIRST_ROW_ID_COLUMN, DataType::Int64, true));
+        statistics
+            .column_statistics
+            .push(ColumnStatistics::new_unknown());
+    }
+    if has_position_deletes || enable_last_updated_sequence_number_column {
         table_partition_cols.push(Field::new(
             DATA_FILE_SEQUENCE_NUMBER_COLUMN,
             DataType::Int64,
@@ -818,7 +888,7 @@ async fn table_scan(
                 .map(Arc::new)
                 .collect::<Vec<_>>(),
         );
-    if has_position_deletes || enable_data_file_row_position_column {
+    if has_position_deletes || enable_data_file_row_position_column || enable_row_id_column {
         table_schema_builder = table_schema_builder.with_virtual_columns(vec![Arc::new(
             Field::new(DATA_FILE_ROW_POSITION_COLUMN, DataType::Int64, false)
                 .with_extension_type(RowNumber),
@@ -830,13 +900,15 @@ async fn table_scan(
     let table_schema = table_schema_builder.build();
     // File schema plus partition columns: what scan orderings are expressed on.
     let scan_schema: SchemaRef = table_schema.table_schema().clone();
-    let scan_projection = requested_projection
-        .iter()
-        .map(|index| scan_schema.index_of(arrow_schema.field(*index).name()))
-        .collect::<Result<Vec<_>, _>>()?;
+    let (scan_projection, projection_expr) = row_lineage_projection(
+        &arrow_schema,
+        &scan_schema,
+        &requested_projection,
+        enable_row_id_column,
+        enable_last_updated_sequence_number_column,
+    )?;
     // See `use_parquet_row_filter_pushdown` for the wide-scan / narrow-predicate rationale.
-    let filter_columns: std::collections::HashSet<_> = filters
-        .iter()
+    let filter_columns: std::collections::HashSet<_> = parquet_filters
         .flat_map(|f| f.column_refs().into_iter().cloned())
         .collect();
     let pushdown_filters =
@@ -942,7 +1014,8 @@ async fn table_scan(
                                 &data_manifest.1,
                                 last_updated_ms,
                                 include_data_file_path_column,
-                                has_position_deletes,
+                                enable_row_lineage,
+                                has_position_deletes || enable_last_updated_sequence_number_column,
                                 manifest_path,
                             )
                             .unwrap();
@@ -998,6 +1071,7 @@ async fn table_scan(
                                 &delete_manifest.1,
                                 last_updated_ms,
                                 enable_data_file_path_column,
+                                false,
                                 false,
                                 manifest_path,
                             )?;
@@ -1096,7 +1170,8 @@ async fn table_scan(
                             &x.1,
                             last_updated_ms,
                             include_data_file_path_column,
-                            has_position_deletes,
+                            enable_row_lineage,
+                            has_position_deletes || enable_last_updated_sequence_number_column,
                             manifest_path,
                         )
                     })
@@ -1171,7 +1246,8 @@ async fn table_scan(
                 &entry,
                 last_updated_ms,
                 include_data_file_path_column,
-                has_position_deletes,
+                enable_row_lineage,
+                has_position_deletes || enable_last_updated_sequence_number_column,
                 manifest_path,
             )?;
             if is_attested {
@@ -1198,9 +1274,16 @@ async fn table_scan(
                 .with_limit(limit)
                 .build();
 
-        let other_plan: Arc<dyn ExecutionPlan> =
+        let mut other_plan: Arc<dyn ExecutionPlan> =
             tracing::debug_span!("datafusion_iceberg::create_physical_plan_scan_data_files")
                 .in_scope(|| DataSourceExec::from_data_source(file_scan_config));
+
+        if enable_row_lineage {
+            other_plan = Arc::new(ProjectionExec::try_new(
+                projection_expr.clone(),
+                other_plan,
+            )?);
+        }
 
         plans.push(other_plan);
     }
@@ -1217,12 +1300,19 @@ async fn table_scan(
             .with_limit(limit)
             .build();
 
-        let sorted_plan = ParquetFormat::default()
+        let mut sorted_plan = ParquetFormat::default()
             .create_physical_plan(session, file_scan_config)
             .instrument(tracing::debug_span!(
                 "datafusion_iceberg::create_physical_plan_scan_sorted_data_files"
             ))
             .await?;
+
+        if enable_row_lineage {
+            sorted_plan = Arc::new(ProjectionExec::try_new(
+                projection_expr.clone(),
+                sorted_plan,
+            )?);
+        }
 
         plans.push(sorted_plan);
     }
@@ -1235,6 +1325,73 @@ async fn table_scan(
         1 => Ok(plans.remove(0)),
         _ => Ok(UnionExec::try_new(plans)?),
     }
+}
+
+fn row_lineage_projection(
+    output_schema: &SchemaRef,
+    scan_schema: &SchemaRef,
+    requested_projection: &[usize],
+    enable_row_id: bool,
+    enable_last_updated_sequence_number: bool,
+) -> Result<(Vec<usize>, PhysicalProjection), DataFusionError> {
+    fn projected_column(
+        scan_projection: &mut Vec<usize>,
+        scan_schema: &SchemaRef,
+        name: &str,
+    ) -> Result<Arc<dyn PhysicalExpr>, DataFusionError> {
+        let scan_index = scan_schema.index_of(name)?;
+        let projected_index = match scan_projection
+            .iter()
+            .position(|index| *index == scan_index)
+        {
+            Some(index) => index,
+            None => {
+                scan_projection.push(scan_index);
+                scan_projection.len() - 1
+            }
+        };
+        Ok(Arc::new(Column::new(name, projected_index)))
+    }
+
+    let mut scan_projection = Vec::with_capacity(requested_projection.len() + 3);
+    let mut output_projection = Vec::with_capacity(requested_projection.len());
+
+    for output_index in requested_projection {
+        let name = output_schema.field(*output_index).name();
+        let expression: Arc<dyn PhysicalExpr> = if enable_row_id && name == ROW_ID_COLUMN {
+            Arc::new(RowLineageExpr::new(
+                RowLineageKind::RowId,
+                projected_column(&mut scan_projection, scan_schema, PHYSICAL_ROW_ID_COLUMN)?,
+                projected_column(&mut scan_projection, scan_schema, FIRST_ROW_ID_COLUMN)?,
+                projected_column(
+                    &mut scan_projection,
+                    scan_schema,
+                    DATA_FILE_ROW_POSITION_COLUMN,
+                )?,
+            ))
+        } else if enable_last_updated_sequence_number && name == LAST_UPDATED_SEQUENCE_NUMBER_COLUMN
+        {
+            Arc::new(RowLineageExpr::new(
+                RowLineageKind::LastUpdatedSequenceNumber,
+                projected_column(
+                    &mut scan_projection,
+                    scan_schema,
+                    PHYSICAL_LAST_UPDATED_SEQUENCE_NUMBER_COLUMN,
+                )?,
+                projected_column(&mut scan_projection, scan_schema, FIRST_ROW_ID_COLUMN)?,
+                projected_column(
+                    &mut scan_projection,
+                    scan_schema,
+                    DATA_FILE_SEQUENCE_NUMBER_COLUMN,
+                )?,
+            ))
+        } else {
+            projected_column(&mut scan_projection, scan_schema, name)?
+        };
+        output_projection.push((expression, name.to_owned()));
+    }
+
+    Ok((scan_projection, output_projection))
 }
 
 /// Maps a table sort order onto a DataFusion ordering over `file_schema`.
@@ -1438,6 +1595,7 @@ fn generate_partitioned_file(
     manifest: &ManifestEntry,
     last_updated_ms: i64,
     enable_data_file_path: bool,
+    include_first_row_id: bool,
     include_sequence_number: bool,
     manifest_file_path: Option<ManifestPath>,
 ) -> Result<PartitionedFile, DataFusionError> {
@@ -1461,6 +1619,10 @@ fn generate_partitioned_file(
 
     if let Some(manifest_file_path) = manifest_file_path {
         partition_values.push(ScalarValue::Utf8(Some(manifest_file_path)));
+    }
+
+    if include_first_row_id {
+        partition_values.push(ScalarValue::Int64(*manifest.data_file().first_row_id()));
     }
 
     if include_sequence_number {
@@ -2118,6 +2280,97 @@ mod tests {
             count_caching_parquet_sources(plan.as_ref()) > 0,
             "expected at least one parquet scan node in the plan"
         );
+    }
+
+    #[tokio::test]
+    async fn test_v3_row_lineage_columns_are_synthesized_by_scan() {
+        let object_store = ObjectStoreBuilder::memory();
+        let catalog: Arc<dyn Catalog> = Arc::new(
+            SqlCatalog::new("sqlite://", "test", object_store)
+                .await
+                .expect("create catalog"),
+        );
+        let schema = Schema::builder()
+            .with_struct_field(StructField {
+                id: 1,
+                name: "id".to_owned(),
+                required: true,
+                field_type: Type::Primitive(PrimitiveType::Long),
+                doc: None,
+                initial_default: None,
+                write_default: None,
+            })
+            .build()
+            .expect("build schema");
+        let table = Table::builder()
+            .with_name("lineage_numbers")
+            .with_location("memory:///test/lineage_numbers")
+            .with_schema(schema)
+            .with_property(("format-version".to_owned(), "3".to_owned()))
+            .build(&["test".to_owned()], catalog)
+            .await
+            .expect("create v3 table");
+        let writable = Arc::new(DataFusionTable::from(table));
+        let ctx = SessionContext::new();
+        ctx.register_table("lineage_numbers", writable.clone())
+            .expect("register writable table");
+        ctx.sql("INSERT INTO lineage_numbers (id) VALUES (10), (20), (30)")
+            .await
+            .expect("plan v3 insert")
+            .collect()
+            .await
+            .expect("write v3 rows");
+
+        let updated_table = {
+            let tabular = writable.tabular.read().expect("read updated table");
+            let Tabular::Table(table) = &*tabular else {
+                panic!("expected an Iceberg table");
+            };
+            table.clone()
+        };
+        let config = super::DataFusionTableConfigBuilder::default()
+            .enable_data_file_path_column(false)
+            .enable_data_file_row_position_column(false)
+            .enable_manifest_file_path_column(false)
+            .enable_row_id_column(true)
+            .enable_last_updated_sequence_number_column(true)
+            .build()
+            .expect("build row lineage scan config");
+        let lineage = Arc::new(DataFusionTable::new_with_config(
+            Tabular::Table(updated_table),
+            None,
+            None,
+            None,
+            Some(config),
+        ));
+        ctx.deregister_table("lineage_numbers")
+            .expect("deregister writable table");
+        ctx.register_table("lineage_numbers", lineage)
+            .expect("register lineage table");
+
+        let batches = ctx
+            .sql(
+                "SELECT id, _row_id, _last_updated_sequence_number \
+                 FROM lineage_numbers WHERE _row_id >= 1 ORDER BY _row_id",
+            )
+            .await
+            .expect("plan lineage scan")
+            .collect()
+            .await
+            .expect("scan row lineage");
+        let batch = batches.first().expect("lineage result batch");
+        let values = |column: usize| {
+            batch
+                .column(column)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("Int64 result")
+                .iter()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(values(0), vec![Some(20), Some(30)]);
+        assert_eq!(values(1), vec![Some(1), Some(2)]);
+        assert_eq!(values(2), vec![Some(1), Some(1)]);
     }
 
     #[tokio::test]

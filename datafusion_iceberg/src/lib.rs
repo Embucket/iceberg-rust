@@ -4,6 +4,7 @@ pub mod materialized_view;
 mod parquet_metadata_cache;
 pub mod planner;
 mod pruning_statistics;
+mod row_lineage;
 mod statistics;
 pub mod table;
 mod variant_schema_adapter;

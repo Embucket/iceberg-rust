@@ -85,6 +85,11 @@ impl ManifestEntry {
     pub fn snapshot_id_mut(&mut self) -> &mut Option<i64> {
         &mut self.snapshot_id
     }
+
+    /// Returns a mutable reference to the data file stored in this manifest entry.
+    pub fn data_file_mut(&mut self) -> &mut DataFile {
+        &mut self.data_file
+    }
 }
 
 impl ManifestEntry {
@@ -645,6 +650,11 @@ pub struct DataFile {
 impl DataFile {
     pub fn builder() -> DataFileBuilder {
         DataFileBuilder::default()
+    }
+
+    /// Returns a mutable reference to the first row ID assigned to this data file.
+    pub fn first_row_id_mut(&mut self) -> &mut Option<i64> {
+        &mut self.first_row_id
     }
 }
 
