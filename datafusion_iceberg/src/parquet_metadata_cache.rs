@@ -82,24 +82,26 @@ indistinguishable — both just look like slow metadata loading.
 
 Interception happens through a custom [`ParquetFileReaderFactory`]
 ([`CachingParquetFileReaderFactory`]) installed on every [`ParquetSource`] the
-scan builds, so both cold and warm queries flow through it. Only footer
-metadata (`get_metadata`) is cached; row-group/page data reads pass straight
-through to the underlying reader.
+scan builds, so both cold and warm queries flow through it. Footer metadata
+(`get_metadata`) uses this cache. Row-group/page reads optionally use the separate
+byte-bounded `parquet_data_cache`; with its default zero capacity they pass
+straight through to the underlying reader.
 
-Concurrent *cold* readers of the same file are collapsed by per-file
-single-flight. Without it, N queries racing on the same not-yet-cached footer
-each fetch and parse it independently (a dogpile) before the first `put` lands.
-The first reader to miss takes the file's single-flight gate — a per-key async
-mutex — and performs the sole fetch+parse+insert; the rest wait on the gate,
-then re-check the cache after acquiring it and return the winner's `Arc`. So N
-racing cold scans pay one round-trip, not N. The synchronous LRU lock is only
-taken to look up or insert an entry and is never held across the fetch await;
-only the per-file async gate is. The gate map is itself a small LRU capped at
-[`INFLIGHT_GATES_CAP`] live gates, so it stays bounded no matter how many
-distinct files the process reads; a gate evicted while a load is still in flight
-merely lets that one file be fetched twice, never breaking correctness. When
-caching is disabled (cap `0`) this path is skipped entirely — reads pass
-straight through with no gate and no lock, exactly as before single-flight.
+Cold readers must remain independently pollable. A query may prefetch metadata
+on a probe input and then stop polling that input while it builds a join whose
+other input reads the same file. Waiting on a per-file single-flight gate owned
+by the paused probe creates a cycle: build waits for metadata, metadata waits
+for probe, probe waits for build. This was reproduced with cold TPC-H SF100 Q2.
+
+Per-file gates therefore never block a reader: a contender rechecks the cache
+and, if still cold, independently fetches and parses the immutable footer.
+`parquet_metadata_cache_contention_bypasses` exposes this trade. Concurrent cold
+readers can issue duplicate I/O, but no task is detached and warm hits retain
+the zero-I/O path. The synchronous LRU lock is never held across an await.
+The gate map is bounded by [`INFLIGHT_GATES_CAP`]; eviction can only weaken
+contention accounting, not correctness. With cap `0`, both caches and gates
+are bypassed. Retained parsed metadata remains byte-capped; in-flight reads
+and query-owned metadata still require separate memory headroom.
 
 [`ParquetSource`]: datafusion::datasource::physical_plan::parquet::source::ParquetSource
 */
@@ -109,6 +111,7 @@ use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
+use crate::parquet_data_cache::{DataMetrics, DATA_CACHE};
 use bytes::Bytes;
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::physical_plan::parquet::{
@@ -127,7 +130,7 @@ use tokio::sync::Mutex as AsyncMutex;
 
 const DEFAULT_CAP_MB: usize = 64;
 
-/// Upper bound on the number of distinct per-file single-flight gates kept live
+/// Upper bound on the number of distinct nonblocking per-file gates kept live
 /// at once. The gate map is an LRU capped here so it stays bounded no matter how
 /// many distinct files the process reads over its lifetime; a gate evicted while
 /// a load is still in flight only weakens de-duplication for that one file (an
@@ -232,6 +235,8 @@ struct CacheMetrics {
     /// latched. Non-zero means this deployment's working set outgrew the cache and
     /// the optimization backed itself off.
     page_index_suppressed: Count,
+    /// Independent loads used instead of waiting for another input's loader.
+    contention_bypasses: Count,
 }
 
 impl CacheMetrics {
@@ -243,12 +248,13 @@ impl CacheMetrics {
                 .counter("parquet_metadata_cache_evictions", partition),
             page_index_suppressed: MetricBuilder::new(metrics)
                 .counter("parquet_metadata_cache_page_index_suppressed", partition),
+            contention_bypasses: MetricBuilder::new(metrics)
+                .counter("parquet_metadata_cache_contention_bypasses", partition),
         }
     }
 }
 
-/// The parsed-footer LRU together with the per-file single-flight gates that
-/// collapse concurrent cold loads of the same file into one fetch+parse.
+/// The parsed-footer LRU together with nonblocking per-file load gates.
 ///
 /// A single instance backs the whole process ([`CACHE`]); the tests construct
 /// isolated instances (including disabled ones) to drive [`load`] deterministically.
@@ -256,10 +262,10 @@ impl CacheMetrics {
 /// [`load`]: MetadataCache::load
 struct MetadataCache {
     /// Parsed footers, byte-capped. `None` when caching is disabled (cap `0`),
-    /// in which case lookups, inserts, and the single-flight gate are all
+    /// in which case lookups, inserts, and load gates are all
     /// bypassed.
     store: Option<Mutex<ByteCappedCache>>,
-    /// Per-file single-flight gates, keyed exactly like [`ByteCappedCache`]
+    /// Nonblocking per-file gates, keyed exactly like [`ByteCappedCache`]
     /// entries. Bounded to [`INFLIGHT_GATES_CAP`] live gates by its own LRU.
     inflight: Mutex<LruCache<String, Arc<AsyncMutex<()>>>>,
     /// Entries evicted over the process lifetime. Drives [`page_index_backed_off`].
@@ -296,7 +302,7 @@ impl MetadataCache {
         Some(guard.stats())
     }
 
-    /// Whether caching (and therefore single-flight) is active.
+    /// Whether caching and load-gate accounting are active.
     fn enabled(&self) -> bool {
         self.store.is_some()
     }
@@ -373,7 +379,7 @@ impl MetadataCache {
         self.backed_off.load(Ordering::Relaxed)
     }
 
-    /// Return the single-flight gate for `key`, creating it on first use. The
+    /// Return the nonblocking load gate for `key`, creating it on first use. The
     /// gate map is a small LRU, so live gates stay bounded to
     /// [`INFLIGHT_GATES_CAP`]; a gate evicted while still held survives through
     /// its holders' `Arc` clones. Takes the map lock only briefly and never
@@ -392,15 +398,14 @@ impl MetadataCache {
     }
 
     /// Resolve the footer for `key`: serve it from cache, or fetch+parse it
-    /// through `reader` on a miss, collapsing concurrent cold misses of the same
-    /// file into a single fetch.
+    /// through `reader` on a miss, without depending on another reader's polling.
     ///
     /// When caching is disabled the fetch is issued straight through with no
-    /// gate and no lock. Otherwise the first caller to miss takes the file's
-    /// single-flight gate and performs the sole fetch+parse+insert; the rest
-    /// wait on the gate and, once it releases, re-check the cache and return the
-    /// winner's `Arc`. The synchronous LRU locks are never held across the
-    /// `reader.get_metadata` await — only the per-file async gate is.
+    /// gate and no lock. Contenders never wait for an in-flight loader: it may
+    /// be a prefetched input that the query parent has stopped polling. They
+    /// recheck the cache, then load independently when necessary. The trade is
+    /// duplicate cold I/O, not a cross-input dependency or detached background
+    /// task. Synchronous LRU locks are never held across the metadata await.
     async fn load(
         &self,
         reader: &mut (dyn AsyncFileReader + Send),
@@ -419,11 +424,14 @@ impl MetadataCache {
             return reader.get_metadata(options).await;
         }
         let gate = self.inflight_gate(key);
-        let _permit = gate.lock().await;
-        // The winner may have populated the cache while we waited on the gate.
+        let permit = gate.try_lock().ok();
+        // A racing reader may have populated the cache since our first lookup.
         if let Some(meta) = self.get(key, size) {
             metrics.hits.add(1);
             return Ok(meta);
+        }
+        if permit.is_none() {
+            metrics.contention_bypasses.add(1);
         }
         metrics.misses.add(1);
         // Fetch the page index in this same round trip when configured, so the
@@ -517,7 +525,7 @@ fn page_index_options(
 
 /// The process-wide metadata cache. Capacity comes from
 /// `ICEBERG_PARQUET_METADATA_CACHE_MB` (read once per process; default 64 MiB;
-/// `0` disables caching and single-flight entirely).
+/// `0` disables caching and load gates entirely).
 static CACHE: LazyLock<MetadataCache> = LazyLock::new(|| {
     let raw = std::env::var("ICEBERG_PARQUET_METADATA_CACHE_MB").ok();
     let cap_mb = raw
@@ -578,6 +586,7 @@ impl ParquetFileReaderFactory for CachingParquetFileReaderFactory {
         );
         let size = partitioned_file.object_meta.size;
         let cache_metrics = CacheMetrics::new(metrics, partition_index);
+        let data_metrics = DataMetrics::new(metrics, partition_index);
         let inner = self.inner.create_reader(
             partition_index,
             partitioned_file,
@@ -586,9 +595,10 @@ impl ParquetFileReaderFactory for CachingParquetFileReaderFactory {
         )?;
         Ok(Box::new(CachingMetadataReader {
             inner,
-            key,
+            key: Arc::from(key),
             size,
             metrics: cache_metrics,
+            data_metrics,
         }))
     }
 }
@@ -597,21 +607,52 @@ impl ParquetFileReaderFactory for CachingParquetFileReaderFactory {
 /// process-wide cache and forwards data reads to `inner`.
 struct CachingMetadataReader {
     inner: Box<dyn AsyncFileReader + Send>,
-    key: String,
+    key: Arc<str>,
     size: u64,
     metrics: CacheMetrics,
+    data_metrics: DataMetrics,
 }
 
 impl AsyncFileReader for CachingMetadataReader {
     fn get_bytes(&mut self, range: Range<u64>) -> BoxFuture<'_, ParquetResult<Bytes>> {
-        self.inner.get_bytes(range)
+        if !DATA_CACHE.enabled() {
+            return self.inner.get_bytes(range);
+        }
+        async move {
+            let mut bytes = DATA_CACHE
+                .read(
+                    &mut *self.inner,
+                    &self.key,
+                    self.size,
+                    vec![range],
+                    &self.data_metrics,
+                )
+                .await?;
+            bytes.pop().ok_or_else(|| {
+                datafusion::parquet::errors::ParquetError::General(
+                    "Missing Parquet byte range".into(),
+                )
+            })
+        }
+        .boxed()
     }
 
     fn get_byte_ranges(
         &mut self,
         ranges: Vec<Range<u64>>,
     ) -> BoxFuture<'_, ParquetResult<Vec<Bytes>>> {
-        self.inner.get_byte_ranges(ranges)
+        if !DATA_CACHE.enabled() {
+            return self.inner.get_byte_ranges(ranges);
+        }
+        DATA_CACHE
+            .read(
+                &mut *self.inner,
+                &self.key,
+                self.size,
+                ranges,
+                &self.data_metrics,
+            )
+            .boxed()
     }
 
     fn get_metadata<'a>(
@@ -885,7 +926,7 @@ mod tests {
     /// An [`ObjectStore`] that counts `get_opts` calls (all footer/data reads
     /// funnel through it) and delegates everything else to an inner store. An
     /// optional per-`get` `delay` widens the window in which concurrent cold
-    /// readers overlap, making the single-flight tests deterministic.
+    /// readers overlap, exercising cold-read contention.
     #[derive(Debug)]
     struct CountingStore {
         inner: Arc<dyn ObjectStore>,
@@ -924,8 +965,8 @@ mod tests {
             options: GetOptions,
         ) -> OsResult<GetResult> {
             if let Some(delay) = self.delay {
-                // Yield while "fetching" so racing cold readers pile onto the
-                // single-flight gate before the winner inserts.
+                // Yield while "fetching" so cold readers overlap before any
+                // reader inserts its result.
                 tokio::time::sleep(delay).await;
             }
             self.gets.fetch_add(1, Ordering::SeqCst);
@@ -1076,10 +1117,51 @@ mod tests {
         gets.swap(0, Ordering::SeqCst)
     }
 
-    /// N concurrent cold readers of the same file collapse to exactly one
-    /// fetch+parse, and every reader receives the winner's `Arc`.
+    #[tokio::test]
+    async fn paused_cold_reader_cannot_block_an_independently_polled_reader() {
+        let path = "db/tbl/data/paused_leader.parquet";
+        let (_inner, factory, size, _gets) =
+            counting_setup(path, Some(Duration::from_millis(1))).await;
+        let cache = MetadataCache::new(64 * 1024 * 1024);
+        let plan_metrics = ExecutionPlanMetricsSet::new();
+        let key = "iceberg-rust://paused-leader/file";
+        let mut first = factory
+            .create_reader(0, partitioned_file(path, size), None, &plan_metrics)
+            .unwrap();
+        let mut second = factory
+            .create_reader(0, partitioned_file(path, size), None, &plan_metrics)
+            .unwrap();
+        let first_metrics = discard_metrics();
+        let second_metrics = discard_metrics();
+        let mut paused = Box::pin(cache.load(&mut *first, None, key, size, &first_metrics));
+        assert!(paused.as_mut().now_or_never().is_none());
+        assert!(
+            cache.inflight_gate(key).try_lock().is_err(),
+            "the first load is paused while holding the per-file gate"
+        );
+
+        // A query parent may stop polling its prefetched probe input while it
+        // consumes a build input reading the same immutable file. The cache
+        // must not introduce a dependency on that paused probe future.
+        let completed = tokio::time::timeout(
+            Duration::from_millis(100),
+            cache.load(&mut *second, None, key, size, &second_metrics),
+        )
+        .await
+        .expect("a parked metadata loader must not deadlock another query input")
+        .unwrap();
+        assert_eq!(completed.file_metadata().num_rows(), 3);
+        assert_eq!(second_metrics.contention_bypasses.value(), 1);
+        let resumed = paused.await.unwrap();
+        assert_eq!(resumed.as_ref(), completed.as_ref());
+        assert_eq!(cache.stats().unwrap().0, 1);
+    }
+
+    /// Racing cold readers may load independently, but values and the cache
+    /// byte bound remain exact. This deliberately replaces the old one-fetch
+    /// performance guarantee, whose blocking gate could deadlock a query.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn concurrent_cold_reads_single_flight_one_fetch() {
+    async fn concurrent_cold_reads_preserve_metadata_and_bounded_cache() {
         let path = "db/tbl/data/single_flight.parquet";
         let (_inner, factory, size, gets) =
             counting_setup(path, Some(Duration::from_millis(25))).await;
@@ -1111,17 +1193,14 @@ mod tests {
             .map(|joined| joined.unwrap())
             .collect();
 
-        assert_eq!(
-            gets.load(Ordering::SeqCst),
-            per_fetch,
-            "N concurrent cold readers must trigger exactly one underlying fetch"
-        );
+        let actual_gets = gets.load(Ordering::SeqCst);
+        assert!(actual_gets >= per_fetch && actual_gets <= per_fetch * n);
         for meta in &metas[1..] {
-            assert!(
-                Arc::ptr_eq(&metas[0], meta),
-                "every reader shares the single-flight winner's Arc"
-            );
+            assert_eq!(metas[0].as_ref(), meta.as_ref());
         }
+        let (entries, bytes) = cache.stats().unwrap();
+        assert_eq!(entries, 1);
+        assert!(bytes <= 64 * 1024 * 1024);
     }
 
     /// Concurrent cold reads of *different* files are not serialized against
