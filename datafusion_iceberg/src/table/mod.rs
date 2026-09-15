@@ -632,6 +632,9 @@ async fn table_scan(
     } else {
         sequence_number_range
     };
+    let change_snapshot_ids = scan_changed_data_files
+        .then(|| snapshot_ids_in_range(table.metadata(), snapshot_range.0, snapshot_range.1))
+        .transpose()?;
 
     // If there is a filter expression the manifests to read are pruned based on the pruning statistics available in the manifest_list file.
     // Row lineage values may be synthesized from manifest metadata, so they must not be
@@ -760,6 +763,7 @@ async fn table_scan(
                     .await
                     .map_err(DataFusionIcebergError::from)?
             };
+        let data_files = prepare_changed_data_files(data_files, change_snapshot_ids.as_ref());
 
         let pruning_predicate = PruningPredicateBuilder::new()
             .with_file_schema(arrow_schema.clone())
@@ -801,6 +805,7 @@ async fn table_scan(
             .try_collect()
             .await
             .map_err(DataFusionIcebergError::from)?;
+        let data_files = prepare_changed_data_files(data_files, change_snapshot_ids.as_ref());
 
         let mut statistics = statistics_from_datafiles(&schema, &data_files);
         for _ in 0..usize::from(enable_row_id_column)
@@ -1383,6 +1388,67 @@ fn scan_manifest_entry(entry: &ManifestEntry, scan_changed_data_files: bool) -> 
         entry.data_file().content(),
         scan_changed_data_files,
     )
+}
+
+fn snapshot_ids_in_range(
+    metadata: &TableMetadata,
+    start_snapshot_id: Option<i64>,
+    end_snapshot_id: Option<i64>,
+) -> Result<HashSet<i64>, DataFusionError> {
+    let mut current = match end_snapshot_id {
+        Some(snapshot_id) => Some(snapshot_id),
+        None => metadata
+            .current_snapshot(None)
+            .map_err(DataFusionIcebergError::from)?
+            .map(|snapshot| *snapshot.snapshot_id()),
+    }
+    .ok_or_else(|| DataFusionError::Plan("Iceberg table has no snapshot".to_owned()))?;
+    let mut snapshots = HashSet::new();
+    loop {
+        if Some(current) == start_snapshot_id {
+            return Ok(snapshots);
+        }
+        snapshots.insert(current);
+        let snapshot = metadata.snapshots.get(&current).ok_or_else(|| {
+            DataFusionError::Plan(format!(
+                "Iceberg snapshot {current} is missing from metadata"
+            ))
+        })?;
+        match snapshot.parent_snapshot_id() {
+            Some(parent) => current = *parent,
+            None if start_snapshot_id.is_none() => return Ok(snapshots),
+            None => {
+                return plan_err!(
+                    "Iceberg scan start snapshot is not an ancestor of the end snapshot"
+                );
+            }
+        }
+    }
+}
+
+fn prepare_changed_data_files(
+    data_files: Vec<(ManifestPath, ManifestEntry)>,
+    change_snapshot_ids: Option<&HashSet<i64>>,
+) -> Vec<(ManifestPath, ManifestEntry)> {
+    let Some(change_snapshot_ids) = change_snapshot_ids else {
+        return data_files;
+    };
+    data_files
+        .into_iter()
+        .filter_map(|(path, mut entry)| {
+            let is_changed_data_file = entry.data_file().content() == &Content::Data
+                && entry
+                    .snapshot_id()
+                    .is_some_and(|snapshot_id| change_snapshot_ids.contains(&snapshot_id));
+            if !is_changed_data_file {
+                return None;
+            }
+            if *entry.status() == Status::Existing {
+                *entry.status_mut() = Status::Added;
+            }
+            Some((path, entry))
+        })
+        .collect()
 }
 
 fn scan_manifest_status(status: Status, content: &Content, scan_changed_data_files: bool) -> bool {
@@ -2498,20 +2564,40 @@ mod tests {
             .collect()
             .await
             .expect("append more v3 rows");
-        let (appended_table, second_snapshot_id) = {
+        let second_snapshot_id = {
             let tabular = writable.tabular.read().expect("read appended table");
+            let Tabular::Table(table) = &*tabular else {
+                panic!("expected an Iceberg table");
+            };
+            table
+                .metadata()
+                .current_snapshot(None)
+                .expect("read second snapshot")
+                .expect("second snapshot")
+                .snapshot_id()
+                .to_owned()
+        };
+        ctx.sql("INSERT INTO lineage_numbers (id) VALUES (60)")
+            .await
+            .expect("plan third v3 append")
+            .collect()
+            .await
+            .expect("append final v3 row");
+        let (appended_table, third_snapshot_id) = {
+            let tabular = writable.tabular.read().expect("read final table");
             let Tabular::Table(table) = &*tabular else {
                 panic!("expected an Iceberg table");
             };
             let snapshot_id = table
                 .metadata()
                 .current_snapshot(None)
-                .expect("read second snapshot")
-                .expect("second snapshot")
+                .expect("read third snapshot")
+                .expect("third snapshot")
                 .snapshot_id()
                 .to_owned();
             (table.clone(), snapshot_id)
         };
+        assert_ne!(second_snapshot_id, third_snapshot_id);
         let changes_config = super::DataFusionTableConfigBuilder::default()
             .enable_data_file_path_column(false)
             .enable_data_file_row_position_column(false)
@@ -2524,7 +2610,7 @@ mod tests {
         let changes = Arc::new(DataFusionTable::new_with_config(
             Tabular::Table(appended_table),
             Some(first_snapshot_id),
-            Some(second_snapshot_id),
+            Some(third_snapshot_id),
             None,
             Some(changes_config),
         ));
@@ -2561,10 +2647,10 @@ mod tests {
             .expect("Utf8 change status")
             .iter()
             .collect::<Vec<_>>();
-        assert_eq!(int_values(0), vec![Some(40), Some(50)]);
-        assert_eq!(int_values(1), vec![Some(3), Some(4)]);
-        assert_eq!(int_values(2), vec![Some(2), Some(2)]);
-        assert_eq!(statuses, vec![Some("ADDED"), Some("ADDED")]);
+        assert_eq!(int_values(0), vec![Some(40), Some(50), Some(60)]);
+        assert_eq!(int_values(1), vec![Some(3), Some(4), Some(5)]);
+        assert_eq!(int_values(2), vec![Some(2), Some(2), Some(3)]);
+        assert_eq!(statuses, vec![Some("ADDED"), Some("ADDED"), Some("ADDED")]);
     }
 
     #[tokio::test]
