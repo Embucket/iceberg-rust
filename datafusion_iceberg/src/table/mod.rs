@@ -1932,20 +1932,38 @@ fn apply_position_deletes(
         ),
     ];
 
-    let delete_sequence_index = delete_plan
-        .schema()
-        .index_of(DELETE_FILE_SEQUENCE_NUMBER_COLUMN)?;
-    let data_sequence_index = data_plan
-        .schema()
-        .index_of(DATA_FILE_SEQUENCE_NUMBER_COLUMN)?;
+    let sequence_filter =
+        position_delete_sequence_filter(&delete_plan.schema(), &data_plan.schema())?;
+
+    Ok(Arc::new(HashJoinExec::try_new(
+        delete_plan,
+        data_plan,
+        join_on,
+        Some(sequence_filter),
+        &JoinType::RightAnti,
+        None,
+        PartitionMode::CollectLeft,
+        NullEquality::NullEqualsNothing,
+        false,
+    )?))
+}
+
+fn position_delete_sequence_filter(
+    delete_schema: &SchemaRef,
+    data_schema: &SchemaRef,
+) -> Result<JoinFilter, DataFusionError> {
+    let delete_sequence_index = delete_schema.index_of(DELETE_FILE_SEQUENCE_NUMBER_COLUMN)?;
+    let data_sequence_index = data_schema.index_of(DATA_FILE_SEQUENCE_NUMBER_COLUMN)?;
     let filter_schema = Arc::new(ArrowSchema::new(vec![
         Field::new("delete_sequence_number", DataType::Int64, false),
         Field::new("data_sequence_number", DataType::Int64, false),
     ]));
-    let sequence_filter = JoinFilter::new(
+    Ok(JoinFilter::new(
         Arc::new(BinaryExpr::new(
             Arc::new(Column::new("delete_sequence_number", 0)),
-            Operator::Gt,
+            // Iceberg v2 position deletes apply when their sequence number is
+            // greater than or equal to the data file sequence number.
+            Operator::GtEq,
             Arc::new(Column::new("data_sequence_number", 1)),
         )),
         vec![
@@ -1959,19 +1977,7 @@ fn apply_position_deletes(
             },
         ],
         filter_schema,
-    );
-
-    Ok(Arc::new(HashJoinExec::try_new(
-        delete_plan,
-        data_plan,
-        join_on,
-        Some(sequence_filter),
-        &JoinType::RightAnti,
-        None,
-        PartitionMode::CollectLeft,
-        NullEquality::NullEqualsNothing,
-        false,
-    )?))
+    ))
 }
 
 fn value_to_scalarvalue(value: &Value) -> Result<ScalarValue, DataFusionError> {
@@ -2335,7 +2341,10 @@ struct PartitionDeleteFileIndex {
 mod tests {
 
     use datafusion::{
-        arrow::array::{Int64Array, StringArray},
+        arrow::{
+            array::{BooleanArray, Int64Array, StringArray},
+            record_batch::RecordBatch,
+        },
         execution::object_store::ObjectStoreUrl,
         prelude::SessionContext,
         scalar::ScalarValue,
@@ -2366,7 +2375,10 @@ mod tests {
 
     use crate::{catalog::catalog::IcebergCatalog, table::fake_object_store_url, DataFusionTable};
 
-    use super::{DataSourceExec, ExecutionPlan, ParquetSource, TableProvider};
+    use super::{
+        position_delete_sequence_filter, DataSourceExec, ExecutionPlan, ParquetSource,
+        TableProvider,
+    };
     use datafusion::datasource::physical_plan::FileScanConfig;
 
     /// Walk `plan` and assert every parquet scan node carries the
@@ -2395,6 +2407,46 @@ mod tests {
             found += count_caching_parquet_sources(child.as_ref());
         }
         found
+    }
+
+    #[test]
+    fn position_deletes_include_equal_data_sequence_numbers() {
+        let delete_schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+            datafusion::arrow::datatypes::Field::new(
+                super::DELETE_FILE_SEQUENCE_NUMBER_COLUMN,
+                datafusion::arrow::datatypes::DataType::Int64,
+                false,
+            ),
+        ]));
+        let data_schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+            datafusion::arrow::datatypes::Field::new(
+                super::DATA_FILE_SEQUENCE_NUMBER_COLUMN,
+                datafusion::arrow::datatypes::DataType::Int64,
+                false,
+            ),
+        ]));
+        let filter = position_delete_sequence_filter(&delete_schema, &data_schema).unwrap();
+        let batch = RecordBatch::try_new(
+            filter.schema().clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![4, 5, 6])),
+                Arc::new(Int64Array::from(vec![5, 5, 5])),
+            ],
+        )
+        .unwrap();
+
+        let result = filter
+            .expression()
+            .evaluate(&batch)
+            .unwrap()
+            .into_array(batch.num_rows())
+            .unwrap();
+        let result = result.as_any().downcast_ref::<BooleanArray>().unwrap();
+
+        assert_eq!(
+            result.values().iter().collect::<Vec<_>>(),
+            [false, true, true]
+        );
     }
 
     #[tokio::test]
