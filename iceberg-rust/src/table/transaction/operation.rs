@@ -1258,7 +1258,7 @@ pub fn compute_n_splits(
 mod tests {
     use super::*;
     use crate::table::ManifestReader;
-    use futures::executor::block_on;
+    use futures::{executor::block_on, TryStreamExt};
     use iceberg_rust_spec::manifest::FileFormat;
     use iceberg_rust_spec::spec::schema::SchemaBuilder;
     use iceberg_rust_spec::spec::table_metadata::TableMetadataBuilder;
@@ -1529,6 +1529,132 @@ mod tests {
 
         crate::catalog::commit::apply_table_updates(&mut metadata, overwrite_updates).unwrap();
         assert_eq!(metadata.next_row_id, 20);
+    }
+
+    #[tokio::test]
+    async fn v3_append_assigns_row_ids_to_pre_upgrade_manifests() {
+        let mut metadata = sample_metadata(&[], None, &[]);
+        let store = Arc::new(InMemory::new());
+
+        let legacy_append = Operation::Append {
+            branch: None,
+            data_files: vec![data_file("s3://tests/table/data/legacy.parquet", 3)],
+            delete_files: Vec::new(),
+            additional_summary: None,
+        };
+        let (_, legacy_updates) = legacy_append
+            .execute(&metadata, store.clone())
+            .await
+            .unwrap();
+        crate::catalog::commit::apply_table_updates(&mut metadata, legacy_updates).unwrap();
+
+        metadata.format_version = FormatVersion::V3;
+        metadata.next_row_id = 0;
+        let v3_append = Operation::Append {
+            branch: None,
+            data_files: vec![data_file("s3://tests/table/data/v3.parquet", 5)],
+            delete_files: Vec::new(),
+            additional_summary: None,
+        };
+        let (_, v3_updates) = v3_append.execute(&metadata, store.clone()).await.unwrap();
+        let snapshot = v3_updates
+            .iter()
+            .find_map(|update| match update {
+                TableUpdate::AddSnapshot { snapshot } => Some(snapshot),
+                _ => None,
+            })
+            .unwrap();
+
+        assert_eq!(*snapshot.first_row_id(), Some(0));
+        assert_eq!(*snapshot.added_rows(), Some(8));
+
+        let manifest_list_bytes = store
+            .get(&strip_prefix(snapshot.manifest_list()).into())
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let manifests = ManifestListReader::new(&manifest_list_bytes[..], &metadata)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let mut first_row_ids = manifests
+            .iter()
+            .map(|manifest| manifest.first_row_id)
+            .collect::<Vec<_>>();
+        first_row_ids.sort();
+        assert_eq!(first_row_ids, vec![Some(0), Some(3)]);
+
+        let mut file_row_ids =
+            crate::table::datafiles(store.clone(), &manifests, None, (None, None))
+                .await
+                .unwrap()
+                .map_ok(|(_, entry)| {
+                    (
+                        entry.data_file().file_path().clone(),
+                        *entry.data_file().first_row_id(),
+                    )
+                })
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+        file_row_ids.sort();
+        assert_eq!(
+            file_row_ids,
+            vec![
+                ("s3://tests/table/data/legacy.parquet".to_string(), Some(0)),
+                ("s3://tests/table/data/v3.parquet".to_string(), Some(3)),
+            ]
+        );
+
+        crate::catalog::commit::apply_table_updates(&mut metadata, v3_updates).unwrap();
+        assert_eq!(metadata.next_row_id, 8);
+    }
+
+    #[test]
+    fn v3_commit_accepts_forward_row_id_gaps_but_rejects_overlap() {
+        let mut metadata = sample_metadata(&[], None, &[]);
+        metadata.format_version = FormatVersion::V3;
+        metadata.next_row_id = 10;
+
+        let gap_snapshot = SnapshotBuilder::default()
+            .with_snapshot_id(1)
+            .with_sequence_number(1)
+            .with_timestamp_ms(1)
+            .with_manifest_list("s3://tests/table/metadata/gap.avro".to_string())
+            .with_summary(Summary::default())
+            .with_first_row_id(15)
+            .with_added_rows(3)
+            .build()
+            .unwrap();
+        crate::catalog::commit::apply_table_updates(
+            &mut metadata,
+            vec![TableUpdate::AddSnapshot {
+                snapshot: gap_snapshot,
+            }],
+        )
+        .unwrap();
+        assert_eq!(metadata.next_row_id, 18);
+
+        let overlapping_snapshot = SnapshotBuilder::default()
+            .with_snapshot_id(2)
+            .with_sequence_number(2)
+            .with_timestamp_ms(2)
+            .with_manifest_list("s3://tests/table/metadata/overlap.avro".to_string())
+            .with_summary(Summary::default())
+            .with_first_row_id(17)
+            .with_added_rows(1)
+            .build()
+            .unwrap();
+        let result = crate::catalog::commit::apply_table_updates(
+            &mut metadata,
+            vec![TableUpdate::AddSnapshot {
+                snapshot: overlapping_snapshot,
+            }],
+        );
+        assert!(matches!(result, Err(Error::InvalidFormat(_))));
+        assert_eq!(metadata.next_row_id, 18);
     }
 
     #[tokio::test]

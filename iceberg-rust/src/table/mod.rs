@@ -22,8 +22,8 @@ use futures::{stream, Stream, StreamExt, TryFutureExt, TryStreamExt};
 use iceberg_rust_spec::util::{self};
 use iceberg_rust_spec::{
     spec::{
-        manifest::{Content, ManifestEntry, Status},
-        manifest_list::{Content as ManifestListContent, ManifestListEntry},
+        manifest::{Content, FirstRowIdInheritance, ManifestEntry},
+        manifest_list::ManifestListEntry,
         schema::Schema,
         table_metadata::TableMetadata,
     },
@@ -396,7 +396,6 @@ async fn datafiles(
             let manifest_sequence_number = file.sequence_number;
             let manifest_snapshot_id = file.added_snapshot_id;
             let manifest_first_row_id = file.first_row_id;
-            let manifest_content = file.content;
             async move {
                 // Manifest files are immutable by path. Key by the original
                 // URI so equal store-relative paths cannot alias across stores.
@@ -415,40 +414,37 @@ async fn datafiles(
                 };
                 let bytes = Cursor::new(Vec::from(data));
 
-                let mut entries = ManifestReader::new(bytes)?.collect::<Result<Vec<_>, Error>>()?;
-                assign_first_row_ids(
-                    &manifest_path,
-                    manifest_content,
-                    manifest_first_row_id,
-                    &mut entries,
-                )?;
-                Ok::<_, Error>(
-                    entries
-                        .into_iter()
-                        .filter_map(|mut x| {
-                            if x.snapshot_id().is_none() {
-                                *x.snapshot_id_mut() = Some(manifest_snapshot_id);
-                            }
-                            let sequence_number = if let Some(sequence_number) = x.sequence_number()
-                            {
-                                *sequence_number
-                            } else {
-                                *x.sequence_number_mut() = Some(manifest_sequence_number);
-                                manifest_sequence_number
-                            };
+                let mut first_row_id_inheritance =
+                    FirstRowIdInheritance::for_committed_manifest(manifest_first_row_id);
 
-                            let keep = match sequence_number_range {
-                                (Some(start), Some(end)) => {
-                                    start < sequence_number && sequence_number <= end
-                                }
-                                (Some(start), None) => start < sequence_number,
-                                (None, Some(end)) => sequence_number <= end,
-                                _ => true,
-                            };
-                            keep.then(|| (manifest_path.clone(), x))
-                        })
-                        .collect::<Vec<_>>(),
-                )
+                ManifestReader::new(bytes)?
+                    .map(move |entry| {
+                        let mut entry = entry?;
+                        first_row_id_inheritance.apply(&mut entry)?;
+                        Ok(entry)
+                    })
+                    .filter_map_ok(|mut x| {
+                        if x.snapshot_id().is_none() {
+                            *x.snapshot_id_mut() = Some(manifest_snapshot_id);
+                        }
+                        let sequence_number = if let Some(sequence_number) = x.sequence_number() {
+                            *sequence_number
+                        } else {
+                            *x.sequence_number_mut() = Some(manifest_sequence_number);
+                            manifest_sequence_number
+                        };
+
+                        let keep = match sequence_number_range {
+                            (Some(start), Some(end)) => {
+                                start < sequence_number && sequence_number <= end
+                            }
+                            (Some(start), None) => start < sequence_number,
+                            (None, Some(end)) => sequence_number <= end,
+                            _ => true,
+                        };
+                        keep.then(|| (manifest_path.clone(), x))
+                    })
+                    .collect::<Result<Vec<_>, Error>>()
             }
         })
         .collect();
@@ -460,54 +456,6 @@ async fn datafiles(
         .buffered(crate::config::concurrent_manifest_ops())
         .map_ok(|entries| stream::iter(entries.into_iter().map(Ok::<_, Error>)))
         .try_flatten())
-}
-
-fn assign_first_row_ids(
-    manifest_path: &str,
-    content: ManifestListContent,
-    manifest_first_row_id: Option<i64>,
-    entries: &mut [ManifestEntry],
-) -> Result<(), Error> {
-    if content != ManifestListContent::Data {
-        return Ok(());
-    }
-
-    let Some(mut next_row_id) = manifest_first_row_id else {
-        for entry in entries {
-            *entry.data_file_mut().first_row_id_mut() = None;
-        }
-        return Ok(());
-    };
-
-    if next_row_id < 0 {
-        return Err(Error::InvalidFormat(format!(
-            "Manifest {manifest_path} has a negative first_row_id: {next_row_id}"
-        )));
-    }
-
-    for entry in entries {
-        if *entry.status() == Status::Deleted {
-            continue;
-        }
-        let data_file = entry.data_file_mut();
-        if data_file.first_row_id().is_some() {
-            continue;
-        }
-        let record_count = *data_file.record_count();
-        if record_count < 0 {
-            return Err(Error::InvalidFormat(format!(
-                "Data file {} has a negative record count: {record_count}",
-                data_file.file_path()
-            )));
-        }
-        *data_file.first_row_id_mut() = Some(next_row_id);
-        next_row_id = next_row_id.checked_add(record_count).ok_or_else(|| {
-            Error::InvalidFormat(format!(
-                "Row ID overflow while reading manifest {manifest_path}"
-            ))
-        })?;
-    }
-    Ok(())
 }
 
 /// delete all datafiles, manifests and metadata files, does not remove table from catalog
@@ -568,105 +516,7 @@ pub(crate) async fn delete_all_table_files(
 
 #[cfg(test)]
 mod tests {
-    use iceberg_rust_spec::spec::{
-        manifest::{Content, DataFile, FileFormat, ManifestEntry, Status},
-        manifest_list::Content as ManifestListContent,
-        table_metadata::FormatVersion,
-        values::{Struct, Value},
-    };
     use rstest::rstest;
-
-    use super::assign_first_row_ids;
-
-    fn data_entry(
-        status: Status,
-        path: &str,
-        record_count: i64,
-        first_row_id: Option<i64>,
-    ) -> ManifestEntry {
-        let mut data_file = DataFile::builder();
-        data_file
-            .with_content(Content::Data)
-            .with_file_path(path.to_owned())
-            .with_file_format(FileFormat::Parquet)
-            .with_partition(Struct::from_iter(Vec::<(String, Option<Value>)>::new()))
-            .with_record_count(record_count)
-            .with_file_size_in_bytes(100)
-            .with_column_sizes(None)
-            .with_value_counts(None)
-            .with_null_value_counts(None)
-            .with_nan_value_counts(None)
-            .with_distinct_counts(None)
-            .with_lower_bounds(None)
-            .with_upper_bounds(None)
-            .with_first_row_id(first_row_id);
-        ManifestEntry::builder()
-            .with_format_version(FormatVersion::V3)
-            .with_status(status)
-            .with_data_file(data_file.build().expect("build data file"))
-            .with_sequence_number(1)
-            .build()
-            .expect("build manifest entry")
-    }
-
-    #[test]
-    fn inherits_v3_first_row_ids_before_scan_filtering() {
-        let mut entries = vec![
-            data_entry(Status::Added, "a.parquet", 2, None),
-            data_entry(Status::Existing, "explicit.parquet", 1, Some(100)),
-            data_entry(Status::Added, "b.parquet", 3, None),
-            data_entry(Status::Deleted, "deleted.parquet", 4, None),
-        ];
-
-        assign_first_row_ids(
-            "manifest.avro",
-            ManifestListContent::Data,
-            Some(10),
-            &mut entries,
-        )
-        .expect("assign first row ids");
-
-        assert_eq!(*entries[0].data_file().first_row_id(), Some(10));
-        assert_eq!(*entries[1].data_file().first_row_id(), Some(100));
-        assert_eq!(*entries[2].data_file().first_row_id(), Some(12));
-        assert_eq!(*entries[3].data_file().first_row_id(), None);
-    }
-
-    #[test]
-    fn clears_inherited_row_ids_without_manifest_lineage() {
-        let mut entries = vec![data_entry(Status::Added, "old.parquet", 2, Some(100))];
-
-        assign_first_row_ids(
-            "manifest.avro",
-            ManifestListContent::Data,
-            None,
-            &mut entries,
-        )
-        .expect("clear stale first row ids");
-
-        assert_eq!(*entries[0].data_file().first_row_id(), None);
-    }
-
-    #[test]
-    fn rejects_invalid_first_row_id_ranges() {
-        let mut entries = vec![data_entry(Status::Added, "a.parquet", 2, None)];
-        assert!(assign_first_row_ids(
-            "manifest.avro",
-            ManifestListContent::Data,
-            Some(-1),
-            &mut entries,
-        )
-        .is_err());
-
-        let mut entries = vec![data_entry(Status::Added, "a.parquet", 2, None)];
-        assert!(assign_first_row_ids(
-            "manifest.avro",
-            ManifestListContent::Data,
-            Some(i64::MAX),
-            &mut entries,
-        )
-        .is_err());
-    }
 
     // -----------------------------------------------------------------------
     // Placeholders for upstream scan + planning + metadata-table tests.
