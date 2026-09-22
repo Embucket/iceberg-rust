@@ -316,6 +316,7 @@ impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
         table_metadata: &'metadata TableMetadata,
     ) -> Result<Self, Error> {
         let inherited_snapshot_id = manifest.added_snapshot_id;
+        let current_schema = table_metadata.current_schema()?;
         let mut writer = AvroWriter::new(schema, Vec::new());
         let mut existing_files = 0;
         let mut existing_rows = 0;
@@ -376,6 +377,9 @@ impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
             if *entry.status() == Status::Deleted {
                 return None;
             }
+            entry
+                .data_file_mut()
+                .promote_bounds_to_schema(current_schema);
             *entry.status_mut() = Status::Existing;
             if entry.sequence_number().is_none() {
                 *entry.sequence_number_mut() = Some(manifest.sequence_number);
@@ -459,6 +463,7 @@ impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
         table_metadata: &'metadata TableMetadata,
     ) -> Result<(Self, FilteredManifestStats), Error> {
         let inherited_snapshot_id = manifest.added_snapshot_id;
+        let current_schema = table_metadata.current_schema()?;
         let manifest_reader = ManifestReader::new(bytes)?;
 
         let mut writer = AvroWriter::new(schema, Vec::new());
@@ -529,6 +534,9 @@ impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
             if *entry.status() == Status::Deleted {
                 return None;
             }
+            entry
+                .data_file_mut()
+                .promote_bounds_to_schema(current_schema);
             if entry.sequence_number().is_none() {
                 *entry.sequence_number_mut() = Some(manifest.sequence_number);
             }
