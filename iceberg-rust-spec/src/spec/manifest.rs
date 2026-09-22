@@ -419,6 +419,8 @@ pub enum FileFormat {
     Orc = 1,
     /// Parquet file
     Parquet = 2,
+    /// Puffin file
+    Puffin = 3,
 }
 
 /// Serialize for PrimitiveType wit special handling for
@@ -433,6 +435,7 @@ impl Serialize for FileFormat {
             Avro => serializer.serialize_str("AVRO"),
             Orc => serializer.serialize_str("ORC"),
             Parquet => serializer.serialize_str("PARQUET"),
+            Puffin => serializer.serialize_str("PUFFIN"),
         }
     }
 }
@@ -451,6 +454,8 @@ impl<'de> Deserialize<'de> for FileFormat {
             Ok(FileFormat::Orc)
         } else if s == "PARQUET" {
             Ok(FileFormat::Parquet)
+        } else if s == "PUFFIN" {
+            Ok(FileFormat::Puffin)
         } else {
             Err(serde::de::Error::custom("Invalid data file format."))
         }
