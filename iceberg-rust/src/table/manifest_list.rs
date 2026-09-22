@@ -590,6 +590,46 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
 
         let mut writer = AvroWriter::new(schema, Vec::new());
 
+        // Rewriting an unaffected v3 manifest is both unnecessary I/O and a
+        // row-lineage hazard. Preserve it by path; affected manifests are
+        // rewritten below after their inherited row IDs are materialized.
+        if table_metadata.format_version == FormatVersion::V3 {
+            let mut manifests = Vec::new();
+            let mut file_count_all_entries = 0usize;
+            for manifest in manifest_list_reader {
+                let manifest = manifest?;
+                let file_count = manifest
+                    .added_files_count
+                    .unwrap_or(0)
+                    .checked_add(manifest.existing_files_count.unwrap_or(0))
+                    .ok_or_else(|| Error::InvalidFormat("manifest file count".to_string()))?;
+                file_count_all_entries = file_count_all_entries
+                    .checked_add(file_count.try_into()?)
+                    .ok_or_else(|| Error::InvalidFormat("manifest file count".to_string()))?;
+
+                if manifests_to_overwrite.contains(&manifest.manifest_path) {
+                    manifests.push(manifest);
+                } else {
+                    writer.append_ser(manifest)?;
+                }
+            }
+
+            return Ok((
+                Self {
+                    table_metadata,
+                    writer,
+                    selected_data_manifest: None,
+                    selected_delete_manifest: None,
+                    bounding_partition_values,
+                    n_existing_files: file_count_all_entries,
+                    commit_uuid,
+                    manifest_count: 0,
+                    next_row_id: Some(table_metadata.next_row_id),
+                },
+                manifests,
+            ));
+        }
+
         let OverwriteManifest {
             manifest,
             file_count_all_entries,
@@ -1412,17 +1452,17 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
         if manifest.content == Content::Data {
             if let Some(next_row_id) = self.next_row_id.as_mut() {
                 let added_rows = manifest.added_rows_count.unwrap_or(0);
-                if added_rows < 0 {
+                let existing_rows = manifest.existing_rows_count.unwrap_or(0);
+                if added_rows < 0 || existing_rows < 0 {
                     return Err(Error::InvalidFormat(
-                        "manifest added row count must be non-negative".to_string(),
+                        "manifest row counts must be non-negative".to_string(),
                     ));
                 }
-                if added_rows > 0 {
-                    manifest.first_row_id = Some(*next_row_id);
-                    *next_row_id = next_row_id
-                        .checked_add(added_rows)
-                        .ok_or_else(|| Error::InvalidFormat("next row id overflow".to_string()))?;
-                }
+                manifest.first_row_id = Some(*next_row_id);
+                *next_row_id = next_row_id
+                    .checked_add(existing_rows)
+                    .and_then(|value| value.checked_add(added_rows))
+                    .ok_or_else(|| Error::InvalidFormat("next row id overflow".to_string()))?;
             }
         }
         self.writer.append_ser(manifest)?;

@@ -130,10 +130,7 @@ impl Operation {
         object_store: Arc<dyn ObjectStore>,
     ) -> Result<(Option<TableRequirement>, Vec<TableUpdate>), Error> {
         if table_metadata.format_version == FormatVersion::V3
-            && matches!(
-                &self,
-                Operation::Replace { .. } | Operation::Overwrite { .. }
-            )
+            && matches!(&self, Operation::Replace { .. })
         {
             return Err(Error::NotSupported(
                 "Iceberg v3 manifest rewrites with row lineage".to_string(),
@@ -731,12 +728,9 @@ impl Operation {
                             .build()
                             .map_err(Error::from)
                     });
-                    let selected_manifest_location = manifest_list_writer
+                    let files_to_filter = manifest_list_writer
                         .selected_data_manifest()
-                        .map(|x| x.manifest_path.clone())
-                        .ok_or(Error::NotFound("Selected manifest".to_owned()))?;
-                    let files_to_filter = files_to_overwrite
-                        .get(&selected_manifest_location)
+                        .and_then(|manifest| files_to_overwrite.get(&manifest.manifest_path))
                         .map(|filter_files| filter_files.iter().cloned().collect::<HashSet<_>>());
 
                     let selected_filter_stats = if n_splits == 0 {
@@ -795,7 +789,7 @@ impl Operation {
                     }
                 }
 
-                let (new_manifest_list_location, _) = manifest_list_writer
+                let (new_manifest_list_location, next_row_id) = manifest_list_writer
                     .finish(snapshot_id, object_store)
                     .await?;
 
@@ -820,6 +814,7 @@ impl Operation {
                     })
                     .with_schema_id(*table_metadata.current_schema()?.schema_id());
                 snapshot_builder.with_parent_snapshot_id(*old_snapshot.snapshot_id());
+                apply_v3_row_lineage(&mut snapshot_builder, table_metadata, next_row_id)?;
                 let snapshot = snapshot_builder.build()?;
 
                 Ok((
@@ -1262,6 +1257,7 @@ pub fn compute_n_splits(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::table::ManifestReader;
     use futures::executor::block_on;
     use iceberg_rust_spec::manifest::FileFormat;
     use iceberg_rust_spec::spec::schema::SchemaBuilder;
@@ -1440,6 +1436,99 @@ mod tests {
 
         crate::catalog::commit::apply_table_updates(&mut metadata, second_updates).unwrap();
         assert_eq!(metadata.next_row_id, 22);
+    }
+
+    #[tokio::test]
+    async fn v3_overwrite_preserves_existing_row_ids_and_reserves_a_new_range() {
+        let mut metadata = sample_metadata(&[], None, &[]);
+        metadata.format_version = FormatVersion::V3;
+        metadata.next_row_id = 10;
+        let store = Arc::new(InMemory::new());
+        let old_path = "s3://tests/table/data/old.parquet";
+
+        let append = Operation::Append {
+            branch: None,
+            data_files: vec![data_file(old_path, 5)],
+            delete_files: Vec::new(),
+            additional_summary: None,
+        };
+        let (_, append_updates) = append.execute(&metadata, store.clone()).await.unwrap();
+        crate::catalog::commit::apply_table_updates(&mut metadata, append_updates).unwrap();
+        assert_eq!(metadata.next_row_id, 15);
+
+        let current_snapshot = metadata.current_snapshot(None).unwrap().unwrap();
+        let manifest_list_bytes = store
+            .get(&strip_prefix(current_snapshot.manifest_list()).into())
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let original_manifest = ManifestListReader::new(&manifest_list_bytes[..], &metadata)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+
+        let mut replacement = data_file("s3://tests/table/data/replacement.parquet", 5);
+        *replacement.first_row_id_mut() = Some(10);
+        let overwrite = Operation::Overwrite {
+            branch: None,
+            data_files: vec![replacement],
+            files_to_overwrite: HashMap::from([(
+                original_manifest.manifest_path.clone(),
+                vec![old_path.to_string()],
+            )]),
+            additional_summary: None,
+        };
+        let (_, overwrite_updates) = overwrite.execute(&metadata, store.clone()).await.unwrap();
+        let overwrite_snapshot = overwrite_updates
+            .iter()
+            .find_map(|update| match update {
+                TableUpdate::AddSnapshot { snapshot } => Some(snapshot),
+                _ => None,
+            })
+            .unwrap();
+
+        assert_eq!(*overwrite_snapshot.first_row_id(), Some(15));
+        assert_eq!(*overwrite_snapshot.added_rows(), Some(5));
+
+        let manifest_list_bytes = store
+            .get(&strip_prefix(overwrite_snapshot.manifest_list()).into())
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let manifests = ManifestListReader::new(&manifest_list_bytes[..], &metadata)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let mut row_ids_by_path = HashMap::new();
+        for manifest in manifests {
+            let bytes = store
+                .get(&strip_prefix(&manifest.manifest_path).into())
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap();
+            for entry in ManifestReader::new(&bytes[..]).unwrap() {
+                let entry = entry.unwrap();
+                row_ids_by_path.insert(
+                    entry.data_file().file_path().clone(),
+                    *entry.data_file().first_row_id(),
+                );
+            }
+        }
+        assert_eq!(row_ids_by_path.get(old_path), Some(&Some(10)));
+        assert_eq!(
+            row_ids_by_path.get("s3://tests/table/data/replacement.parquet"),
+            Some(&Some(10))
+        );
+
+        crate::catalog::commit::apply_table_updates(&mut metadata, overwrite_updates).unwrap();
+        assert_eq!(metadata.next_row_id, 20);
     }
 
     #[tokio::test]

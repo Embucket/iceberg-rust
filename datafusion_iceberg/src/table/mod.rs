@@ -108,6 +108,7 @@ use iceberg_rust::spec::{
     partition::Transform,
     schema::Schema,
     sort::{NullOrder, SortDirection, SortOrder},
+    table_metadata::FormatVersion,
     view_metadata::ViewRepresentation,
 };
 use iceberg_rust::{
@@ -2173,7 +2174,26 @@ pub async fn write_parquet_data_files(
     context: &Arc<TaskContext>,
     branch: Option<&str>,
 ) -> Result<Vec<DataFile>, DataFusionError> {
-    write_parquet_files(table, batches, context, None, branch).await
+    write_parquet_files(table, batches, context, None, branch, false).await
+}
+
+/// Writes copy-on-write data while preserving Iceberg v3 row lineage.
+///
+/// The input must contain the table columns followed by nullable `_row_id` and
+/// `_last_updated_sequence_number` Int64 columns. Existing rows carry their
+/// current values; modified rows carry their row ID and a null last-update
+/// value; new rows carry nulls for both. Iceberg inheritance fills null values
+/// from the committed file metadata without a post-commit rewrite.
+pub async fn write_parquet_data_files_with_row_lineage(
+    table: &Table,
+    batches: SendableRecordBatchStream,
+    context: &Arc<TaskContext>,
+    branch: Option<&str>,
+) -> Result<Vec<DataFile>, DataFusionError> {
+    if table.metadata().format_version != FormatVersion::V3 {
+        return plan_err!("Iceberg row-lineage writes require a v3 table");
+    }
+    write_parquet_files(table, batches, context, None, branch, true).await
 }
 
 /// Writes record batches as Parquet equality delete files to an Iceberg table.
@@ -2204,7 +2224,7 @@ pub async fn write_parquet_equality_delete_files(
     equality_ids: &[i32],
     branch: Option<&str>,
 ) -> Result<Vec<DataFile>, DataFusionError> {
-    write_parquet_files(table, batches, context, Some(equality_ids), branch).await
+    write_parquet_files(table, batches, context, Some(equality_ids), branch, false).await
 }
 
 #[instrument(name = "datafusion_iceberg::write_parquet_files", level = "debug", skip(table, batches, context), fields(
@@ -2217,6 +2237,7 @@ async fn write_parquet_files(
     context: &Arc<TaskContext>,
     equality_ids: Option<&[i32]>,
     branch: Option<&str>,
+    preserve_row_lineage: bool,
 ) -> Result<Vec<DataFile>, DataFusionError> {
     let object_store = table.object_store();
     let metadata = table.metadata();
@@ -2225,9 +2246,26 @@ async fn write_parquet_files(
     let schema = table
         .current_schema()
         .map_err(DataFusionIcebergError::from)?;
-    let arrow_schema = Arc::new(
+    let table_arrow_schema = Arc::new(
         TryInto::<ArrowSchema>::try_into(schema.fields()).map_err(DataFusionIcebergError::from)?,
     );
+    let arrow_schema = if preserve_row_lineage {
+        let mut builder = SchemaBuilder::from(table_arrow_schema.as_ref().clone());
+        builder.push(row_lineage_field(ROW_ID_COLUMN, ROW_ID_FIELD_ID));
+        builder.push(row_lineage_field(
+            LAST_UPDATED_SEQUENCE_NUMBER_COLUMN,
+            LAST_UPDATED_SEQUENCE_NUMBER_FIELD_ID,
+        ));
+        let write_schema = Arc::new(builder.finish());
+        if !write_schema.equivalent_names_and_types(&batches.schema()) {
+            return plan_err!(
+                "Iceberg row-lineage write input must contain table columns followed by nullable {ROW_ID_COLUMN} and {LAST_UPDATED_SEQUENCE_NUMBER_COLUMN} Int64 columns"
+            );
+        }
+        write_schema
+    } else {
+        table_arrow_schema
+    };
 
     let partition_fields = metadata
         .current_partition_fields()
@@ -2480,21 +2518,29 @@ mod tests {
     use datafusion::{
         arrow::{
             array::{BooleanArray, Int64Array, StringArray},
+            datatypes::{DataType, Field, Schema as ArrowSchema},
             record_batch::RecordBatch,
         },
         execution::object_store::ObjectStoreUrl,
+        physical_plan::stream::RecordBatchStreamAdapter,
         prelude::SessionContext,
         scalar::ScalarValue,
     };
+    use futures::stream;
     use iceberg_rust::{
         catalog::tabular::Tabular,
         object_store::ObjectStoreBuilder,
         spec::{
             namespace::Namespace,
             partition::{PartitionField, Transform},
+            row_lineage::{
+                LAST_UPDATED_SEQUENCE_NUMBER_COLUMN_NAME, LAST_UPDATED_SEQUENCE_NUMBER_FIELD_ID,
+                ROW_ID_COLUMN_NAME, ROW_ID_FIELD_ID,
+            },
             schema::Schema,
             snapshot::SnapshotBuilder,
             types::{PrimitiveType, StructField, Type},
+            util,
         },
     };
     use iceberg_rust::{
@@ -2507,6 +2553,8 @@ mod tests {
         view::View,
     };
     use iceberg_sql_catalog::SqlCatalog;
+    use object_store::ObjectStoreExt;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
     use std::sync::Arc;
 
@@ -2837,6 +2885,119 @@ mod tests {
         assert_eq!(int_values(2), vec![Some(2), Some(2), Some(3)]);
         assert_eq!(statuses, vec![Some("ADDED"), Some("ADDED"), Some("ADDED")]);
         assert_eq!(int_values(4), vec![Some(2), Some(2), Some(3)]);
+    }
+
+    #[tokio::test]
+    async fn test_v3_row_lineage_writer_preserves_physical_values() {
+        let object_store = ObjectStoreBuilder::memory();
+        let catalog: Arc<dyn Catalog> = Arc::new(
+            SqlCatalog::new("sqlite://", "test", object_store)
+                .await
+                .expect("create catalog"),
+        );
+        let schema = Schema::builder()
+            .with_struct_field(StructField {
+                id: 1,
+                name: "id".to_owned(),
+                required: true,
+                field_type: Type::Primitive(PrimitiveType::Long),
+                doc: None,
+                initial_default: None,
+                write_default: None,
+            })
+            .build()
+            .expect("build schema");
+        let table = Table::builder()
+            .with_name("lineage_writer")
+            .with_location("memory:///test/lineage_writer")
+            .with_schema(schema)
+            .with_property(("format-version".to_owned(), "3".to_owned()))
+            .build(&["test".to_owned()], catalog)
+            .await
+            .expect("create v3 table");
+
+        let write_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            super::row_lineage_field(ROW_ID_COLUMN_NAME, ROW_ID_FIELD_ID),
+            super::row_lineage_field(
+                LAST_UPDATED_SEQUENCE_NUMBER_COLUMN_NAME,
+                LAST_UPDATED_SEQUENCE_NUMBER_FIELD_ID,
+            ),
+        ]));
+        let batch = RecordBatch::try_new(
+            write_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![10, 20, 30])),
+                Arc::new(Int64Array::from(vec![Some(7), Some(8), None])),
+                Arc::new(Int64Array::from(vec![Some(1), None, None])),
+            ],
+        )
+        .expect("build lineage batch");
+        let batches = Box::pin(RecordBatchStreamAdapter::new(
+            write_schema,
+            stream::iter([Ok(batch)]),
+        ));
+        let ctx = SessionContext::new();
+        let files = super::write_parquet_data_files_with_row_lineage(
+            &table,
+            batches,
+            &ctx.task_ctx(),
+            None,
+        )
+        .await
+        .expect("write lineage parquet");
+        assert_eq!(files.len(), 1);
+        let file = &files[0];
+        assert_eq!(*file.record_count(), 3);
+        for metrics in [
+            file.column_sizes().as_ref(),
+            file.value_counts().as_ref(),
+            file.null_value_counts().as_ref(),
+        ] {
+            let metrics = metrics.expect("data file metrics");
+            assert!(!metrics.contains_key(&ROW_ID_FIELD_ID));
+            assert!(!metrics.contains_key(&LAST_UPDATED_SEQUENCE_NUMBER_FIELD_ID));
+        }
+
+        let path = util::strip_prefix(file.file_path()).into();
+        let bytes = table
+            .object_store()
+            .get(&path)
+            .await
+            .expect("read lineage parquet")
+            .bytes()
+            .await
+            .expect("load lineage parquet bytes");
+        let builder =
+            ParquetRecordBatchReaderBuilder::try_new(bytes).expect("open lineage parquet reader");
+        let columns = builder.metadata().file_metadata().schema_descr().columns();
+        assert_eq!(
+            columns[1].self_type().get_basic_info().id(),
+            ROW_ID_FIELD_ID
+        );
+        assert_eq!(
+            columns[2].self_type().get_basic_info().id(),
+            LAST_UPDATED_SEQUENCE_NUMBER_FIELD_ID
+        );
+        let output = builder
+            .build()
+            .expect("build lineage parquet reader")
+            .next()
+            .transpose()
+            .expect("read lineage parquet batch")
+            .expect("lineage parquet batch");
+        let values = |column: usize| {
+            output
+                .column(column)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("Int64 lineage column")
+                .iter()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(values(0), vec![Some(10), Some(20), Some(30)]);
+        assert_eq!(values(1), vec![Some(7), Some(8), None]);
+        assert_eq!(values(2), vec![Some(1), None, None]);
     }
 
     #[tokio::test]

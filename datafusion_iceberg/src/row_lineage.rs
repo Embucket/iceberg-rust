@@ -10,15 +10,15 @@ use datafusion::common::{exec_err, Result};
 use datafusion::physical_plan::PhysicalExpr;
 use datafusion_expr::ColumnarValue;
 use iceberg_rust::spec::arrow::schema::PARQUET_FIELD_ID_META_KEY;
+pub use iceberg_rust::spec::row_lineage::{
+    LAST_UPDATED_SEQUENCE_NUMBER_COLUMN_NAME as LAST_UPDATED_SEQUENCE_NUMBER_COLUMN,
+    LAST_UPDATED_SEQUENCE_NUMBER_FIELD_ID, ROW_ID_COLUMN_NAME as ROW_ID_COLUMN, ROW_ID_FIELD_ID,
+};
 
-pub(crate) const ROW_ID_COLUMN: &str = "_row_id";
-pub(crate) const LAST_UPDATED_SEQUENCE_NUMBER_COLUMN: &str = "_last_updated_sequence_number";
 pub(crate) const PHYSICAL_ROW_ID_COLUMN: &str = "__iceberg_physical_row_id";
 pub(crate) const PHYSICAL_LAST_UPDATED_SEQUENCE_NUMBER_COLUMN: &str =
     "__iceberg_physical_last_updated_sequence_number";
 pub(crate) const FIRST_ROW_ID_COLUMN: &str = "__iceberg_first_row_id";
-pub(crate) const ROW_ID_FIELD_ID: i32 = i32::MAX - 107;
-pub(crate) const LAST_UPDATED_SEQUENCE_NUMBER_FIELD_ID: i32 = i32::MAX - 108;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum RowLineageKind {

@@ -23,6 +23,7 @@ pub mod materialized_view_metadata;
 pub mod namespace;
 pub mod partition;
 pub mod puffin;
+pub mod row_lineage;
 pub mod schema;
 pub mod snapshot;
 pub mod sort;
