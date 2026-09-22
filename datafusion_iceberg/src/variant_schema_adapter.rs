@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt::{self, Display};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -11,7 +12,7 @@ use datafusion::physical_expr::utils::collect_columns;
 use datafusion::physical_expr_adapter::{
     DefaultPhysicalExprAdapter, PhysicalExprAdapter, PhysicalExprAdapterFactory,
 };
-use datafusion::physical_plan::expressions::Column;
+use datafusion::physical_plan::expressions::{CastExpr, Column};
 use datafusion::physical_plan::PhysicalExpr;
 use datafusion_expr::ColumnarValue;
 use iceberg_rust::spec::arrow::schema::PARQUET_FIELD_ID_META_KEY;
@@ -33,6 +34,14 @@ impl PhysicalExprAdapterFactory for IcebergPhysicalExprAdapterFactory {
         logical_file_schema: SchemaRef,
         physical_file_schema: SchemaRef,
     ) -> Result<Arc<dyn PhysicalExprAdapter>> {
+        let physical_fields_by_id = physical_file_schema
+            .fields()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, field)| {
+                field_id(field).map(|field_id| (field_id, (index, Arc::clone(field))))
+            })
+            .collect();
         Ok(Arc::new(IcebergPhysicalExprAdapter {
             default: DefaultPhysicalExprAdapter::new(
                 Arc::clone(&logical_file_schema),
@@ -40,6 +49,7 @@ impl PhysicalExprAdapterFactory for IcebergPhysicalExprAdapterFactory {
             ),
             logical_file_schema,
             physical_file_schema,
+            physical_fields_by_id,
         }))
     }
 }
@@ -49,9 +59,33 @@ struct IcebergPhysicalExprAdapter {
     default: DefaultPhysicalExprAdapter,
     logical_file_schema: SchemaRef,
     physical_file_schema: SchemaRef,
+    physical_fields_by_id: HashMap<i32, (usize, FieldRef)>,
 }
 
 impl IcebergPhysicalExprAdapter {
+    fn physical_field_by_id(
+        &self,
+        field_id: i32,
+    ) -> Option<(usize, datafusion::arrow::datatypes::FieldRef)> {
+        self.physical_fields_by_id
+            .get(&field_id)
+            .map(|(index, field)| (*index, Arc::clone(field)))
+    }
+
+    fn field_id_mapping(
+        &self,
+        name: &str,
+    ) -> Option<(
+        datafusion::arrow::datatypes::FieldRef,
+        usize,
+        datafusion::arrow::datatypes::FieldRef,
+    )> {
+        let logical = self.logical_file_schema.field_with_name(name).ok()?;
+        let field_id = field_id(logical)?;
+        let (physical_index, physical) = self.physical_field_by_id(field_id)?;
+        Some((Arc::new(logical.clone()), physical_index, physical))
+    }
+
     fn is_logical_variant_column(&self, name: &str) -> bool {
         self.logical_file_schema
             .field_with_name(name)
@@ -59,9 +93,21 @@ impl IcebergPhysicalExprAdapter {
     }
 
     fn rewrite_variant_column(&self, column: &Column) -> Result<Arc<dyn PhysicalExpr>> {
-        let logical_field = self.logical_file_schema.field_with_name(column.name())?;
-        let physical_index = self.physical_file_schema.index_of(column.name())?;
-        let physical_field = self.physical_file_schema.field(physical_index);
+        let mapping = self.field_id_mapping(column.name()).or_else(|| {
+            let logical = self
+                .logical_file_schema
+                .field_with_name(column.name())
+                .ok()?;
+            let physical_index = self.physical_file_schema.index_of(column.name()).ok()?;
+            Some((
+                Arc::new(logical.clone()),
+                physical_index,
+                Arc::clone(&self.physical_file_schema.fields()[physical_index]),
+            ))
+        });
+        let Some((logical_field, physical_index, physical_field)) = mapping else {
+            return self.default.rewrite(Arc::new(column.clone()));
+        };
 
         if !is_variant_storage(physical_field.data_type()) {
             return internal_err!(
@@ -72,9 +118,33 @@ impl IcebergPhysicalExprAdapter {
         }
 
         Ok(Arc::new(UnshredVariantExpr::new(
-            Arc::new(Column::new(column.name(), physical_index)),
-            Arc::new(logical_field.clone()),
+            Arc::new(Column::new(physical_field.name(), physical_index)),
+            logical_field,
         )))
+    }
+
+    fn rewrite_renamed_column(&self, column: &Column) -> Result<Option<Arc<dyn PhysicalExpr>>> {
+        let Some((logical_field, physical_index, physical_field)) =
+            self.field_id_mapping(column.name())
+        else {
+            return Ok(None);
+        };
+        if logical_field.name() == physical_field.name() {
+            return Ok(None);
+        }
+
+        let physical_column: Arc<dyn PhysicalExpr> =
+            Arc::new(Column::new(physical_field.name(), physical_index));
+        let input = if logical_field.data_type() == physical_field.data_type() {
+            physical_column
+        } else {
+            Arc::new(CastExpr::new_with_target_field(
+                physical_column,
+                Arc::clone(&logical_field),
+                None,
+            ))
+        };
+        Ok(Some(Arc::new(FieldIdColumnExpr::new(input, logical_field))))
     }
 
     fn row_lineage_field_id(name: &str) -> Option<i32> {
@@ -117,12 +187,22 @@ impl IcebergPhysicalExprAdapter {
     }
 }
 
+fn field_id(field: &datafusion::arrow::datatypes::Field) -> Option<i32> {
+    field
+        .metadata()
+        .get(PARQUET_FIELD_ID_META_KEY)
+        .and_then(|id| id.parse().ok())
+}
+
 impl PhysicalExprAdapter for IcebergPhysicalExprAdapter {
     fn rewrite(&self, expr: Arc<dyn PhysicalExpr>) -> Result<Arc<dyn PhysicalExpr>> {
         let columns = collect_columns(&expr);
         let requires_iceberg_rewrite = columns.iter().any(|column| {
             self.is_logical_variant_column(column.name())
                 || Self::row_lineage_field_id(column.name()).is_some()
+                || self
+                    .field_id_mapping(column.name())
+                    .is_some_and(|(logical, _, physical)| logical.name() != physical.name())
         });
         if !requires_iceberg_rewrite {
             return self.default.rewrite(expr);
@@ -144,9 +224,86 @@ impl PhysicalExprAdapter for IcebergPhysicalExprAdapter {
                 return self.rewrite_variant_column(column).map(Transformed::yes);
             }
 
+            if let Some(physical) = self.rewrite_renamed_column(column)? {
+                return Ok(Transformed::yes(physical));
+            }
+
             self.default.rewrite(expr).map(Transformed::yes)
         })
         .data()
+    }
+}
+
+#[derive(Debug, Eq)]
+struct FieldIdColumnExpr {
+    input: Arc<dyn PhysicalExpr>,
+    target_field: FieldRef,
+}
+
+impl FieldIdColumnExpr {
+    fn new(input: Arc<dyn PhysicalExpr>, target_field: FieldRef) -> Self {
+        Self {
+            input,
+            target_field,
+        }
+    }
+}
+
+impl PartialEq for FieldIdColumnExpr {
+    fn eq(&self, other: &Self) -> bool {
+        self.input.eq(&other.input) && self.target_field == other.target_field
+    }
+}
+
+impl Hash for FieldIdColumnExpr {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.input.hash(state);
+        self.target_field.hash(state);
+    }
+}
+
+impl Display for FieldIdColumnExpr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Display::fmt(&self.input, f)
+    }
+}
+
+impl PhysicalExpr for FieldIdColumnExpr {
+    fn data_type(&self, _input_schema: &Schema) -> Result<DataType> {
+        Ok(self.target_field.data_type().clone())
+    }
+
+    fn nullable(&self, _input_schema: &Schema) -> Result<bool> {
+        Ok(self.target_field.is_nullable())
+    }
+
+    fn evaluate(&self, batch: &RecordBatch) -> Result<ColumnarValue> {
+        self.input.evaluate(batch)
+    }
+
+    fn return_field(&self, _input_schema: &Schema) -> Result<FieldRef> {
+        Ok(Arc::clone(&self.target_field))
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {
+        vec![&self.input]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn PhysicalExpr>>,
+    ) -> Result<Arc<dyn PhysicalExpr>> {
+        if children.len() != 1 {
+            return internal_err!("FieldIdColumnExpr requires exactly one child");
+        }
+        Ok(Arc::new(Self::new(
+            Arc::clone(&children[0]),
+            Arc::clone(&self.target_field),
+        )))
+    }
+
+    fn fmt_sql(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Display::fmt(self, f)
     }
 }
 
@@ -255,7 +412,7 @@ impl PhysicalExpr for UnshredVariantExpr {
 
 #[cfg(test)]
 mod tests {
-    use datafusion::arrow::array::{BinaryViewArray, BooleanArray};
+    use datafusion::arrow::array::{BinaryViewArray, BooleanArray, Int64Array, StringArray};
     use datafusion::arrow::datatypes::{Field, Fields};
 
     use super::*;
@@ -341,6 +498,33 @@ mod tests {
             .expect("physical lineage column");
         assert_eq!(column.name(), "writer_specific_row_id");
         assert_eq!(column.index(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn maps_renamed_iceberg_column_by_field_id_without_copying() -> Result<()> {
+        let field_id = |id: i32| [(PARQUET_FIELD_ID_META_KEY.to_owned(), id.to_string())].into();
+        let logical_schema = Arc::new(Schema::new(vec![Arc::new(
+            Field::new("display_name", DataType::Utf8, false).with_metadata(field_id(2)),
+        )]));
+        let physical_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false).with_metadata(field_id(1)),
+            Field::new("old_name", DataType::Utf8, false).with_metadata(field_id(2)),
+        ]));
+        let adapter = IcebergPhysicalExprAdapterFactory
+            .create(Arc::clone(&logical_schema), Arc::clone(&physical_schema))?;
+        let rewritten = adapter.rewrite(Arc::new(Column::new("display_name", 0)))?;
+        let target = rewritten.return_field(&physical_schema)?;
+        assert_eq!(target.name(), "display_name");
+        assert_eq!(target.metadata(), logical_schema.field(0).metadata());
+
+        let ids: ArrayRef = Arc::new(Int64Array::from(vec![1, 2]));
+        let names: ArrayRef = Arc::new(StringArray::from(vec!["one", "two"]));
+        let batch = RecordBatch::try_new(physical_schema, vec![ids, Arc::clone(&names)])?;
+        let ColumnarValue::Array(output) = rewritten.evaluate(&batch)? else {
+            return internal_err!("renamed field unexpectedly evaluated to a scalar");
+        };
+        assert!(Arc::ptr_eq(&output, &names));
         Ok(())
     }
 }
