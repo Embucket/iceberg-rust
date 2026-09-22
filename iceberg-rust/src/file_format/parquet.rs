@@ -12,6 +12,7 @@ use iceberg_rust_spec::{
     spec::{
         manifest::{AvroMap, Content, DataFile, FileFormat},
         partition::PartitionField,
+        row_lineage::is_row_lineage_field_id,
         schema::Schema,
         types::{PrimitiveType, Type},
         values::{PhysicalTypeHint, Struct, Value},
@@ -116,6 +117,13 @@ pub fn parquet_to_datafile(
         let mut counted_logical_values = HashSet::new();
         let mut variant_null_counts = HashMap::<i32, i64>::new();
         for column in row_group.columns() {
+            let parquet_field = column.column_descr().self_type().get_basic_info();
+            if parquet_field.has_id() && is_row_lineage_field_id(parquet_field.id()) {
+                // Row-lineage columns are reserved metadata, not table fields. Their
+                // values are still written to Parquet, but v1-v3 DataFile metrics do
+                // not have table-schema entries through which to describe them.
+                continue;
+            }
             let column_name = column.column_descr().name();
             let column_path = column.column_path().parts().join(".");
             let id = schema
