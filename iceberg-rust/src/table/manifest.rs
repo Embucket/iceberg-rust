@@ -180,6 +180,36 @@ impl FilteredManifestStats {
     }
 }
 
+fn inherit_first_row_id(
+    content: manifest_list::Content,
+    next_row_id: &mut Option<i64>,
+    data_file: &mut iceberg_rust_spec::manifest::DataFile,
+) -> Result<(), Error> {
+    if content != manifest_list::Content::Data || data_file.first_row_id().is_some() {
+        return Ok(());
+    }
+
+    let Some(first_row_id) = *next_row_id else {
+        return Ok(());
+    };
+    let record_count = *data_file.record_count();
+    if first_row_id < 0 || record_count < 0 {
+        return Err(Error::InvalidFormat(format!(
+            "Invalid row lineage range for data file {}: first_row_id={first_row_id}, record_count={record_count}",
+            data_file.file_path()
+        )));
+    }
+
+    *data_file.first_row_id_mut() = Some(first_row_id);
+    *next_row_id = Some(first_row_id.checked_add(record_count).ok_or_else(|| {
+        Error::InvalidFormat(format!(
+            "Row ID overflow while rewriting data file {}",
+            data_file.file_path()
+        ))
+    })?);
+    Ok(())
+}
+
 impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
     /// Creates a new ManifestWriter for writing manifest entries to a new manifest file.
     ///
@@ -465,6 +495,7 @@ impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
         let inherited_snapshot_id = manifest.added_snapshot_id;
         let current_schema = table_metadata.current_schema()?;
         let manifest_reader = ManifestReader::new(bytes)?;
+        let mut next_inherited_row_id = manifest.first_row_id;
 
         let mut writer = AvroWriter::new(schema, Vec::new());
         let mut filtered_stats = FilteredManifestStats::default();
@@ -523,17 +554,16 @@ impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
             },
         )?;
 
-        writer.extend(manifest_reader.filter_map(|entry| {
-            let mut entry = entry
-                .map_err(|err| {
-                    apache_avro::Error::new(apache_avro::error::Details::DeserializeValue(
-                        err.to_string(),
-                    ))
-                })
-                .unwrap();
+        for entry in manifest_reader {
+            let mut entry = entry?;
             if *entry.status() == Status::Deleted {
-                return None;
+                continue;
             }
+            inherit_first_row_id(
+                manifest.content,
+                &mut next_inherited_row_id,
+                entry.data_file_mut(),
+            )?;
             entry
                 .data_file_mut()
                 .promote_bounds_to_schema(current_schema);
@@ -552,14 +582,13 @@ impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
                 filtered_stats.removed_data_files += 1;
                 *entry.status_mut() = Status::Deleted;
                 filtered_stats.filtered_entries.push(entry);
-                None
             } else {
                 existing_files += 1;
                 existing_rows += entry.data_file().record_count();
                 *entry.status_mut() = Status::Existing;
-                Some(to_value(entry).unwrap())
+                writer.append_ser(entry)?;
             }
-        }))?;
+        }
 
         manifest.sequence_number = table_metadata.last_sequence_number + 1;
         manifest.added_snapshot_id = snapshot_id;
