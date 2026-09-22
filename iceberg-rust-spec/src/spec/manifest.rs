@@ -652,6 +652,30 @@ impl DataFile {
         DataFileBuilder::default()
     }
 
+    /// Promote numeric bounds to the current schema before rewriting this file
+    /// into a manifest whose embedded schema has evolved.
+    pub fn promote_bounds_to_schema(&mut self, schema: &Schema) {
+        for bounds in [&mut self.lower_bounds, &mut self.upper_bounds]
+            .into_iter()
+            .flatten()
+        {
+            for (field_id, value) in bounds {
+                let Some(field) = schema.fields().get(*field_id as usize) else {
+                    continue;
+                };
+                match (&*value, &field.field_type) {
+                    (Value::Int(inner), Type::Primitive(PrimitiveType::Long)) => {
+                        *value = Value::LongInt(i64::from(*inner));
+                    }
+                    (Value::Float(inner), Type::Primitive(PrimitiveType::Double)) => {
+                        *value = Value::Double(ordered_float::OrderedFloat(f64::from(inner.0)));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
     /// Returns a mutable reference to the first row ID assigned to this data file.
     pub fn first_row_id_mut(&mut self) -> &mut Option<i64> {
         &mut self.first_row_id
@@ -1886,6 +1910,77 @@ mod tests {
 
     use super::*;
     use apache_avro::{self, types::Value as AvroValue};
+    use ordered_float::OrderedFloat;
+
+    #[test]
+    fn promotes_bounds_to_the_manifest_schema() {
+        let schema = Schema::from_struct_type(
+            StructType::new(vec![
+                StructField::new(
+                    1,
+                    "integer_value",
+                    false,
+                    Type::Primitive(PrimitiveType::Long),
+                    None,
+                ),
+                StructField::new(
+                    2,
+                    "float_value",
+                    false,
+                    Type::Primitive(PrimitiveType::Double),
+                    None,
+                ),
+            ]),
+            1,
+            None,
+        );
+        let mut data_file = DataFile {
+            content: Content::Data,
+            file_path: "data.parquet".to_string(),
+            file_format: FileFormat::Parquet,
+            partition: Struct::from_iter([]),
+            record_count: 1,
+            file_size_in_bytes: 1,
+            column_sizes: None,
+            value_counts: None,
+            null_value_counts: None,
+            nan_value_counts: None,
+            distinct_counts: None,
+            lower_bounds: Some(HashMap::from([
+                (1, Value::Int(7)),
+                (2, Value::Float(OrderedFloat(1.5))),
+            ])),
+            upper_bounds: Some(HashMap::from([
+                (1, Value::Int(9)),
+                (2, Value::Float(OrderedFloat(2.5))),
+            ])),
+            key_metadata: None,
+            split_offsets: None,
+            equality_ids: None,
+            sort_order_id: None,
+            first_row_id: None,
+            referenced_data_file: None,
+            content_offset: None,
+            content_size_in_bytes: None,
+        };
+
+        data_file.promote_bounds_to_schema(&schema);
+
+        assert_eq!(
+            data_file.lower_bounds().as_ref(),
+            Some(&HashMap::from([
+                (1, Value::LongInt(7)),
+                (2, Value::Double(OrderedFloat(1.5))),
+            ]))
+        );
+        assert_eq!(
+            data_file.upper_bounds().as_ref(),
+            Some(&HashMap::from([
+                (1, Value::LongInt(9)),
+                (2, Value::Double(OrderedFloat(2.5))),
+            ]))
+        );
+    }
 
     #[test]
     fn manifest_entry() {
