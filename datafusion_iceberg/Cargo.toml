@@ -34,6 +34,7 @@ uuid = { workspace = true }
 # The version should match the Arrow version used by duckdb
 arrow-ipc = "58"
 bytes = { workspace = true }
+crc32fast = "1.5"
 duckdb = { version = "1.10503", features = ["bundled"] }
 iceberg-rest-catalog = { path = "../catalogs/iceberg-rest-catalog" }
 iceberg-rust = { path = "../iceberg-rust", version = "0.10.0", features = ["test-utils"] }
@@ -41,6 +42,7 @@ iceberg-sql-catalog = { path = "../catalogs/iceberg-sql-catalog" }
 parquet = { workspace = true }
 pyo3 = { version = "0.28", features = ["auto-initialize"] }
 reqwest = "0.12"
+roaring = { workspace = true }
 rstest = "0.26"
 sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "any", "sqlite", "postgres", "mysql"], default-features = false }
 tempfile = "3.27.0"

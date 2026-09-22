@@ -26,8 +26,8 @@ use iceberg_rust::spec::table_metadata::{
 use itertools::Itertools;
 use lru::LruCache;
 use object_store::path::Path;
-use object_store::ObjectMeta;
 use object_store::ObjectStoreExt;
+use object_store::{ObjectMeta, ObjectStore};
 use std::collections::BTreeMap;
 use std::thread::available_parallelism;
 use std::{
@@ -39,6 +39,7 @@ use std::{
 use tokio::sync::mpsc::{self};
 use tracing::{instrument, Instrument};
 
+use crate::deletion_vector_filter::DeletionVectorPredicate;
 use crate::statistics::statistics_from_datafiles;
 use crate::{
     error::Error as DataFusionIcebergError,
@@ -82,6 +83,7 @@ use datafusion::{
     physical_optimizer::pruning::PruningPredicateBuilder,
     physical_plan::{
         expressions::{BinaryExpr, Column},
+        filter::FilterExec,
         joins::{
             utils::{ColumnIndex, JoinFilter},
             HashJoinExec, PartitionMode,
@@ -109,7 +111,7 @@ use iceberg_rust::{
 use iceberg_rust::{
     spec::{
         arrow::schema::PARQUET_FIELD_ID_META_KEY,
-        manifest::{Content, ManifestEntry, Status},
+        manifest::{Content, FileFormat as IcebergFileFormat, ManifestEntry, Status},
         util,
         values::{Struct, Value},
     },
@@ -802,6 +804,11 @@ async fn table_scan(
                         .cmp(&y.1.sequence_number().unwrap())
                 });
 
+                let active_data_file_paths = data_files
+                    .iter()
+                    .map(|(_, entry)| entry.data_file().file_path().clone())
+                    .collect::<HashSet<_>>();
+
                 let mut data_file_iter = data_files.into_iter().peekable();
 
                 // Gather the complete equality projection up-front, since in general the requested
@@ -1051,7 +1058,10 @@ async fn table_scan(
                         plan,
                         delete_files.position_deletes,
                         &object_store_url,
-                    )?;
+                        table.object_store(),
+                        &active_data_file_paths,
+                    )
+                    .await?;
                 }
 
                 Ok::<_, DataFusionError>(Arc::new(ProjectionExec::try_new(projection_expr, plan)?)
@@ -1407,11 +1417,64 @@ fn generate_partitioned_file(
     Ok(file)
 }
 
-fn apply_position_deletes(
-    data_plan: Arc<dyn ExecutionPlan>,
+async fn apply_position_deletes(
+    mut data_plan: Arc<dyn ExecutionPlan>,
     delete_files: Vec<(ManifestPath, ManifestEntry)>,
     object_store_url: &ObjectStoreUrl,
+    object_store: Arc<dyn ObjectStore>,
+    active_data_file_paths: &HashSet<String>,
 ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+    let mut parquet_delete_files = Vec::new();
+    let mut deletion_vector_files = Vec::new();
+    for delete_file in delete_files {
+        let data_file = delete_file.1.data_file();
+        let pointer = (
+            *data_file.content_offset(),
+            *data_file.content_size_in_bytes(),
+            data_file.referenced_data_file().clone(),
+        );
+        match pointer {
+            (None, None, None) => parquet_delete_files.push(delete_file),
+            (Some(_), Some(_), Some(ref referenced_data_file)) => {
+                if data_file.file_format() != &IcebergFileFormat::Puffin {
+                    return Err(DataFusionError::Execution(format!(
+                        "Iceberg deletion vector {} must use PUFFIN file format",
+                        data_file.file_path()
+                    )));
+                }
+                if active_data_file_paths.contains(referenced_data_file) {
+                    deletion_vector_files.push(delete_file);
+                }
+            }
+            _ => {
+                return Err(DataFusionError::Execution(format!(
+                    "Iceberg deletion vector {} must set referenced_data_file, content_offset, and content_size_in_bytes together",
+                    data_file.file_path()
+                )));
+            }
+        }
+    }
+
+    if !deletion_vector_files.is_empty() {
+        let vectors = load_deletion_vectors(deletion_vector_files, object_store).await?;
+        let predicate = Arc::new(DeletionVectorPredicate::new(
+            Arc::new(Column::new_with_schema(
+                DATA_FILE_PATH_COLUMN,
+                &data_plan.schema(),
+            )?),
+            Arc::new(Column::new_with_schema(
+                DATA_FILE_ROW_POSITION_COLUMN,
+                &data_plan.schema(),
+            )?),
+            vectors,
+        ));
+        data_plan = Arc::new(FilterExec::try_new(predicate, data_plan)?);
+    }
+
+    if parquet_delete_files.is_empty() {
+        return Ok(data_plan);
+    }
+
     let delete_schema = Arc::new(ArrowSchema::new(vec![
         Field::new(POSITION_DELETE_FILE_PATH_COLUMN, DataType::Utf8, false).with_metadata(
             HashMap::from([(
@@ -1427,15 +1490,10 @@ fn apply_position_deletes(
         ),
     ]));
 
-    let files = delete_files
+    let files = parquet_delete_files
         .into_iter()
         .map(|(_, entry)| {
             let data_file = entry.data_file();
-            if data_file.content_offset().is_some() || data_file.content_size_in_bytes().is_some() {
-                return not_impl_err!(
-                    "Iceberg v3 deletion vectors are not supported yet; use v2 position delete files"
-                );
-            }
             let mut file = PartitionedFile::new(
                 util::strip_prefix(data_file.file_path()),
                 u64::try_from(*data_file.file_size_in_bytes()).map_err(|_| {
@@ -1445,16 +1503,12 @@ fn apply_position_deletes(
                     ))
                 })?,
             );
-            let sequence_number = entry
-                .sequence_number()
-                .as_ref()
-                .copied()
-                .ok_or_else(|| {
-                    DataFusionError::Execution(format!(
-                        "Position delete file {} has no sequence number",
-                        data_file.file_path()
-                    ))
-                })?;
+            let sequence_number = entry.sequence_number().as_ref().copied().ok_or_else(|| {
+                DataFusionError::Execution(format!(
+                    "Position delete file {} has no sequence number",
+                    data_file.file_path()
+                ))
+            })?;
             file.partition_values
                 .push(ScalarValue::Int64(Some(sequence_number)));
             Ok(file)
@@ -1511,6 +1565,89 @@ fn apply_position_deletes(
         NullEquality::NullEqualsNothing,
         false,
     )?))
+}
+
+async fn load_deletion_vectors(
+    delete_files: Vec<(ManifestPath, ManifestEntry)>,
+    object_store: Arc<dyn ObjectStore>,
+) -> Result<HashMap<String, iceberg_rust::spec::deletion_vector::DeletionVector>, DataFusionError> {
+    let concurrency = available_parallelism()
+        .map(|parallelism| parallelism.get())
+        .unwrap_or(4)
+        .clamp(1, 16);
+
+    let vectors = stream::iter(delete_files)
+        .map(|(_, entry)| {
+            let object_store = Arc::clone(&object_store);
+            async move {
+                let data_file = entry.data_file();
+                let offset = u64::try_from(data_file.content_offset().ok_or_else(|| {
+                    DataFusionError::Execution("Deletion vector has no content offset".to_string())
+                })?)
+                .map_err(|_| {
+                    DataFusionError::Execution(format!(
+                        "Deletion vector {} has a negative content offset",
+                        data_file.file_path()
+                    ))
+                })?;
+                let size = u64::try_from(data_file.content_size_in_bytes().ok_or_else(|| {
+                    DataFusionError::Execution("Deletion vector has no content size".to_string())
+                })?)
+                .map_err(|_| {
+                    DataFusionError::Execution(format!(
+                        "Deletion vector {} has a negative content size",
+                        data_file.file_path()
+                    ))
+                })?;
+                let end = offset.checked_add(size).ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "Deletion vector {} byte range overflows",
+                        data_file.file_path()
+                    ))
+                })?;
+                let path = Path::from(util::strip_prefix(data_file.file_path()));
+                let blob = object_store
+                    .get_range(&path, offset..end)
+                    .await
+                    .map_err(|error| DataFusionError::External(Box::new(error)))?;
+                let vector = iceberg_rust::spec::deletion_vector::DeletionVector::decode(&blob)
+                    .map_err(|error| DataFusionError::External(Box::new(error)))?;
+                let expected = u64::try_from(*data_file.record_count()).map_err(|_| {
+                    DataFusionError::Execution(format!(
+                        "Deletion vector {} has a negative record count",
+                        data_file.file_path()
+                    ))
+                })?;
+                if vector.len() != expected {
+                    return Err(DataFusionError::Execution(format!(
+                        "Deletion vector {} contains {} positions, expected {expected}",
+                        data_file.file_path(),
+                        vector.len()
+                    )));
+                }
+                let referenced_data_file =
+                    data_file.referenced_data_file().clone().ok_or_else(|| {
+                        DataFusionError::Execution(
+                            "Deletion vector has no referenced data file".to_string(),
+                        )
+                    })?;
+                Ok((referenced_data_file, vector))
+            }
+        })
+        .buffer_unordered(concurrency)
+        .try_collect::<Vec<_>>()
+        .await?;
+
+    let mut merged = HashMap::with_capacity(vectors.len());
+    for (data_file, vector) in vectors {
+        match merged.entry(data_file) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => *entry.get_mut() |= vector,
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(vector);
+            }
+        }
+    }
+    Ok(merged)
 }
 
 fn position_delete_sequence_filter(

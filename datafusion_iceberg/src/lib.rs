@@ -1,4 +1,5 @@
 pub mod catalog;
+mod deletion_vector_filter;
 pub mod error;
 pub mod materialized_view;
 pub mod planner;
