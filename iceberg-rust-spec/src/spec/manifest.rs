@@ -660,10 +660,10 @@ impl DataFile {
             .flatten()
         {
             for (field_id, value) in bounds {
-                let Some(field) = schema.fields().get(*field_id as usize) else {
+                let Some(field_type) = field_type_by_id(schema.fields(), *field_id) else {
                     continue;
                 };
-                match (&*value, &field.field_type) {
+                match (&*value, field_type) {
                     (Value::Int(inner), Type::Primitive(PrimitiveType::Long)) => {
                         *value = Value::LongInt(i64::from(*inner));
                     }
@@ -679,6 +679,42 @@ impl DataFile {
     /// Returns a mutable reference to the first row ID assigned to this data file.
     pub fn first_row_id_mut(&mut self) -> &mut Option<i64> {
         &mut self.first_row_id
+    }
+}
+
+fn field_type_by_id(fields: &StructType, field_id: i32) -> Option<&Type> {
+    if let Ok(field_id) = usize::try_from(field_id) {
+        if let Some(field) = fields.get(field_id) {
+            return Some(&field.field_type);
+        }
+    }
+
+    fields
+        .iter()
+        .find_map(|field| nested_type_by_id(&field.field_type, field_id))
+}
+
+fn nested_type_by_id(data_type: &Type, field_id: i32) -> Option<&Type> {
+    match data_type {
+        Type::Primitive(_) => None,
+        Type::Struct(fields) => field_type_by_id(fields, field_id),
+        Type::List(list) => {
+            if list.element_id == field_id {
+                Some(&list.element)
+            } else {
+                nested_type_by_id(&list.element, field_id)
+            }
+        }
+        Type::Map(map) => {
+            if map.key_id == field_id {
+                Some(&map.key)
+            } else if map.value_id == field_id {
+                Some(&map.value)
+            } else {
+                nested_type_by_id(&map.key, field_id)
+                    .or_else(|| nested_type_by_id(&map.value, field_id))
+            }
+        }
     }
 }
 
@@ -1930,6 +1966,19 @@ mod tests {
                     Type::Primitive(PrimitiveType::Double),
                     None,
                 ),
+                StructField::new(
+                    3,
+                    "nested",
+                    false,
+                    Type::Struct(StructType::new(vec![StructField::new(
+                        4,
+                        "integer_value",
+                        false,
+                        Type::Primitive(PrimitiveType::Long),
+                        None,
+                    )])),
+                    None,
+                ),
             ]),
             1,
             None,
@@ -1949,10 +1998,12 @@ mod tests {
             lower_bounds: Some(HashMap::from([
                 (1, Value::Int(7)),
                 (2, Value::Float(OrderedFloat(1.5))),
+                (4, Value::Int(11)),
             ])),
             upper_bounds: Some(HashMap::from([
                 (1, Value::Int(9)),
                 (2, Value::Float(OrderedFloat(2.5))),
+                (4, Value::Int(13)),
             ])),
             key_metadata: None,
             split_offsets: None,
@@ -1971,6 +2022,7 @@ mod tests {
             Some(&HashMap::from([
                 (1, Value::LongInt(7)),
                 (2, Value::Double(OrderedFloat(1.5))),
+                (4, Value::LongInt(11)),
             ]))
         );
         assert_eq!(
@@ -1978,6 +2030,7 @@ mod tests {
             Some(&HashMap::from([
                 (1, Value::LongInt(9)),
                 (2, Value::Double(OrderedFloat(2.5))),
+                (4, Value::LongInt(13)),
             ]))
         );
     }
