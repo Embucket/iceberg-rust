@@ -154,6 +154,59 @@ fn row_lineage_field(name: &str, field_id: i32) -> Field {
     )]))
 }
 
+#[derive(Clone, Copy, Debug)]
+struct PositionDeleteDataColumns {
+    file_path: usize,
+    row_position: usize,
+    sequence_number: usize,
+}
+
+impl PositionDeleteDataColumns {
+    fn project(self, projection: &[usize]) -> Result<Self, DataFusionError> {
+        let projected_index = |scan_index| {
+            projection
+                .iter()
+                .position(|index| *index == scan_index)
+                .ok_or_else(|| {
+                    DataFusionError::Plan(format!(
+                        "Position delete scan column {scan_index} is missing from the projection"
+                    ))
+                })
+        };
+
+        Ok(Self {
+            file_path: projected_index(self.file_path)?,
+            row_position: projected_index(self.row_position)?,
+            sequence_number: projected_index(self.sequence_number)?,
+        })
+    }
+}
+
+fn unique_internal_column_name(
+    file_schema: &ArrowSchema,
+    partition_columns: &[Field],
+    base: &str,
+) -> String {
+    let is_available = |candidate: &str| {
+        file_schema
+            .fields()
+            .iter()
+            .all(|field| field.name() != candidate)
+            && partition_columns
+                .iter()
+                .all(|field| field.name() != candidate)
+    };
+
+    if is_available(base) {
+        return base.to_owned();
+    }
+
+    (1..)
+        .map(|suffix| format!("{base}_{suffix}"))
+        .find(|candidate| is_available(candidate))
+        .expect("an internal column name must be available")
+}
+
 /// When the view tracks source arrow ids (the `overrides` map is non-empty),
 /// reshape each top-level field's `PARQUET:field_id` metadata so it matches
 /// what the underlying SELECT actually produces at run time:
@@ -691,13 +744,17 @@ async fn table_scan(
         .cloned()
         .unwrap_or((0..arrow_schema.fields().len()).collect_vec());
 
+    let mut data_file_path_scan_index = None;
     if enable_data_file_path_column {
+        data_file_path_scan_index = Some(file_schema.fields().len() + table_partition_cols.len());
         table_partition_cols.push(Field::new(DATA_FILE_PATH_COLUMN, DataType::Utf8, false));
     }
 
-    if enable_manifest_file_path_column {
+    let manifest_file_path_partition_index = enable_manifest_file_path_column.then(|| {
+        let index = table_partition_cols.len();
         table_partition_cols.push(Field::new(MANIFEST_FILE_PATH_COLUMN, DataType::Utf8, false));
-    }
+        index
+    });
 
     // All files have to be grouped according to their partition values. This is done by using a HashMap with the partition values as the key.
     // This way data files with the same partition value are mapped to the same vector.
@@ -908,30 +965,53 @@ async fn table_scan(
         .any(|files| !files.position_deletes.is_empty());
     let include_data_file_path_column = enable_data_file_path_column || has_position_deletes;
 
-    // Position deletes identify rows by data-file path and absolute row position. Keep both
-    // columns internal unless the caller explicitly requested the data-file path column.
-    if has_position_deletes && !enable_data_file_path_column {
-        table_partition_cols.push(Field::new(DATA_FILE_PATH_COLUMN, DataType::Utf8, false));
-        statistics
-            .column_statistics
-            .push(ColumnStatistics::new_unknown());
-    }
+    // Carry physical indices into delete reconciliation so valid user columns cannot shadow the
+    // internal path, row-position, or sequence-number columns.
+    let position_delete_file_path_index = if has_position_deletes {
+        Some(if let Some(index) = data_file_path_scan_index {
+            index
+        } else {
+            let name = unique_internal_column_name(
+                file_schema.as_ref(),
+                &table_partition_cols,
+                DATA_FILE_PATH_COLUMN,
+            );
+            // PartitionedFile values always place the data-file path before the manifest path.
+            // Preserve that physical order when the data-file path is internal to delete handling.
+            let partition_index =
+                manifest_file_path_partition_index.unwrap_or(table_partition_cols.len());
+            let index = file_schema.fields().len() + partition_index;
+            table_partition_cols.insert(partition_index, Field::new(name, DataType::Utf8, false));
+            statistics
+                .column_statistics
+                .push(ColumnStatistics::new_unknown());
+            index
+        })
+    } else {
+        None
+    };
     if enable_row_lineage {
         table_partition_cols.push(Field::new(FIRST_ROW_ID_COLUMN, DataType::Int64, true));
         statistics
             .column_statistics
             .push(ColumnStatistics::new_unknown());
     }
-    if has_position_deletes || enable_last_updated_sequence_number_column {
-        table_partition_cols.push(Field::new(
-            DATA_FILE_SEQUENCE_NUMBER_COLUMN,
-            DataType::Int64,
-            false,
-        ));
-        statistics
-            .column_statistics
-            .push(ColumnStatistics::new_unknown());
-    }
+    let sequence_number_column =
+        if has_position_deletes || enable_last_updated_sequence_number_column {
+            let name = unique_internal_column_name(
+                file_schema.as_ref(),
+                &table_partition_cols,
+                DATA_FILE_SEQUENCE_NUMBER_COLUMN,
+            );
+            let index = file_schema.fields().len() + table_partition_cols.len();
+            table_partition_cols.push(Field::new(name.clone(), DataType::Int64, false));
+            statistics
+                .column_statistics
+                .push(ColumnStatistics::new_unknown());
+            Some((name, index))
+        } else {
+            None
+        };
     if scan_changed_data_files {
         table_partition_cols.push(Field::new(CHANGE_FILE_STATUS_COLUMN, DataType::Utf8, false));
         statistics
@@ -955,10 +1035,20 @@ async fn table_scan(
                 .map(Arc::new)
                 .collect::<Vec<_>>(),
         );
-    if has_position_deletes || enable_data_file_row_position_column || enable_row_id_column {
+    let needs_row_position =
+        has_position_deletes || enable_data_file_row_position_column || enable_row_id_column;
+    let row_position_column = needs_row_position.then(|| {
+        let name = unique_internal_column_name(
+            file_schema.as_ref(),
+            &table_partition_cols,
+            DATA_FILE_ROW_POSITION_COLUMN,
+        );
+        let index = file_schema.fields().len() + table_partition_cols.len();
+        (name, index)
+    });
+    if let Some((name, _)) = &row_position_column {
         table_schema_builder = table_schema_builder.with_virtual_columns(vec![Arc::new(
-            Field::new(DATA_FILE_ROW_POSITION_COLUMN, DataType::Int64, false)
-                .with_extension_type(RowNumber),
+            Field::new(name, DataType::Int64, false).with_extension_type(RowNumber),
         )]);
         statistics
             .column_statistics
@@ -973,7 +1063,30 @@ async fn table_scan(
         &requested_projection,
         enable_row_id_column,
         enable_last_updated_sequence_number_column,
+        row_position_column
+            .as_ref()
+            .map(|(name, _)| name.as_str())
+            .unwrap_or(DATA_FILE_ROW_POSITION_COLUMN),
+        sequence_number_column
+            .as_ref()
+            .map(|(name, _)| name.as_str())
+            .unwrap_or(DATA_FILE_SEQUENCE_NUMBER_COLUMN),
     )?;
+    let position_delete_data_columns = if has_position_deletes {
+        Some(PositionDeleteDataColumns {
+            file_path: position_delete_file_path_index.expect("position deletes require a path"),
+            row_position: row_position_column
+                .as_ref()
+                .expect("position deletes require a row position")
+                .1,
+            sequence_number: sequence_number_column
+                .as_ref()
+                .expect("position deletes require a sequence number")
+                .1,
+        })
+    } else {
+        None
+    };
     // See `use_parquet_row_filter_pushdown` for the wide-scan / narrow-predicate rationale.
     let filter_columns: std::collections::HashSet<_> = parquet_filters
         .flat_map(|f| f.column_refs().into_iter().cloned())
@@ -996,7 +1109,6 @@ async fn table_scan(
             let parquet_reader_factory = parquet_reader_factory.clone();
             let projection_expr = projection_expr.clone();
             let scan_projection = scan_projection.clone();
-            let scan_schema = scan_schema.clone();
             let change_manifest_sequence_numbers = change_manifest_sequence_numbers.clone();
             let mut data_files = data_file_groups
                 .remove(&partition_value)
@@ -1048,18 +1160,25 @@ async fn table_scan(
                         }
                     });
 
-                if !delete_files.position_deletes.is_empty() {
-                    for column_name in [
-                        DATA_FILE_PATH_COLUMN,
-                        DATA_FILE_ROW_POSITION_COLUMN,
-                        DATA_FILE_SEQUENCE_NUMBER_COLUMN,
+                let position_delete_plan_columns = if !delete_files.position_deletes.is_empty() {
+                    let scan_columns = position_delete_data_columns.ok_or_else(|| {
+                        DataFusionError::Plan(
+                            "Position delete files require internal scan columns".to_owned(),
+                        )
+                    })?;
+                    for index in [
+                        scan_columns.file_path,
+                        scan_columns.row_position,
+                        scan_columns.sequence_number,
                     ] {
-                        let index = scan_schema.index_of(column_name)?;
                         if !equality_projection.contains(&index) {
                             equality_projection.push(index);
                         }
                     }
-                }
+                    Some(scan_columns.project(&equality_projection)?)
+                } else {
+                    None
+                };
 
                 let mut plan = stream::iter(delete_files.equality_deletes.iter())
                     .map(Ok::<_, DataFusionError>)
@@ -1299,6 +1418,12 @@ async fn table_scan(
                         parquet_reader_factory,
                         table.object_store(),
                         &active_data_file_paths,
+                        position_delete_plan_columns.ok_or_else(|| {
+                            DataFusionError::Plan(
+                                "Position delete files require projected internal columns"
+                                    .to_owned(),
+                            )
+                        })?,
                     )
                     .await?;
                 }
@@ -1500,6 +1625,8 @@ fn row_lineage_projection(
     requested_projection: &[usize],
     enable_row_id: bool,
     enable_last_updated_sequence_number: bool,
+    row_position_column_name: &str,
+    sequence_number_column_name: &str,
 ) -> Result<(Vec<usize>, PhysicalProjection), DataFusionError> {
     fn projected_column(
         scan_projection: &mut Vec<usize>,
@@ -1530,11 +1657,7 @@ fn row_lineage_projection(
                 RowLineageKind::RowId,
                 projected_column(&mut scan_projection, scan_schema, PHYSICAL_ROW_ID_COLUMN)?,
                 projected_column(&mut scan_projection, scan_schema, FIRST_ROW_ID_COLUMN)?,
-                projected_column(
-                    &mut scan_projection,
-                    scan_schema,
-                    DATA_FILE_ROW_POSITION_COLUMN,
-                )?,
+                projected_column(&mut scan_projection, scan_schema, row_position_column_name)?,
             ))
         } else if enable_last_updated_sequence_number && name == LAST_UPDATED_SEQUENCE_NUMBER_COLUMN
         {
@@ -1549,7 +1672,7 @@ fn row_lineage_projection(
                 projected_column(
                     &mut scan_projection,
                     scan_schema,
-                    DATA_FILE_SEQUENCE_NUMBER_COLUMN,
+                    sequence_number_column_name,
                 )?,
             ))
         } else {
@@ -1852,6 +1975,7 @@ async fn apply_position_deletes(
     parquet_reader_factory: Arc<dyn ParquetFileReaderFactory>,
     object_store: Arc<dyn ObjectStore>,
     active_data_file_paths: &HashSet<String>,
+    data_columns: PositionDeleteDataColumns,
 ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
     let mut parquet_delete_files = Vec::new();
     let mut deletion_vector_files = Vec::new();
@@ -1887,14 +2011,14 @@ async fn apply_position_deletes(
     if !deletion_vector_files.is_empty() {
         let vectors = load_deletion_vectors(deletion_vector_files, object_store).await?;
         let predicate = Arc::new(DeletionVectorPredicate::new(
-            Arc::new(Column::new_with_schema(
-                DATA_FILE_PATH_COLUMN,
-                &data_plan.schema(),
-            )?),
-            Arc::new(Column::new_with_schema(
-                DATA_FILE_ROW_POSITION_COLUMN,
-                &data_plan.schema(),
-            )?),
+            Arc::new(Column::new(
+                data_plan.schema().field(data_columns.file_path).name(),
+                data_columns.file_path,
+            )),
+            Arc::new(Column::new(
+                data_plan.schema().field(data_columns.row_position).name(),
+                data_columns.row_position,
+            )),
             vectors,
         ));
         data_plan = Arc::new(FilterExec::try_new(predicate, data_plan)?);
@@ -1964,31 +2088,33 @@ async fn apply_position_deletes(
         .build();
     let delete_plan: Arc<dyn ExecutionPlan> = DataSourceExec::from_data_source(delete_scan_config);
 
+    let column_at =
+        |schema: &SchemaRef, index: usize| -> Result<Arc<dyn PhysicalExpr>, DataFusionError> {
+            let field = schema.fields().get(index).ok_or_else(|| {
+                DataFusionError::Plan(format!(
+                    "Position delete column index {index} is outside a {}-column schema",
+                    schema.fields().len()
+                ))
+            })?;
+            Ok(Arc::new(Column::new(field.name(), index)))
+        };
     let join_on = vec![
         (
-            Arc::new(Column::new_with_schema(
-                POSITION_DELETE_FILE_PATH_COLUMN,
-                &delete_plan.schema(),
-            )?) as Arc<dyn PhysicalExpr>,
-            Arc::new(Column::new_with_schema(
-                DATA_FILE_PATH_COLUMN,
-                &data_plan.schema(),
-            )?) as Arc<dyn PhysicalExpr>,
+            column_at(&delete_plan.schema(), 0)?,
+            column_at(&data_plan.schema(), data_columns.file_path)?,
         ),
         (
-            Arc::new(Column::new_with_schema(
-                POSITION_DELETE_POS_COLUMN,
-                &delete_plan.schema(),
-            )?) as Arc<dyn PhysicalExpr>,
-            Arc::new(Column::new_with_schema(
-                DATA_FILE_ROW_POSITION_COLUMN,
-                &data_plan.schema(),
-            )?) as Arc<dyn PhysicalExpr>,
+            column_at(&delete_plan.schema(), 1)?,
+            column_at(&data_plan.schema(), data_columns.row_position)?,
         ),
     ];
 
-    let sequence_filter =
-        position_delete_sequence_filter(&delete_plan.schema(), &data_plan.schema())?;
+    let sequence_filter = position_delete_sequence_filter(
+        &delete_plan.schema(),
+        2,
+        &data_plan.schema(),
+        data_columns.sequence_number,
+    )?;
 
     Ok(Arc::new(HashJoinExec::try_new(
         delete_plan,
@@ -2088,10 +2214,27 @@ async fn load_deletion_vectors(
 
 fn position_delete_sequence_filter(
     delete_schema: &SchemaRef,
+    delete_sequence_index: usize,
     data_schema: &SchemaRef,
+    data_sequence_index: usize,
 ) -> Result<JoinFilter, DataFusionError> {
-    let delete_sequence_index = delete_schema.index_of(DELETE_FILE_SEQUENCE_NUMBER_COLUMN)?;
-    let data_sequence_index = data_schema.index_of(DATA_FILE_SEQUENCE_NUMBER_COLUMN)?;
+    for (schema, index, side) in [
+        (delete_schema, delete_sequence_index, "delete"),
+        (data_schema, data_sequence_index, "data"),
+    ] {
+        let field = schema.fields().get(index).ok_or_else(|| {
+            DataFusionError::Plan(format!(
+                "Position delete {side} sequence index {index} is outside a {}-column schema",
+                schema.fields().len()
+            ))
+        })?;
+        if field.data_type() != &DataType::Int64 {
+            return plan_err!(
+                "Position delete {side} sequence column at index {index} must be Int64, got {}",
+                field.data_type()
+            );
+        }
+    }
     let filter_schema = Arc::new(ArrowSchema::new(vec![
         Field::new("delete_sequence_number", DataType::Int64, false),
         Field::new("data_sequence_number", DataType::Int64, false),
@@ -2610,7 +2753,7 @@ mod tests {
                 false,
             ),
         ]));
-        let filter = position_delete_sequence_filter(&delete_schema, &data_schema).unwrap();
+        let filter = position_delete_sequence_filter(&delete_schema, 0, &data_schema, 0).unwrap();
         let batch = RecordBatch::try_new(
             filter.schema().clone(),
             vec![
