@@ -24,6 +24,7 @@ use serde_repr::{Deserialize_repr, Serialize_repr};
 use crate::{error::Error, partition::BoundPartitionField};
 
 use super::{
+    decimal::decimal_scale,
     partition::PartitionSpec,
     schema::Schema,
     table_metadata::FormatVersion,
@@ -89,6 +90,94 @@ impl ManifestEntry {
     /// Returns a mutable reference to the data file stored in this manifest entry.
     pub fn data_file_mut(&mut self) -> &mut DataFile {
         &mut self.data_file
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FirstRowIdInheritanceMode {
+    Assign(i64),
+    Clear,
+    Preserve,
+}
+
+/// Applies Iceberg v3 first-row-ID inheritance while reading manifest entries.
+///
+/// A committed data manifest with a manifest-level first row ID assigns that ID
+/// to live data files that do not already carry one, advancing by each assigned
+/// file's record count. A committed manifest without an ID predates row lineage,
+/// so per-file IDs are cleared. Uncommitted manifests without an ID preserve
+/// their entries because manifest-list assignment has not happened yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FirstRowIdInheritance {
+    mode: FirstRowIdInheritanceMode,
+}
+
+impl FirstRowIdInheritance {
+    /// Creates inheritance state for a manifest read from a committed manifest list.
+    pub fn for_committed_manifest(first_row_id: Option<i64>) -> Self {
+        Self {
+            mode: first_row_id.map_or(
+                FirstRowIdInheritanceMode::Clear,
+                FirstRowIdInheritanceMode::Assign,
+            ),
+        }
+    }
+
+    /// Creates validated inheritance state for a committed manifest.
+    pub fn try_for_committed_manifest(first_row_id: Option<i64>) -> Result<Self, Error> {
+        if first_row_id.is_some_and(|first_row_id| first_row_id < 0) {
+            return Err(Error::InvalidFormat(
+                "manifest first row id must be non-negative".to_string(),
+            ));
+        }
+        Ok(Self::for_committed_manifest(first_row_id))
+    }
+
+    /// Creates inheritance state for a manifest that has not been committed yet.
+    pub fn for_uncommitted_manifest(first_row_id: Option<i64>) -> Self {
+        Self {
+            mode: first_row_id.map_or(
+                FirstRowIdInheritanceMode::Preserve,
+                FirstRowIdInheritanceMode::Assign,
+            ),
+        }
+    }
+
+    /// Applies inheritance to one entry in manifest order.
+    pub fn apply(&mut self, entry: &mut ManifestEntry) -> Result<(), Error> {
+        match &mut self.mode {
+            FirstRowIdInheritanceMode::Clear => {
+                entry.data_file.first_row_id = None;
+            }
+            FirstRowIdInheritanceMode::Preserve => {}
+            FirstRowIdInheritanceMode::Assign(next_row_id) => {
+                if *next_row_id < 0 {
+                    return Err(Error::InvalidFormat(
+                        "manifest first row id must be non-negative".to_string(),
+                    ));
+                }
+                if entry.status == Status::Deleted
+                    || entry.data_file.content != Content::Data
+                    || entry.data_file.first_row_id.is_some()
+                {
+                    return Ok(());
+                }
+
+                let record_count = entry.data_file.record_count;
+                if record_count < 0 {
+                    return Err(Error::InvalidFormat(
+                        "data file record count must be non-negative".to_string(),
+                    ));
+                }
+
+                let first_row_id = *next_row_id;
+                *next_row_id = first_row_id.checked_add(record_count).ok_or_else(|| {
+                    Error::InvalidFormat("first row id inheritance overflow".to_string())
+                })?;
+                entry.data_file.first_row_id = Some(first_row_id);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -664,20 +753,30 @@ impl DataFile {
             .into_iter()
             .flatten()
         {
-            for (field_id, value) in bounds {
+            bounds.retain(|field_id, value| {
                 let Some(field_type) = field_type_by_id(schema.fields(), *field_id) else {
-                    continue;
+                    return true;
                 };
-                match (&*value, field_type) {
-                    (Value::Int(inner), Type::Primitive(PrimitiveType::Long)) => {
-                        *value = Value::LongInt(i64::from(*inner));
-                    }
-                    (Value::Float(inner), Type::Primitive(PrimitiveType::Double)) => {
-                        *value = Value::Double(ordered_float::OrderedFloat(f64::from(inner.0)));
-                    }
-                    _ => {}
+                let source_type = value.datatype();
+                if source_type == *field_type
+                    || matches!(
+                        (&*value, field_type),
+                        (
+                            Value::Decimal(decimal),
+                            Type::Primitive(PrimitiveType::Decimal { scale, .. })
+                        ) if decimal_scale(decimal) == *scale
+                    )
+                {
+                    return true;
                 }
-            }
+                match value.clone().promote_iceberg(&source_type, field_type) {
+                    Ok(promoted) => {
+                        *value = promoted;
+                        true
+                    }
+                    Err(_) => false,
+                }
+            });
         }
     }
 
@@ -875,12 +974,16 @@ pub struct DataFileV3 {
     /// ID representing sort order for this file
     pub sort_order_id: Option<i32>,
     /// First row ID stored directly on this data file.
+    #[serde(default)]
     pub first_row_id: Option<i64>,
     /// Location of the data file the deletion vector applies to.
+    #[serde(default)]
     pub referenced_data_file: Option<String>,
     /// Byte offset of the deletion-vector blob inside the Puffin file.
+    #[serde(default)]
     pub content_offset: Option<i64>,
     /// Length of the deletion-vector blob (compressed if applicable).
+    #[serde(default)]
     pub content_size_in_bytes: Option<i64>,
 }
 
@@ -1943,10 +2046,11 @@ impl DataFileV2 {
 #[cfg(test)]
 mod tests {
     use crate::spec::{
+        decimal::decimal_from_i128_with_scale,
         partition::{PartitionField, Transform},
         table_metadata::TableMetadataBuilder,
         types::{PrimitiveType, StructField, Type},
-        values::Value,
+        values::{Struct, Value},
     };
 
     use super::*;
@@ -1984,6 +2088,23 @@ mod tests {
                     )])),
                     None,
                 ),
+                StructField::new(
+                    5,
+                    "decimal_value",
+                    false,
+                    Type::Primitive(PrimitiveType::Decimal {
+                        precision: 10,
+                        scale: 2,
+                    }),
+                    None,
+                ),
+                StructField::new(
+                    6,
+                    "string_value",
+                    false,
+                    Type::Primitive(PrimitiveType::String),
+                    None,
+                ),
             ]),
             1,
             None,
@@ -2004,11 +2125,21 @@ mod tests {
                 (1, Value::Int(7)),
                 (2, Value::Float(OrderedFloat(1.5))),
                 (4, Value::Int(11)),
+                (
+                    5,
+                    Value::Decimal(decimal_from_i128_with_scale(12_345, 2).unwrap()),
+                ),
+                (6, Value::String("lower".to_string())),
             ])),
             upper_bounds: Some(HashMap::from([
                 (1, Value::Int(9)),
                 (2, Value::Float(OrderedFloat(2.5))),
                 (4, Value::Int(13)),
+                (
+                    5,
+                    Value::Decimal(decimal_from_i128_with_scale(67_890, 2).unwrap()),
+                ),
+                (6, Value::String("upper".to_string())),
             ])),
             key_metadata: None,
             split_offsets: None,
@@ -2028,6 +2159,11 @@ mod tests {
                 (1, Value::LongInt(7)),
                 (2, Value::Double(OrderedFloat(1.5))),
                 (4, Value::LongInt(11)),
+                (
+                    5,
+                    Value::Decimal(decimal_from_i128_with_scale(12_345, 2).unwrap()),
+                ),
+                (6, Value::String("lower".to_string())),
             ]))
         );
         assert_eq!(
@@ -2036,8 +2172,178 @@ mod tests {
                 (1, Value::LongInt(9)),
                 (2, Value::Double(OrderedFloat(2.5))),
                 (4, Value::LongInt(13)),
+                (
+                    5,
+                    Value::Decimal(decimal_from_i128_with_scale(67_890, 2).unwrap()),
+                ),
+                (6, Value::String("upper".to_string())),
             ]))
         );
+    }
+
+    fn row_id_entry(
+        status: Status,
+        content: Content,
+        record_count: i64,
+        first_row_id: Option<i64>,
+    ) -> ManifestEntry {
+        ManifestEntry {
+            format_version: FormatVersion::V3,
+            status,
+            snapshot_id: Some(1),
+            sequence_number: Some(1),
+            data_file: DataFile {
+                content,
+                file_path: "/data.parquet".to_string(),
+                file_format: FileFormat::Parquet,
+                partition: Struct::from_iter(Vec::<(String, Option<Value>)>::new()),
+                record_count,
+                file_size_in_bytes: 1,
+                column_sizes: None,
+                value_counts: None,
+                null_value_counts: None,
+                nan_value_counts: None,
+                distinct_counts: None,
+                lower_bounds: None,
+                upper_bounds: None,
+                key_metadata: None,
+                split_offsets: None,
+                equality_ids: None,
+                sort_order_id: None,
+                first_row_id,
+                referenced_data_file: None,
+                content_offset: None,
+                content_size_in_bytes: None,
+            },
+        }
+    }
+
+    #[test]
+    fn first_row_id_inheritance_assigns_live_null_data_files_in_manifest_order() {
+        let mut entries = [
+            row_id_entry(Status::Added, Content::Data, 3, None),
+            row_id_entry(Status::Existing, Content::Data, 2, Some(100)),
+            row_id_entry(Status::Deleted, Content::Data, 7, None),
+            row_id_entry(Status::Added, Content::PositionDeletes, 5, None),
+            row_id_entry(Status::Existing, Content::Data, 4, None),
+        ];
+        let mut inheritance = FirstRowIdInheritance::for_committed_manifest(Some(10));
+
+        for entry in &mut entries {
+            inheritance.apply(entry).unwrap();
+        }
+
+        assert_eq!(*entries[0].data_file().first_row_id(), Some(10));
+        assert_eq!(*entries[1].data_file().first_row_id(), Some(100));
+        assert_eq!(*entries[2].data_file().first_row_id(), None);
+        assert_eq!(*entries[3].data_file().first_row_id(), None);
+        assert_eq!(*entries[4].data_file().first_row_id(), Some(13));
+    }
+
+    #[test]
+    fn first_row_id_inheritance_clears_committed_pre_upgrade_ids() {
+        let mut entry = row_id_entry(Status::Existing, Content::Data, 3, Some(100));
+        FirstRowIdInheritance::for_committed_manifest(None)
+            .apply(&mut entry)
+            .unwrap();
+        assert_eq!(*entry.data_file().first_row_id(), None);
+    }
+
+    #[test]
+    fn first_row_id_inheritance_preserves_uncommitted_ids() {
+        let mut explicit = row_id_entry(Status::Existing, Content::Data, 3, Some(100));
+        let mut inherited = row_id_entry(Status::Added, Content::Data, 4, None);
+        let mut inheritance = FirstRowIdInheritance::for_uncommitted_manifest(None);
+
+        inheritance.apply(&mut explicit).unwrap();
+        inheritance.apply(&mut inherited).unwrap();
+
+        assert_eq!(*explicit.data_file().first_row_id(), Some(100));
+        assert_eq!(*inherited.data_file().first_row_id(), None);
+    }
+
+    #[test]
+    fn first_row_id_inheritance_rejects_counter_overflow() {
+        let mut entry = row_id_entry(Status::Added, Content::Data, 2, None);
+        let error = FirstRowIdInheritance::for_committed_manifest(Some(i64::MAX))
+            .apply(&mut entry)
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidFormat(_)));
+        assert_eq!(*entry.data_file().first_row_id(), None);
+    }
+
+    #[test]
+    fn first_row_id_inheritance_rejects_negative_manifest_id() {
+        let mut entry = row_id_entry(Status::Added, Content::Data, 1, None);
+        let error = FirstRowIdInheritance::for_committed_manifest(Some(-1))
+            .apply(&mut entry)
+            .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidFormat(_)));
+        assert_eq!(*entry.data_file().first_row_id(), None);
+    }
+
+    #[test]
+    fn first_row_id_inheritance_rejects_negative_empty_manifest_id() {
+        let error = FirstRowIdInheritance::try_for_committed_manifest(Some(-1)).unwrap_err();
+
+        assert!(matches!(error, Error::InvalidFormat(_)));
+    }
+
+    #[test]
+    fn data_file_v3_reads_schema_written_before_row_lineage_fields() {
+        let partition_schema = partition_value_schema(&[]).unwrap();
+        let mut schema_json: serde_json::Value =
+            serde_json::from_str(&DataFileV3::schema(&partition_schema)).unwrap();
+        let fields = schema_json
+            .get_mut("fields")
+            .and_then(serde_json::Value::as_array_mut)
+            .unwrap();
+        fields.retain(|field| {
+            !matches!(
+                field.get("name").and_then(serde_json::Value::as_str),
+                Some(
+                    "first_row_id"
+                        | "referenced_data_file"
+                        | "content_offset"
+                        | "content_size_in_bytes"
+                )
+            )
+        });
+        let old_schema =
+            AvroSchema::parse_str(&serde_json::to_string(&schema_json).unwrap()).unwrap();
+
+        let data_file: DataFileV3 = row_id_entry(Status::Added, Content::Data, 3, None)
+            .data_file
+            .into();
+        let mut value = apache_avro::to_value(data_file).unwrap();
+        let AvroValue::Record(fields) = &mut value else {
+            panic!("data file must serialize as an Avro record");
+        };
+        fields.retain(|(name, _)| {
+            !matches!(
+                name.as_str(),
+                "first_row_id"
+                    | "referenced_data_file"
+                    | "content_offset"
+                    | "content_size_in_bytes"
+            )
+        });
+
+        let mut writer = apache_avro::Writer::new(&old_schema, Vec::new());
+        writer.append(value).unwrap();
+        let encoded = writer.into_inner().unwrap();
+        let value = apache_avro::Reader::new(&encoded[..])
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        let restored = apache_avro::from_value::<DataFileV3>(&value).unwrap();
+
+        assert_eq!(restored.first_row_id, None);
+        assert_eq!(restored.referenced_data_file, None);
+        assert_eq!(restored.content_offset, None);
+        assert_eq!(restored.content_size_in_bytes, None);
     }
 
     #[test]

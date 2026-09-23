@@ -33,7 +33,9 @@ use tokio::task::JoinHandle;
 use tracing::{debug, instrument};
 
 use crate::table::manifest::{FilteredManifestStats, ManifestWriter};
-use crate::table::manifest_list::{ManifestListReader, ManifestListWriter};
+use crate::table::manifest_list::{
+    hydrate_v1_manifest_list_row_counts, ManifestListReader, ManifestListWriter,
+};
 use crate::table::transaction::append::append_summary;
 use crate::{
     catalog::commit::{TableRequirement, TableUpdate},
@@ -167,8 +169,19 @@ impl Operation {
                     prefetch_manifest_list(old_snapshot, &object_store)
                 {
                     let bytes = manifest_list_bytes.await??;
+                    let hydrated_bytes = if table_metadata.format_version != FormatVersion::V1 {
+                        hydrate_v1_manifest_list_row_counts(
+                            &bytes,
+                            table_metadata,
+                            object_store.clone(),
+                        )
+                        .await?
+                    } else {
+                        None
+                    };
+                    let bytes = hydrated_bytes.as_deref().unwrap_or(&bytes);
                     ManifestListWriter::from_existing(
-                        &bytes,
+                        bytes,
                         all_files.iter(),
                         manifest_list_schema,
                         table_metadata,
@@ -327,8 +340,19 @@ impl Operation {
                     prefetch_manifest_list(old_snapshot, &object_store)
                 {
                     let bytes = manifest_list_bytes.await??;
+                    let hydrated_bytes = if table_metadata.format_version != FormatVersion::V1 {
+                        hydrate_v1_manifest_list_row_counts(
+                            &bytes,
+                            table_metadata,
+                            object_store.clone(),
+                        )
+                        .await?
+                    } else {
+                        None
+                    };
+                    let bytes = hydrated_bytes.as_deref().unwrap_or(&bytes);
                     ManifestListWriter::from_existing(
-                        &bytes,
+                        bytes,
                         data_files_iter,
                         manifest_list_schema,
                         table_metadata,
@@ -667,10 +691,21 @@ impl Operation {
                 let bytes = prefetch_manifest_list(Some(old_snapshot), &object_store)
                     .unwrap()
                     .await??;
+                let hydrated_bytes = if table_metadata.format_version != FormatVersion::V1 {
+                    hydrate_v1_manifest_list_row_counts(
+                        &bytes,
+                        table_metadata,
+                        object_store.clone(),
+                    )
+                    .await?
+                } else {
+                    None
+                };
+                let bytes = hydrated_bytes.as_deref().unwrap_or(&bytes);
 
                 // Validate that all manifests specified in files_to_overwrite actually exist in the current snapshot
                 let current_manifest_paths: HashSet<String> = {
-                    let manifest_list_reader = ManifestListReader::new(&bytes[..], table_metadata)?;
+                    let manifest_list_reader = ManifestListReader::new(bytes, table_metadata)?;
                     manifest_list_reader
                         .map(|entry| entry.map(|e| e.manifest_path.clone()))
                         .collect::<Result<HashSet<_>, _>>()?
@@ -691,14 +726,14 @@ impl Operation {
 
                 let (mut manifest_list_writer, manifests_to_overwrite) = if n_data_files == 0 {
                     ManifestListWriter::from_existing_for_deletion(
-                        &bytes,
+                        bytes,
                         &manifests_to_overwrite,
                         manifest_list_schema,
                         table_metadata,
                     )?
                 } else {
                     ManifestListWriter::from_existing_without_overwrites(
-                        &bytes,
+                        bytes,
                         data_files_iter,
                         &manifests_to_overwrite,
                         manifest_list_schema,
@@ -1258,7 +1293,7 @@ pub fn compute_n_splits(
 mod tests {
     use super::*;
     use crate::table::ManifestReader;
-    use futures::executor::block_on;
+    use futures::{executor::block_on, TryStreamExt};
     use iceberg_rust_spec::manifest::FileFormat;
     use iceberg_rust_spec::spec::schema::SchemaBuilder;
     use iceberg_rust_spec::spec::table_metadata::TableMetadataBuilder;
@@ -1375,6 +1410,44 @@ mod tests {
             .with_upper_bounds(None)
             .build()
             .unwrap()
+    }
+
+    async fn clear_current_v1_manifest_list_counts(
+        metadata: &TableMetadata,
+        store: &Arc<InMemory>,
+    ) {
+        let legacy_snapshot = metadata.current_snapshot(None).unwrap().unwrap();
+        let legacy_manifest_list_path = strip_prefix(legacy_snapshot.manifest_list()).into();
+        let legacy_manifest_list = store
+            .get(&legacy_manifest_list_path)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let mut legacy_manifests = ManifestListReader::new(&legacy_manifest_list[..], metadata)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        for manifest in &mut legacy_manifests {
+            manifest.added_files_count = None;
+            manifest.existing_files_count = None;
+            manifest.deleted_files_count = None;
+            manifest.added_rows_count = None;
+            manifest.existing_rows_count = None;
+            manifest.deleted_rows_count = None;
+        }
+        let mut legacy_writer = apache_avro::Writer::new(manifest_list_schema_v1(), Vec::new());
+        for manifest in legacy_manifests {
+            legacy_writer.append_ser(manifest).unwrap();
+        }
+        store
+            .put(
+                &legacy_manifest_list_path,
+                legacy_writer.into_inner().unwrap().into(),
+            )
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1529,6 +1602,209 @@ mod tests {
 
         crate::catalog::commit::apply_table_updates(&mut metadata, overwrite_updates).unwrap();
         assert_eq!(metadata.next_row_id, 20);
+    }
+
+    #[tokio::test]
+    async fn v3_append_assigns_row_ids_to_pre_upgrade_manifests() {
+        let mut metadata = sample_metadata(&[], None, &[]);
+        metadata.format_version = FormatVersion::V1;
+        let store = Arc::new(InMemory::new());
+
+        let legacy_append = Operation::Append {
+            branch: None,
+            data_files: vec![data_file("s3://tests/table/data/legacy.parquet", 3)],
+            delete_files: Vec::new(),
+            additional_summary: None,
+        };
+        let (_, legacy_updates) = legacy_append
+            .execute(&metadata, store.clone())
+            .await
+            .unwrap();
+        crate::catalog::commit::apply_table_updates(&mut metadata, legacy_updates).unwrap();
+
+        clear_current_v1_manifest_list_counts(&metadata, &store).await;
+
+        metadata.format_version = FormatVersion::V3;
+        metadata.next_row_id = 0;
+        let v3_append = Operation::Append {
+            branch: None,
+            data_files: vec![data_file("s3://tests/table/data/v3.parquet", 5)],
+            delete_files: Vec::new(),
+            additional_summary: None,
+        };
+        let (_, v3_updates) = v3_append.execute(&metadata, store.clone()).await.unwrap();
+        let snapshot = v3_updates
+            .iter()
+            .find_map(|update| match update {
+                TableUpdate::AddSnapshot { snapshot } => Some(snapshot),
+                _ => None,
+            })
+            .unwrap();
+
+        assert_eq!(*snapshot.first_row_id(), Some(0));
+        assert_eq!(*snapshot.added_rows(), Some(8));
+
+        let manifest_list_bytes = store
+            .get(&strip_prefix(snapshot.manifest_list()).into())
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let manifests = ManifestListReader::new(&manifest_list_bytes[..], &metadata)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let mut first_row_ids = manifests
+            .iter()
+            .map(|manifest| manifest.first_row_id)
+            .collect::<Vec<_>>();
+        first_row_ids.sort();
+        assert_eq!(first_row_ids, vec![Some(0), Some(3)]);
+
+        let mut file_row_ids =
+            crate::table::datafiles(store.clone(), &manifests, None, (None, None))
+                .await
+                .unwrap()
+                .map_ok(|(_, entry)| {
+                    (
+                        entry.data_file().file_path().clone(),
+                        *entry.data_file().first_row_id(),
+                    )
+                })
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+        file_row_ids.sort();
+        assert_eq!(
+            file_row_ids,
+            vec![
+                ("s3://tests/table/data/legacy.parquet".to_string(), Some(0)),
+                ("s3://tests/table/data/v3.parquet".to_string(), Some(3)),
+            ]
+        );
+
+        crate::catalog::commit::apply_table_updates(&mut metadata, v3_updates).unwrap();
+        assert_eq!(metadata.next_row_id, 8);
+    }
+
+    #[tokio::test]
+    async fn v2_append_promotes_v1_manifest_list_with_missing_counts() {
+        let mut metadata = sample_metadata(&[], None, &[]);
+        metadata.format_version = FormatVersion::V1;
+        let store = Arc::new(InMemory::new());
+
+        let legacy_append = Operation::Append {
+            branch: None,
+            data_files: vec![data_file("s3://tests/table/data/legacy.parquet", 3)],
+            delete_files: Vec::new(),
+            additional_summary: None,
+        };
+        let (_, legacy_updates) = legacy_append
+            .execute(&metadata, store.clone())
+            .await
+            .unwrap();
+        crate::catalog::commit::apply_table_updates(&mut metadata, legacy_updates).unwrap();
+        clear_current_v1_manifest_list_counts(&metadata, &store).await;
+
+        metadata.format_version = FormatVersion::V2;
+        let v2_append = Operation::Append {
+            branch: None,
+            data_files: vec![data_file("s3://tests/table/data/v2.parquet", 5)],
+            delete_files: Vec::new(),
+            additional_summary: None,
+        };
+        let (_, v2_updates) = v2_append.execute(&metadata, store.clone()).await.unwrap();
+        let snapshot = v2_updates
+            .iter()
+            .find_map(|update| match update {
+                TableUpdate::AddSnapshot { snapshot } => Some(snapshot),
+                _ => None,
+            })
+            .unwrap();
+        let manifest_list_bytes = store
+            .get(&strip_prefix(snapshot.manifest_list()).into())
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let manifests = ManifestListReader::new(&manifest_list_bytes[..], &metadata)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert!(!manifests.is_empty());
+        assert!(manifests.iter().all(|manifest| {
+            manifest.format_version == FormatVersion::V2
+                && manifest.first_row_id.is_none()
+                && manifest.added_files_count.is_some()
+                && manifest.existing_files_count.is_some()
+                && manifest.deleted_files_count.is_some()
+                && manifest.added_rows_count.is_some()
+                && manifest.existing_rows_count.is_some()
+                && manifest.deleted_rows_count.is_some()
+        }));
+        let mut paths = crate::table::datafiles(store, &manifests, None, (None, None))
+            .await
+            .unwrap()
+            .map_ok(|(_, entry)| entry.data_file().file_path().clone())
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec![
+                "s3://tests/table/data/legacy.parquet".to_string(),
+                "s3://tests/table/data/v2.parquet".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn v3_commit_accepts_forward_row_id_gaps_but_rejects_overlap() {
+        let mut metadata = sample_metadata(&[], None, &[]);
+        metadata.format_version = FormatVersion::V3;
+        metadata.next_row_id = 10;
+
+        let gap_snapshot = SnapshotBuilder::default()
+            .with_snapshot_id(1)
+            .with_sequence_number(1)
+            .with_timestamp_ms(1)
+            .with_manifest_list("s3://tests/table/metadata/gap.avro".to_string())
+            .with_summary(Summary::default())
+            .with_first_row_id(15)
+            .with_added_rows(3)
+            .build()
+            .unwrap();
+        crate::catalog::commit::apply_table_updates(
+            &mut metadata,
+            vec![TableUpdate::AddSnapshot {
+                snapshot: gap_snapshot,
+            }],
+        )
+        .unwrap();
+        assert_eq!(metadata.next_row_id, 18);
+
+        let overlapping_snapshot = SnapshotBuilder::default()
+            .with_snapshot_id(2)
+            .with_sequence_number(2)
+            .with_timestamp_ms(2)
+            .with_manifest_list("s3://tests/table/metadata/overlap.avro".to_string())
+            .with_summary(Summary::default())
+            .with_first_row_id(17)
+            .with_added_rows(1)
+            .build()
+            .unwrap();
+        let result = crate::catalog::commit::apply_table_updates(
+            &mut metadata,
+            vec![TableUpdate::AddSnapshot {
+                snapshot: overlapping_snapshot,
+            }],
+        );
+        assert!(matches!(result, Err(Error::InvalidFormat(_))));
+        assert_eq!(metadata.next_row_id, 18);
     }
 
     #[tokio::test]

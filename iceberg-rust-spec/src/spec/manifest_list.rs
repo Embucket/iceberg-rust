@@ -12,7 +12,7 @@
 //! They include summary statistics that can be used to skip reading manifests that
 //! don't contain relevant data for a query.
 
-use std::sync::OnceLock;
+use std::{collections::HashMap, sync::OnceLock};
 
 use apache_avro::{types::Value as AvroValue, Schema as AvroSchema};
 use serde::{Deserialize, Serialize};
@@ -196,9 +196,6 @@ mod _serde {
         pub partitions: Option<Vec<FieldSummarySerde>>,
         /// Implementation-specific key metadata for encryption
         pub key_metadata: Option<ByteBuf>,
-        /// This field is absent in v2 and remains null when decoding a v2 manifest list.
-        #[serde(default)]
-        pub first_row_id: Option<i64>,
     }
 
     #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
@@ -310,7 +307,6 @@ mod _serde {
                     .partitions
                     .map(|v| v.into_iter().map(Into::into).collect()),
                 key_metadata: value.key_metadata,
-                first_row_id: None,
             }
         }
     }
@@ -343,6 +339,53 @@ mod _serde {
 }
 
 impl ManifestListEntry {
+    fn preferred_schema_id(table_metadata: &TableMetadata, added_snapshot_id: i64) -> i32 {
+        table_metadata
+            .snapshots
+            .get(&added_snapshot_id)
+            .and_then(|snapshot| *snapshot.schema_id())
+            .unwrap_or(table_metadata.current_schema_id)
+    }
+
+    fn partition_type_candidates(
+        table_metadata: &TableMetadata,
+        partition_spec_id: i32,
+        preferred_schema_id: i32,
+    ) -> Result<Vec<Vec<Type>>, Error> {
+        let partition_spec = table_metadata
+            .partition_specs
+            .get(&partition_spec_id)
+            .ok_or_else(|| {
+                Error::NotFound(format!("Partition spec with id {partition_spec_id}"))
+            })?;
+        let mut schema_ids = table_metadata.schemas.keys().copied().collect::<Vec<_>>();
+        schema_ids.sort_unstable_by(|left, right| right.cmp(left));
+        schema_ids.retain(|schema_id| *schema_id != preferred_schema_id);
+        schema_ids.insert(0, preferred_schema_id);
+
+        let mut candidates: Option<Vec<Vec<Type>>> = None;
+        for schema_id in schema_ids {
+            let Some(schema) = table_metadata.schemas.get(&schema_id) else {
+                continue;
+            };
+            let Ok(types) = partition_spec.data_types(schema.fields()) else {
+                continue;
+            };
+            let candidates = candidates.get_or_insert_with(|| vec![Vec::new(); types.len()]);
+            for (field_candidates, data_type) in candidates.iter_mut().zip(types) {
+                if !field_candidates.contains(&data_type) {
+                    field_candidates.push(data_type);
+                }
+            }
+        }
+
+        candidates.ok_or_else(|| {
+            Error::NotFound(format!(
+                "Schema containing all source fields for partition spec {partition_spec_id}"
+            ))
+        })
+    }
+
     pub fn try_from_enum(
         entry: ManifestListEntryEnum,
         table_metadata: &TableMetadata,
@@ -364,18 +407,20 @@ impl ManifestListEntry {
         entry: _serde::ManifestListEntryV3,
         table_metadata: &TableMetadata,
     ) -> Result<ManifestListEntry, Error> {
-        let partition_types = table_metadata.default_partition_spec()?.data_types(
-            table_metadata
-                .current_schema()
-                .or(table_metadata
-                    .refs
-                    .values()
-                    .next()
-                    .ok_or(Error::NotFound("Current schema".to_string()))
-                    .and_then(|x| table_metadata.schema(x.snapshot_id)))
-                .unwrap()
-                .fields(),
+        let preferred_schema_id =
+            Self::preferred_schema_id(table_metadata, entry.added_snapshot_id);
+        let partition_types = Self::partition_type_candidates(
+            table_metadata,
+            entry.partition_spec_id,
+            preferred_schema_id,
         )?;
+        Self::try_from_v3_with_partition_types(entry, &partition_types)
+    }
+
+    fn try_from_v3_with_partition_types(
+        entry: _serde::ManifestListEntryV3,
+        partition_types: &[Vec<Type>],
+    ) -> Result<ManifestListEntry, Error> {
         Ok(ManifestListEntry {
             format_version: FormatVersion::V3,
             manifest_path: entry.manifest_path,
@@ -396,7 +441,7 @@ impl ManifestListEntry {
                 .map(|v| {
                     v.into_iter()
                         .zip(partition_types.iter())
-                        .map(|(x, d)| FieldSummary::try_from(x, d))
+                        .map(|(x, candidates)| FieldSummary::try_from(x, candidates))
                         .collect::<Result<Vec<_>, Error>>()
                 })
                 .transpose()?,
@@ -409,18 +454,20 @@ impl ManifestListEntry {
         entry: _serde::ManifestListEntryV2,
         table_metadata: &TableMetadata,
     ) -> Result<ManifestListEntry, Error> {
-        let partition_types = table_metadata.default_partition_spec()?.data_types(
-            table_metadata
-                .current_schema()
-                .or(table_metadata
-                    .refs
-                    .values()
-                    .next()
-                    .ok_or(Error::NotFound("Current schema".to_string()))
-                    .and_then(|x| table_metadata.schema(x.snapshot_id)))
-                .unwrap()
-                .fields(),
+        let preferred_schema_id =
+            Self::preferred_schema_id(table_metadata, entry.added_snapshot_id);
+        let partition_types = Self::partition_type_candidates(
+            table_metadata,
+            entry.partition_spec_id,
+            preferred_schema_id,
         )?;
+        Self::try_from_v2_with_partition_types(entry, &partition_types)
+    }
+
+    fn try_from_v2_with_partition_types(
+        entry: _serde::ManifestListEntryV2,
+        partition_types: &[Vec<Type>],
+    ) -> Result<ManifestListEntry, Error> {
         Ok(ManifestListEntry {
             format_version: FormatVersion::V2,
             manifest_path: entry.manifest_path,
@@ -441,7 +488,7 @@ impl ManifestListEntry {
                 .map(|v| {
                     v.into_iter()
                         .zip(partition_types.iter())
-                        .map(|(x, d)| FieldSummary::try_from(x, d))
+                        .map(|(x, candidates)| FieldSummary::try_from(x, candidates))
                         .collect::<Result<Vec<_>, Error>>()
                 })
                 .transpose()?,
@@ -454,18 +501,20 @@ impl ManifestListEntry {
         entry: _serde::ManifestListEntryV1,
         table_metadata: &TableMetadata,
     ) -> Result<ManifestListEntry, Error> {
-        let partition_types = table_metadata.default_partition_spec()?.data_types(
-            table_metadata
-                .current_schema()
-                .or(table_metadata
-                    .refs
-                    .values()
-                    .next()
-                    .ok_or(Error::NotFound("Current schema".to_string()))
-                    .and_then(|x| table_metadata.schema(x.snapshot_id)))
-                .unwrap()
-                .fields(),
+        let preferred_schema_id =
+            Self::preferred_schema_id(table_metadata, entry.added_snapshot_id);
+        let partition_types = Self::partition_type_candidates(
+            table_metadata,
+            entry.partition_spec_id,
+            preferred_schema_id,
         )?;
+        Self::try_from_v1_with_partition_types(entry, &partition_types)
+    }
+
+    fn try_from_v1_with_partition_types(
+        entry: _serde::ManifestListEntryV1,
+        partition_types: &[Vec<Type>],
+    ) -> Result<ManifestListEntry, Error> {
         Ok(ManifestListEntry {
             format_version: FormatVersion::V1,
             manifest_path: entry.manifest_path,
@@ -486,7 +535,7 @@ impl ManifestListEntry {
                 .map(|v| {
                     v.into_iter()
                         .zip(partition_types.iter())
-                        .map(|(x, d)| FieldSummary::try_from(x, d))
+                        .map(|(x, candidates)| FieldSummary::try_from(x, candidates))
                         .collect::<Result<Vec<_>, Error>>()
                 })
                 .transpose()?,
@@ -496,20 +545,103 @@ impl ManifestListEntry {
     }
 }
 
+/// Stateful manifest-list decoder that reuses partition type candidates across entries.
+pub struct ManifestListEntryDecoder<'a> {
+    table_metadata: &'a TableMetadata,
+    partition_type_candidates: HashMap<(i32, i32), Vec<Vec<Type>>>,
+}
+
+impl<'a> ManifestListEntryDecoder<'a> {
+    pub fn new(table_metadata: &'a TableMetadata) -> Self {
+        Self {
+            table_metadata,
+            partition_type_candidates: HashMap::new(),
+        }
+    }
+
+    fn partition_type_candidates(
+        &mut self,
+        partition_spec_id: i32,
+        added_snapshot_id: i64,
+    ) -> Result<&[Vec<Type>], Error> {
+        let preferred_schema_id =
+            ManifestListEntry::preferred_schema_id(self.table_metadata, added_snapshot_id);
+        let key = (partition_spec_id, preferred_schema_id);
+        if !self.partition_type_candidates.contains_key(&key) {
+            let candidates = ManifestListEntry::partition_type_candidates(
+                self.table_metadata,
+                partition_spec_id,
+                preferred_schema_id,
+            )?;
+            self.partition_type_candidates.insert(key, candidates);
+        }
+        Ok(self.partition_type_candidates.get(&key).unwrap())
+    }
+
+    pub fn decode(
+        &mut self,
+        value: Result<AvroValue, apache_avro::Error>,
+        format_version: FormatVersion,
+    ) -> Result<ManifestListEntry, Error> {
+        let entry = value?;
+        match format_version {
+            FormatVersion::V1 => {
+                let entry = apache_avro::from_value::<_serde::ManifestListEntryV1>(&entry)?;
+                let partition_types = self
+                    .partition_type_candidates(entry.partition_spec_id, entry.added_snapshot_id)?;
+                ManifestListEntry::try_from_v1_with_partition_types(entry, partition_types)
+            }
+            FormatVersion::V2 => {
+                let entry = apache_avro::from_value::<_serde::ManifestListEntryV2>(&entry)?;
+                let partition_types = self
+                    .partition_type_candidates(entry.partition_spec_id, entry.added_snapshot_id)?;
+                ManifestListEntry::try_from_v2_with_partition_types(entry, partition_types)
+            }
+            FormatVersion::V3 => {
+                let entry = apache_avro::from_value::<_serde::ManifestListEntryV3>(&entry)?;
+                let partition_types = self
+                    .partition_type_candidates(entry.partition_spec_id, entry.added_snapshot_id)?;
+                ManifestListEntry::try_from_v3_with_partition_types(entry, partition_types)
+            }
+        }
+    }
+}
+
 impl FieldSummary {
-    fn try_from(value: _serde::FieldSummarySerde, data_type: &Type) -> Result<Self, Error> {
+    fn try_from(
+        value: _serde::FieldSummarySerde,
+        data_type_candidates: &[Type],
+    ) -> Result<Self, Error> {
         Ok(FieldSummary {
             contains_null: value.contains_null,
             contains_nan: value.contains_nan,
             lower_bound: value
                 .lower_bound
-                .map(|x| Value::try_from_bytes(&x, data_type))
+                .map(|x| Self::decode_bound(&x, data_type_candidates))
                 .transpose()?,
             upper_bound: value
                 .upper_bound
-                .map(|x| Value::try_from_bytes(&x, data_type))
+                .map(|x| Self::decode_bound(&x, data_type_candidates))
                 .transpose()?,
         })
+    }
+
+    fn decode_bound(bytes: &[u8], data_type_candidates: &[Type]) -> Result<Value, Error> {
+        let target_type = data_type_candidates
+            .first()
+            .ok_or_else(|| Error::InvalidFormat("partition field type candidates".to_string()))?;
+        let mut last_error = None;
+        for data_type in data_type_candidates {
+            match Value::try_from_bytes(bytes, data_type) {
+                Ok(value) if data_type == target_type => return Ok(value),
+                Ok(value) => match value.promote_iceberg(data_type, target_type) {
+                    Ok(value) => return Ok(value),
+                    Err(error) => last_error = Some(error),
+                },
+                Err(error) => last_error = Some(error),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| Error::InvalidFormat("partition field bound".to_string())))
     }
 }
 
@@ -788,15 +920,6 @@ pub fn manifest_list_schema_v2() -> &'static AvroSchema {
                     ],
                     "default": null,
                     "field-id": 519
-                },
-                {
-                    "name": "first_row_id",
-                    "type": [
-                        "null",
-                        "long"
-                    ],
-                    "default": null,
-                    "field-id": 520
                 }
             ]
         }
@@ -806,10 +929,22 @@ pub fn manifest_list_schema_v2() -> &'static AvroSchema {
     })
 }
 
-/// Manifest list Avro schema for V3 tables. Initially identical to the V2 schema.
+/// Manifest list Avro schema for V3 tables.
 pub fn manifest_list_schema_v3() -> &'static AvroSchema {
     static MANIFEST_LIST_SCHEMA_V3: OnceLock<AvroSchema> = OnceLock::new();
-    MANIFEST_LIST_SCHEMA_V3.get_or_init(|| manifest_list_schema_v2().clone())
+    MANIFEST_LIST_SCHEMA_V3.get_or_init(|| {
+        let mut schema = serde_json::to_value(manifest_list_schema_v2()).unwrap();
+        schema["fields"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "name": "first_row_id",
+                "type": ["null", "long"],
+                "default": null,
+                "field-id": 520
+            }));
+        AvroSchema::parse(&schema).unwrap()
+    })
 }
 
 /// Convert an avro value result to a manifest list version according to the provided format version
@@ -817,8 +952,24 @@ pub fn avro_value_to_manifest_list_entry(
     value: Result<AvroValue, apache_avro::Error>,
     table_metadata: &TableMetadata,
 ) -> Result<ManifestListEntry, Error> {
+    avro_value_to_manifest_list_entry_for_format_version(
+        value,
+        table_metadata,
+        table_metadata.format_version,
+    )
+}
+
+/// Converts an Avro value using the format version of the manifest list writer.
+///
+/// This is required when a table has been upgraded: historical manifest lists retain their
+/// original writer schema and must not be decoded as the table's current format version.
+pub fn avro_value_to_manifest_list_entry_for_format_version(
+    value: Result<AvroValue, apache_avro::Error>,
+    table_metadata: &TableMetadata,
+    format_version: FormatVersion,
+) -> Result<ManifestListEntry, Error> {
     let entry = value?;
-    match table_metadata.format_version {
+    match format_version {
         FormatVersion::V1 => ManifestListEntry::try_from_v1(
             apache_avro::from_value::<_serde::ManifestListEntryV1>(&entry)?,
             table_metadata,
@@ -842,8 +993,10 @@ mod tests {
     use super::*;
 
     use crate::spec::{
+        decimal::decimal_from_i128_with_scale,
         partition::{PartitionField, PartitionSpec, Transform},
         schema::Schema,
+        snapshot::{SnapshotBuilder, Summary},
         table_metadata::TableMetadataBuilder,
         types::{PrimitiveType, StructField},
     };
@@ -1079,5 +1232,274 @@ mod tests {
                 ManifestListEntry::try_from_v1(result, &table_metadata).unwrap()
             );
         }
+    }
+
+    #[test]
+    fn historical_manifest_uses_its_partition_spec_and_snapshot_schema() {
+        let historical_schema = Schema::builder()
+            .with_schema_id(1)
+            .with_struct_field(StructField {
+                id: 1,
+                name: "historical_id".to_string(),
+                required: true,
+                field_type: Type::Primitive(PrimitiveType::Int),
+                doc: None,
+                initial_default: None,
+                write_default: None,
+            })
+            .build()
+            .unwrap();
+        let current_schema = Schema::builder()
+            .with_schema_id(2)
+            .with_struct_field(StructField {
+                id: 2,
+                name: "current_value".to_string(),
+                required: true,
+                field_type: Type::Primitive(PrimitiveType::String),
+                doc: None,
+                initial_default: None,
+                write_default: None,
+            })
+            .build()
+            .unwrap();
+        let historical_snapshot = SnapshotBuilder::default()
+            .with_snapshot_id(7)
+            .with_sequence_number(1)
+            .with_timestamp_ms(1)
+            .with_manifest_list("historical-list.avro".to_string())
+            .with_summary(Summary::default())
+            .with_schema_id(1)
+            .build()
+            .unwrap();
+        let historical_snapshot_without_schema = SnapshotBuilder::default()
+            .with_snapshot_id(7)
+            .with_sequence_number(1)
+            .with_timestamp_ms(1)
+            .with_manifest_list("historical-list.avro".to_string())
+            .with_summary(Summary::default())
+            .build()
+            .unwrap();
+        let table_metadata = |snapshots| {
+            TableMetadataBuilder::default()
+                .format_version(FormatVersion::V3)
+                .location("/")
+                .current_schema_id(2)
+                .schemas(HashMap::from([
+                    (1, historical_schema.clone()),
+                    (2, current_schema.clone()),
+                ]))
+                .default_spec_id(1)
+                .partition_specs(HashMap::from([
+                    (
+                        0,
+                        PartitionSpec::builder()
+                            .with_spec_id(0)
+                            .with_partition_field(PartitionField::new(
+                                1,
+                                1000,
+                                "historical_id",
+                                Transform::Identity,
+                            ))
+                            .build()
+                            .unwrap(),
+                    ),
+                    (
+                        1,
+                        PartitionSpec::builder()
+                            .with_spec_id(1)
+                            .with_partition_field(PartitionField::new(
+                                2,
+                                1001,
+                                "current_value",
+                                Transform::Identity,
+                            ))
+                            .build()
+                            .unwrap(),
+                    ),
+                ]))
+                .snapshots(snapshots)
+                .build()
+                .unwrap()
+        };
+        let historical_entry = ManifestListEntry {
+            format_version: FormatVersion::V1,
+            manifest_path: "historical-manifest.avro".to_string(),
+            manifest_length: 1,
+            partition_spec_id: 0,
+            content: Content::Data,
+            sequence_number: 0,
+            min_sequence_number: 0,
+            added_snapshot_id: 7,
+            added_files_count: Some(1),
+            existing_files_count: Some(0),
+            deleted_files_count: Some(0),
+            added_rows_count: Some(1),
+            existing_rows_count: Some(0),
+            deleted_rows_count: Some(0),
+            partitions: Some(vec![FieldSummary {
+                contains_null: false,
+                contains_nan: None,
+                lower_bound: Some(Value::Int(42)),
+                upper_bound: Some(Value::Int(42)),
+            }]),
+            key_metadata: None,
+            first_row_id: None,
+        };
+        let mut writer = apache_avro::Writer::new(manifest_list_schema_v1(), Vec::new());
+        writer.append_ser(historical_entry).unwrap();
+        let bytes = writer.into_inner().unwrap();
+        for metadata in [
+            table_metadata(HashMap::from([(7, historical_snapshot)])),
+            table_metadata(HashMap::from([(7, historical_snapshot_without_schema)])),
+            table_metadata(HashMap::new()),
+        ] {
+            let record = apache_avro::Reader::new(&bytes[..])
+                .unwrap()
+                .next()
+                .unwrap();
+            let decoded = avro_value_to_manifest_list_entry_for_format_version(
+                record,
+                &metadata,
+                FormatVersion::V1,
+            )
+            .unwrap();
+
+            assert_eq!(
+                decoded.partitions.unwrap()[0].lower_bound,
+                Some(Value::Int(42))
+            );
+        }
+    }
+
+    fn decode_historical_bound_after_snapshot_expiration(
+        source_type: PrimitiveType,
+        target_type: PrimitiveType,
+        value: Value,
+    ) -> Value {
+        let schema = |schema_id, primitive_type| {
+            Schema::builder()
+                .with_schema_id(schema_id)
+                .with_struct_field(StructField {
+                    id: 1,
+                    name: "partition_source".to_string(),
+                    required: true,
+                    field_type: Type::Primitive(primitive_type),
+                    doc: None,
+                    initial_default: None,
+                    write_default: None,
+                })
+                .build()
+                .unwrap()
+        };
+        let metadata = TableMetadataBuilder::default()
+            .format_version(FormatVersion::V3)
+            .location("/")
+            .current_schema_id(2)
+            .schemas(HashMap::from([
+                (1, schema(1, source_type)),
+                (2, schema(2, target_type)),
+            ]))
+            .default_spec_id(0)
+            .partition_specs(HashMap::from([(
+                0,
+                PartitionSpec::builder()
+                    .with_spec_id(0)
+                    .with_partition_field(PartitionField::new(
+                        1,
+                        1000,
+                        "partition_source",
+                        Transform::Identity,
+                    ))
+                    .build()
+                    .unwrap(),
+            )]))
+            .build()
+            .unwrap();
+        let entry = ManifestListEntry {
+            format_version: FormatVersion::V1,
+            manifest_path: "expired-snapshot-manifest.avro".to_string(),
+            manifest_length: 1,
+            partition_spec_id: 0,
+            content: Content::Data,
+            sequence_number: 0,
+            min_sequence_number: 0,
+            added_snapshot_id: 7,
+            added_files_count: Some(1),
+            existing_files_count: Some(0),
+            deleted_files_count: Some(0),
+            added_rows_count: Some(1),
+            existing_rows_count: Some(0),
+            deleted_rows_count: Some(0),
+            partitions: Some(vec![FieldSummary {
+                contains_null: false,
+                contains_nan: None,
+                lower_bound: Some(value.clone()),
+                upper_bound: Some(value),
+            }]),
+            key_metadata: None,
+            first_row_id: None,
+        };
+        let mut writer = apache_avro::Writer::new(manifest_list_schema_v1(), Vec::new());
+        writer.append_ser(entry).unwrap();
+        let bytes = writer.into_inner().unwrap();
+        let record = apache_avro::Reader::new(&bytes[..])
+            .unwrap()
+            .next()
+            .unwrap();
+
+        avro_value_to_manifest_list_entry_for_format_version(record, &metadata, FormatVersion::V1)
+            .unwrap()
+            .partitions
+            .unwrap()[0]
+            .lower_bound
+            .clone()
+            .unwrap()
+    }
+
+    #[test]
+    fn expired_snapshot_bounds_follow_iceberg_schema_promotions() {
+        assert_eq!(
+            decode_historical_bound_after_snapshot_expiration(
+                PrimitiveType::Int,
+                PrimitiveType::Long,
+                Value::Int(42),
+            ),
+            Value::LongInt(42)
+        );
+
+        let float = Value::try_from_bytes(
+            &1.5_f32.to_le_bytes(),
+            &Type::Primitive(PrimitiveType::Float),
+        )
+        .unwrap();
+        let expected_double = Value::try_from_bytes(
+            &1.5_f64.to_le_bytes(),
+            &Type::Primitive(PrimitiveType::Double),
+        )
+        .unwrap();
+        assert_eq!(
+            decode_historical_bound_after_snapshot_expiration(
+                PrimitiveType::Float,
+                PrimitiveType::Double,
+                float,
+            ),
+            expected_double
+        );
+
+        let decimal = Value::Decimal(decimal_from_i128_with_scale(12_345, 2).unwrap());
+        assert_eq!(
+            decode_historical_bound_after_snapshot_expiration(
+                PrimitiveType::Decimal {
+                    precision: 7,
+                    scale: 2,
+                },
+                PrimitiveType::Decimal {
+                    precision: 12,
+                    scale: 2,
+                },
+                decimal.clone(),
+            ),
+            decimal
+        );
     }
 }
