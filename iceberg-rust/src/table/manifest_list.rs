@@ -6,21 +6,22 @@ use std::{
     collections::{HashMap, HashSet},
     future::Future,
     io::{Cursor, Read},
-    iter::{repeat, Map, Repeat, Zip},
     sync::Arc,
 };
 
-use apache_avro::{
-    types::Value as AvroValue, Reader as AvroReader, Schema as AvroSchema, Writer as AvroWriter,
-};
-use futures::{future::join_all, TryFutureExt, TryStreamExt};
+use apache_avro::{Reader as AvroReader, Schema as AvroSchema, Writer as AvroWriter};
+use futures::{future::join_all, stream, StreamExt, TryFutureExt, TryStreamExt};
 use iceberg_rust_spec::{
     manifest::{partition_value_schema, DataFile, ManifestEntry, Status},
-    manifest_list::{avro_value_to_manifest_list_entry, Content, ManifestListEntry},
+    manifest_list::{
+        manifest_list_schema_v1, Content, ManifestListEntry, ManifestListEntryDecoder,
+    },
     snapshot::Snapshot,
     table_metadata::{FormatVersion, TableMetadata},
     util::strip_prefix,
 };
+
+const MANIFEST_UPGRADE_CONCURRENCY: usize = 8;
 use object_store::{ObjectStore, ObjectStoreExt};
 use smallvec::SmallVec;
 
@@ -48,12 +49,6 @@ use super::{
     },
 };
 
-type ReaderZip<'a, 'metadata, R> = Zip<AvroReader<'a, R>, Repeat<&'metadata TableMetadata>>;
-type ReaderMap<'a, 'metadata, R> = Map<
-    ReaderZip<'a, 'metadata, R>,
-    fn((Result<AvroValue, apache_avro::Error>, &TableMetadata)) -> Result<ManifestListEntry, Error>,
->;
-
 /// A reader for Iceberg manifest list files that provides an iterator over manifest list entries.
 ///
 /// ManifestListReader parses manifest list files according to the table's format version (V1/V2)
@@ -64,13 +59,43 @@ type ReaderMap<'a, 'metadata, R> = Map<
 /// * `'metadata` - The lifetime of the table metadata reference
 /// * `R` - The type implementing `Read` that provides the manifest list data
 pub(crate) struct ManifestListReader<'a, 'metadata, R: Read> {
-    reader: ReaderMap<'a, 'metadata, R>,
+    reader: AvroReader<'a, R>,
+    decoder: ManifestListEntryDecoder<'metadata>,
+    writer_format_version: FormatVersion,
 }
 
 impl<R: Read> Iterator for ManifestListReader<'_, '_, R> {
     type Item = Result<ManifestListEntry, Error>;
     fn next(&mut self) -> Option<Self::Item> {
-        self.reader.next()
+        self.reader.next().map(|value| {
+            self.decoder
+                .decode(value, self.writer_format_version)
+                .map_err(Error::from)
+        })
+    }
+}
+
+fn manifest_list_format_version(
+    schema: &AvroSchema,
+    table_format_version: FormatVersion,
+) -> Result<FormatVersion, Error> {
+    let AvroSchema::Record(record) = schema else {
+        return Err(Error::InvalidFormat(
+            "manifest list writer schema must be a record".to_string(),
+        ));
+    };
+
+    let detected = if record.lookup.contains_key("first_row_id") {
+        FormatVersion::V3
+    } else if record.lookup.contains_key("content") {
+        FormatVersion::V2
+    } else {
+        FormatVersion::V1
+    };
+    if table_format_version == FormatVersion::V2 && detected == FormatVersion::V3 {
+        Ok(FormatVersion::V2)
+    } else {
+        Ok(detected)
     }
 }
 
@@ -104,14 +129,101 @@ impl<'metadata, R: Read> ManifestListReader<'_, 'metadata, R> {
         //
         // TODO: switch back to `AvroReader::with_schema` once all major query engines write
         // the spec-correct field names.
+        let reader = AvroReader::new(reader)?;
+        let writer_format_version =
+            manifest_list_format_version(reader.writer_schema(), table_metadata.format_version)?;
+
         Ok(Self {
-            reader: AvroReader::new(reader)?.zip(repeat(table_metadata)).map(
-                |(avro_value_res, meta)| {
-                    avro_value_to_manifest_list_entry(avro_value_res, meta).map_err(Error::from)
-                },
-            ),
+            reader,
+            decoder: ManifestListEntryDecoder::new(table_metadata),
+            writer_format_version,
         })
     }
+}
+
+pub(crate) async fn hydrate_v1_manifest_list_row_counts(
+    bytes: &[u8],
+    table_metadata: &TableMetadata,
+    object_store: Arc<dyn ObjectStore>,
+) -> Result<Option<Vec<u8>>, Error> {
+    let reader = AvroReader::new(bytes)?;
+    if manifest_list_format_version(reader.writer_schema(), table_metadata.format_version)?
+        != FormatVersion::V1
+    {
+        return Ok(None);
+    }
+    drop(reader);
+
+    let entries = ManifestListReader::new(bytes, table_metadata)?.collect::<Result<Vec<_>, _>>()?;
+    if entries.iter().all(|entry| {
+        entry.added_files_count.is_some()
+            && entry.existing_files_count.is_some()
+            && entry.deleted_files_count.is_some()
+            && entry.added_rows_count.is_some()
+            && entry.existing_rows_count.is_some()
+            && entry.deleted_rows_count.is_some()
+    }) {
+        return Ok(None);
+    }
+
+    let entries = stream::iter(entries.into_iter().map(|mut entry| {
+        let object_store = object_store.clone();
+        async move {
+            if entry.added_files_count.is_some()
+                && entry.existing_files_count.is_some()
+                && entry.deleted_files_count.is_some()
+                && entry.added_rows_count.is_some()
+                && entry.existing_rows_count.is_some()
+                && entry.deleted_rows_count.is_some()
+            {
+                return Ok(entry);
+            }
+
+            let manifest_bytes = object_store
+                .get(&strip_prefix(&entry.manifest_path).into())
+                .await?
+                .bytes()
+                .await?;
+            let mut file_counts = [0_i32; 3];
+            let mut row_counts = [0_i64; 3];
+            for manifest_entry in ManifestReader::new(&manifest_bytes[..])? {
+                let manifest_entry = manifest_entry?;
+                let record_count = *manifest_entry.data_file().record_count();
+                if record_count < 0 {
+                    return Err(Error::InvalidFormat(
+                        "data file record count must be non-negative".to_string(),
+                    ));
+                }
+                let index = match *manifest_entry.status() {
+                    Status::Added => 0,
+                    Status::Existing => 1,
+                    Status::Deleted => 2,
+                };
+                file_counts[index] = file_counts[index]
+                    .checked_add(1)
+                    .ok_or_else(|| Error::InvalidFormat("manifest file count overflow".into()))?;
+                row_counts[index] = row_counts[index]
+                    .checked_add(record_count)
+                    .ok_or_else(|| Error::InvalidFormat("manifest row count overflow".into()))?;
+            }
+            entry.added_files_count = Some(file_counts[0]);
+            entry.existing_files_count = Some(file_counts[1]);
+            entry.deleted_files_count = Some(file_counts[2]);
+            entry.added_rows_count = Some(row_counts[0]);
+            entry.existing_rows_count = Some(row_counts[1]);
+            entry.deleted_rows_count = Some(row_counts[2]);
+            Ok(entry)
+        }
+    }))
+    .buffered(MANIFEST_UPGRADE_CONCURRENCY)
+    .try_collect::<Vec<_>>()
+    .await?;
+
+    let mut writer = AvroWriter::new(manifest_list_schema_v1(), Vec::new());
+    for entry in entries {
+        writer.append_ser(entry)?;
+    }
+    Ok(Some(writer.into_inner()?))
 }
 
 /// Reads a snapshot's manifest list file and returns an iterator over its manifest list entries.
@@ -345,6 +457,15 @@ impl RowIdAssigner {
             manifest.first_row_id = None;
             return Ok(());
         }
+        if manifest
+            .first_row_id
+            .is_some_and(|first_row_id| first_row_id < 0)
+        {
+            return Err(Error::InvalidFormat(format!(
+                "manifest {} has a negative first row id",
+                manifest.manifest_path
+            )));
+        }
         if manifest.first_row_id.is_some() {
             return Ok(());
         }
@@ -392,16 +513,47 @@ pub(crate) fn append_manifest(
     row_id_assigner: Option<&mut RowIdAssigner>,
     mut manifest: ManifestListEntry,
 ) -> Result<(), Error> {
-    if manifest.format_version == FormatVersion::V3 {
-        let row_id_assigner = row_id_assigner.ok_or_else(|| {
-            Error::InvalidFormat("v3 manifest list requires row id assignment".to_string())
-        })?;
-        row_id_assigner.assign(&mut manifest)?;
-        if manifest.content == Content::Data && manifest.first_row_id.is_none() {
-            return Err(Error::InvalidFormat(format!(
-                "v3 data manifest {} has no first row id",
-                manifest.manifest_path
-            )));
+    let output_format_version = manifest_list_format_version(writer.schema(), FormatVersion::V3)?;
+    match output_format_version {
+        FormatVersion::V3 => {
+            let row_id_assigner = row_id_assigner.ok_or_else(|| {
+                Error::InvalidFormat("v3 manifest list requires row id assignment".to_string())
+            })?;
+            manifest.format_version = FormatVersion::V3;
+            row_id_assigner.assign(&mut manifest)?;
+            if manifest.content == Content::Data && manifest.first_row_id.is_none() {
+                return Err(Error::InvalidFormat(format!(
+                    "v3 data manifest {} has no first row id",
+                    manifest.manifest_path
+                )));
+            }
+        }
+        FormatVersion::V2 => {
+            for (field, count) in [
+                (
+                    "added_files_count",
+                    manifest.added_files_count.map(i64::from),
+                ),
+                (
+                    "existing_files_count",
+                    manifest.existing_files_count.map(i64::from),
+                ),
+                (
+                    "deleted_files_count",
+                    manifest.deleted_files_count.map(i64::from),
+                ),
+                ("added_rows_count", manifest.added_rows_count),
+                ("existing_rows_count", manifest.existing_rows_count),
+                ("deleted_rows_count", manifest.deleted_rows_count),
+            ] {
+                required_non_negative_row_count(count, field, &manifest.manifest_path)?;
+            }
+            manifest.format_version = FormatVersion::V2;
+            manifest.first_row_id = None;
+        }
+        FormatVersion::V1 => {
+            manifest.format_version = FormatVersion::V1;
+            manifest.first_row_id = None;
         }
     }
     writer.append_ser(manifest)?;
@@ -1563,6 +1715,107 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iceberg_rust_spec::{
+        manifest_list::{manifest_list_schema_v1, manifest_list_schema_v3},
+        spec::{
+            schema::SchemaBuilder,
+            table_metadata::TableMetadataBuilder,
+            types::{PrimitiveType, StructField, Type},
+        },
+    };
+
+    fn test_metadata(format_version: FormatVersion) -> TableMetadata {
+        let schema = SchemaBuilder::default()
+            .with_schema_id(0)
+            .with_struct_field(StructField {
+                id: 1,
+                name: "id".to_string(),
+                required: true,
+                field_type: Type::Primitive(PrimitiveType::Long),
+                doc: None,
+                initial_default: None,
+                write_default: None,
+            })
+            .build()
+            .unwrap();
+        TableMetadataBuilder::default()
+            .format_version(format_version)
+            .location("s3://tests/table".to_string())
+            .current_schema_id(0)
+            .schemas(HashMap::from_iter([(0, schema)]))
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn upgraded_v3_table_reads_v1_manifest_list_from_writer_schema() {
+        let metadata = test_metadata(FormatVersion::V3);
+        let v1_entry = ManifestListEntry {
+            format_version: FormatVersion::V1,
+            manifest_path: "s3://tests/table/metadata/v1-manifest.avro".to_string(),
+            manifest_length: 1,
+            partition_spec_id: 0,
+            content: Content::Data,
+            sequence_number: 0,
+            min_sequence_number: 0,
+            added_snapshot_id: 1,
+            added_files_count: Some(1),
+            existing_files_count: Some(0),
+            deleted_files_count: Some(0),
+            added_rows_count: Some(1),
+            existing_rows_count: Some(0),
+            deleted_rows_count: Some(0),
+            partitions: None,
+            key_metadata: None,
+            first_row_id: None,
+        };
+        let mut writer = AvroWriter::new(manifest_list_schema_v1(), Vec::new());
+        writer.append_ser(v1_entry.clone()).unwrap();
+        let bytes = writer.into_inner().unwrap();
+
+        let decoded = ManifestListReader::new(bytes.as_slice(), &metadata)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(decoded, vec![v1_entry]);
+    }
+
+    #[test]
+    fn v2_table_reads_legacy_v2_schema_with_first_row_id_field() {
+        let metadata = test_metadata(FormatVersion::V2);
+        let legacy_entry = ManifestListEntry {
+            format_version: FormatVersion::V3,
+            manifest_path: "s3://tests/table/metadata/v2-manifest.avro".to_string(),
+            manifest_length: 1,
+            partition_spec_id: 0,
+            content: Content::Data,
+            sequence_number: 1,
+            min_sequence_number: 1,
+            added_snapshot_id: 1,
+            added_files_count: Some(1),
+            existing_files_count: Some(0),
+            deleted_files_count: Some(0),
+            added_rows_count: Some(1),
+            existing_rows_count: Some(0),
+            deleted_rows_count: Some(0),
+            partitions: None,
+            key_metadata: None,
+            first_row_id: None,
+        };
+        let mut writer = AvroWriter::new(manifest_list_schema_v3(), Vec::new());
+        writer.append_ser(legacy_entry).unwrap();
+        let bytes = writer.into_inner().unwrap();
+
+        let decoded = ManifestListReader::new(bytes.as_slice(), &metadata)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].format_version, FormatVersion::V2);
+        assert_eq!(decoded[0].first_row_id, None);
+    }
 
     fn manifest(
         path: &str,
@@ -1642,6 +1895,18 @@ mod tests {
             Err(Error::InvalidFormat(_))
         ));
         assert_eq!(missing_existing.first_row_id, None);
+        assert_eq!(assigner.next_row_id, 1000);
+    }
+
+    #[test]
+    fn row_id_assigner_rejects_negative_inherited_first_row_id() {
+        let mut assigner = RowIdAssigner::new(1000);
+        let mut invalid = manifest("invalid.avro", Content::Data, Some(-1), Some(1), Some(0));
+
+        assert!(matches!(
+            assigner.assign(&mut invalid),
+            Err(Error::InvalidFormat(_))
+        ));
         assert_eq!(assigner.next_row_id, 1000);
     }
 }

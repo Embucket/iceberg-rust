@@ -24,6 +24,7 @@ use serde_repr::{Deserialize_repr, Serialize_repr};
 use crate::{error::Error, partition::BoundPartitionField};
 
 use super::{
+    decimal::decimal_scale,
     partition::PartitionSpec,
     schema::Schema,
     table_metadata::FormatVersion,
@@ -122,6 +123,16 @@ impl FirstRowIdInheritance {
         }
     }
 
+    /// Creates validated inheritance state for a committed manifest.
+    pub fn try_for_committed_manifest(first_row_id: Option<i64>) -> Result<Self, Error> {
+        if first_row_id.is_some_and(|first_row_id| first_row_id < 0) {
+            return Err(Error::InvalidFormat(
+                "manifest first row id must be non-negative".to_string(),
+            ));
+        }
+        Ok(Self::for_committed_manifest(first_row_id))
+    }
+
     /// Creates inheritance state for a manifest that has not been committed yet.
     pub fn for_uncommitted_manifest(first_row_id: Option<i64>) -> Self {
         Self {
@@ -140,6 +151,11 @@ impl FirstRowIdInheritance {
             }
             FirstRowIdInheritanceMode::Preserve => {}
             FirstRowIdInheritanceMode::Assign(next_row_id) => {
+                if *next_row_id < 0 {
+                    return Err(Error::InvalidFormat(
+                        "manifest first row id must be non-negative".to_string(),
+                    ));
+                }
                 if entry.status == Status::Deleted
                     || entry.data_file.content != Content::Data
                     || entry.data_file.first_row_id.is_some()
@@ -737,20 +753,30 @@ impl DataFile {
             .into_iter()
             .flatten()
         {
-            for (field_id, value) in bounds {
+            bounds.retain(|field_id, value| {
                 let Some(field_type) = field_type_by_id(schema.fields(), *field_id) else {
-                    continue;
+                    return true;
                 };
-                match (&*value, field_type) {
-                    (Value::Int(inner), Type::Primitive(PrimitiveType::Long)) => {
-                        *value = Value::LongInt(i64::from(*inner));
-                    }
-                    (Value::Float(inner), Type::Primitive(PrimitiveType::Double)) => {
-                        *value = Value::Double(ordered_float::OrderedFloat(f64::from(inner.0)));
-                    }
-                    _ => {}
+                let source_type = value.datatype();
+                if source_type == *field_type
+                    || matches!(
+                        (&*value, field_type),
+                        (
+                            Value::Decimal(decimal),
+                            Type::Primitive(PrimitiveType::Decimal { scale, .. })
+                        ) if decimal_scale(decimal) == *scale
+                    )
+                {
+                    return true;
                 }
-            }
+                match value.clone().promote_iceberg(&source_type, field_type) {
+                    Ok(promoted) => {
+                        *value = promoted;
+                        true
+                    }
+                    Err(_) => false,
+                }
+            });
         }
     }
 
@@ -2020,6 +2046,7 @@ impl DataFileV2 {
 #[cfg(test)]
 mod tests {
     use crate::spec::{
+        decimal::decimal_from_i128_with_scale,
         partition::{PartitionField, Transform},
         table_metadata::TableMetadataBuilder,
         types::{PrimitiveType, StructField, Type},
@@ -2061,6 +2088,23 @@ mod tests {
                     )])),
                     None,
                 ),
+                StructField::new(
+                    5,
+                    "decimal_value",
+                    false,
+                    Type::Primitive(PrimitiveType::Decimal {
+                        precision: 10,
+                        scale: 2,
+                    }),
+                    None,
+                ),
+                StructField::new(
+                    6,
+                    "string_value",
+                    false,
+                    Type::Primitive(PrimitiveType::String),
+                    None,
+                ),
             ]),
             1,
             None,
@@ -2081,11 +2125,21 @@ mod tests {
                 (1, Value::Int(7)),
                 (2, Value::Float(OrderedFloat(1.5))),
                 (4, Value::Int(11)),
+                (
+                    5,
+                    Value::Decimal(decimal_from_i128_with_scale(12_345, 2).unwrap()),
+                ),
+                (6, Value::String("lower".to_string())),
             ])),
             upper_bounds: Some(HashMap::from([
                 (1, Value::Int(9)),
                 (2, Value::Float(OrderedFloat(2.5))),
                 (4, Value::Int(13)),
+                (
+                    5,
+                    Value::Decimal(decimal_from_i128_with_scale(67_890, 2).unwrap()),
+                ),
+                (6, Value::String("upper".to_string())),
             ])),
             key_metadata: None,
             split_offsets: None,
@@ -2105,6 +2159,11 @@ mod tests {
                 (1, Value::LongInt(7)),
                 (2, Value::Double(OrderedFloat(1.5))),
                 (4, Value::LongInt(11)),
+                (
+                    5,
+                    Value::Decimal(decimal_from_i128_with_scale(12_345, 2).unwrap()),
+                ),
+                (6, Value::String("lower".to_string())),
             ]))
         );
         assert_eq!(
@@ -2113,6 +2172,11 @@ mod tests {
                 (1, Value::LongInt(9)),
                 (2, Value::Double(OrderedFloat(2.5))),
                 (4, Value::LongInt(13)),
+                (
+                    5,
+                    Value::Decimal(decimal_from_i128_with_scale(67_890, 2).unwrap()),
+                ),
+                (6, Value::String("upper".to_string())),
             ]))
         );
     }
@@ -2206,6 +2270,24 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, Error::InvalidFormat(_)));
         assert_eq!(*entry.data_file().first_row_id(), None);
+    }
+
+    #[test]
+    fn first_row_id_inheritance_rejects_negative_manifest_id() {
+        let mut entry = row_id_entry(Status::Added, Content::Data, 1, None);
+        let error = FirstRowIdInheritance::for_committed_manifest(Some(-1))
+            .apply(&mut entry)
+            .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidFormat(_)));
+        assert_eq!(*entry.data_file().first_row_id(), None);
+    }
+
+    #[test]
+    fn first_row_id_inheritance_rejects_negative_empty_manifest_id() {
+        let error = FirstRowIdInheritance::try_for_committed_manifest(Some(-1)).unwrap_err();
+
+        assert!(matches!(error, Error::InvalidFormat(_)));
     }
 
     #[test]

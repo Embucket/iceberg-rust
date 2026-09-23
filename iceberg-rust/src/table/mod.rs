@@ -415,7 +415,7 @@ async fn datafiles(
                 let bytes = Cursor::new(Vec::from(data));
 
                 let mut first_row_id_inheritance =
-                    FirstRowIdInheritance::for_committed_manifest(manifest_first_row_id);
+                    FirstRowIdInheritance::try_for_committed_manifest(manifest_first_row_id)?;
 
                 ManifestReader::new(bytes)?
                     .map(move |entry| {
