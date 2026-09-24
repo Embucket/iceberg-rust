@@ -346,7 +346,6 @@ impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
         table_metadata: &'metadata TableMetadata,
     ) -> Result<Self, Error> {
         let inherited_snapshot_id = manifest.added_snapshot_id;
-        let current_schema = table_metadata.current_schema()?;
         let mut writer = AvroWriter::new(schema, Vec::new());
         let mut existing_files = 0;
         let mut existing_rows = 0;
@@ -402,14 +401,11 @@ impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
             },
         )?;
 
-        writer.extend(manifest_reader.filter_map(|entry| {
-            let mut entry = entry.ok()?;
+        for entry in manifest_reader {
+            let mut entry = entry?;
             if *entry.status() == Status::Deleted {
-                return None;
+                continue;
             }
-            entry
-                .data_file_mut()
-                .promote_bounds_to_schema(current_schema);
             *entry.status_mut() = Status::Existing;
             if entry.sequence_number().is_none() {
                 *entry.sequence_number_mut() = Some(manifest.sequence_number);
@@ -419,8 +415,8 @@ impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
             }
             existing_files += 1;
             existing_rows += entry.data_file().record_count();
-            to_value(entry).ok()
-        }))?;
+            writer.append(to_value(entry)?)?;
+        }
 
         manifest.sequence_number = table_metadata.last_sequence_number + 1;
         manifest.added_snapshot_id = snapshot_id;
@@ -493,7 +489,6 @@ impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
         table_metadata: &'metadata TableMetadata,
     ) -> Result<(Self, FilteredManifestStats), Error> {
         let inherited_snapshot_id = manifest.added_snapshot_id;
-        let current_schema = table_metadata.current_schema()?;
         let manifest_reader = ManifestReader::new(bytes)?;
         let mut next_inherited_row_id = manifest.first_row_id;
 
@@ -564,9 +559,6 @@ impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
                 &mut next_inherited_row_id,
                 entry.data_file_mut(),
             )?;
-            entry
-                .data_file_mut()
-                .promote_bounds_to_schema(current_schema);
             if entry.sequence_number().is_none() {
                 *entry.sequence_number_mut() = Some(manifest.sequence_number);
             }

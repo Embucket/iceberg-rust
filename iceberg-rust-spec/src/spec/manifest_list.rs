@@ -379,11 +379,7 @@ impl ManifestListEntry {
             }
         }
 
-        candidates.ok_or_else(|| {
-            Error::NotFound(format!(
-                "Schema containing all source fields for partition spec {partition_spec_id}"
-            ))
-        })
+        Ok(candidates.unwrap_or_default())
     }
 
     pub fn try_from_enum(
@@ -438,6 +434,7 @@ impl ManifestListEntry {
             deleted_rows_count: Some(entry.deleted_rows_count),
             partitions: entry
                 .partitions
+                .filter(|partitions| partitions.len() == partition_types.len())
                 .map(|v| {
                     v.into_iter()
                         .zip(partition_types.iter())
@@ -485,6 +482,7 @@ impl ManifestListEntry {
             deleted_rows_count: Some(entry.deleted_rows_count),
             partitions: entry
                 .partitions
+                .filter(|partitions| partitions.len() == partition_types.len())
                 .map(|v| {
                     v.into_iter()
                         .zip(partition_types.iter())
@@ -532,6 +530,7 @@ impl ManifestListEntry {
             deleted_rows_count: entry.deleted_rows_count,
             partitions: entry
                 .partitions
+                .filter(|partitions| partitions.len() == partition_types.len())
                 .map(|v| {
                     v.into_iter()
                         .zip(partition_types.iter())
@@ -632,7 +631,7 @@ impl FieldSummary {
             .ok_or_else(|| Error::InvalidFormat("partition field type candidates".to_string()))?;
         let mut last_error = None;
         for data_type in data_type_candidates {
-            match Value::try_from_bytes(bytes, data_type) {
+            match super::manifest::decode_bound(bytes, data_type) {
                 Ok(value) if data_type == target_type => return Ok(value),
                 Ok(value) => match value.promote_iceberg(data_type, target_type) {
                     Ok(value) => return Ok(value),
@@ -1369,12 +1368,27 @@ mod tests {
                 Some(Value::Int(42))
             );
         }
+
+        let mut metadata = table_metadata(HashMap::new());
+        metadata.schemas.remove(&1);
+        let record = apache_avro::Reader::new(&bytes[..])
+            .unwrap()
+            .next()
+            .unwrap();
+        let decoded = avro_value_to_manifest_list_entry_for_format_version(
+            record,
+            &metadata,
+            FormatVersion::V1,
+        )
+        .unwrap();
+        assert!(decoded.partitions.is_none());
     }
 
     fn decode_historical_bound_after_snapshot_expiration(
         source_type: PrimitiveType,
         target_type: PrimitiveType,
         value: Value,
+        retain_source_schema: bool,
     ) -> Value {
         let schema = |schema_id, primitive_type| {
             Schema::builder()
@@ -1391,7 +1405,7 @@ mod tests {
                 .build()
                 .unwrap()
         };
-        let metadata = TableMetadataBuilder::default()
+        let mut metadata = TableMetadataBuilder::default()
             .format_version(FormatVersion::V3)
             .location("/")
             .current_schema_id(2)
@@ -1415,6 +1429,9 @@ mod tests {
             )]))
             .build()
             .unwrap();
+        if !retain_source_schema {
+            metadata.schemas.remove(&1);
+        }
         let entry = ManifestListEntry {
             format_version: FormatVersion::V1,
             manifest_path: "expired-snapshot-manifest.avro".to_string(),
@@ -1463,6 +1480,16 @@ mod tests {
                 PrimitiveType::Int,
                 PrimitiveType::Long,
                 Value::Int(42),
+                true,
+            ),
+            Value::LongInt(42)
+        );
+        assert_eq!(
+            decode_historical_bound_after_snapshot_expiration(
+                PrimitiveType::Int,
+                PrimitiveType::Long,
+                Value::Int(42),
+                false,
             ),
             Value::LongInt(42)
         );
@@ -1481,7 +1508,17 @@ mod tests {
             decode_historical_bound_after_snapshot_expiration(
                 PrimitiveType::Float,
                 PrimitiveType::Double,
+                float.clone(),
+                true,
+            ),
+            expected_double
+        );
+        assert_eq!(
+            decode_historical_bound_after_snapshot_expiration(
+                PrimitiveType::Float,
+                PrimitiveType::Double,
                 float,
+                false,
             ),
             expected_double
         );
@@ -1498,6 +1535,7 @@ mod tests {
                     scale: 2,
                 },
                 decimal.clone(),
+                true,
             ),
             decimal
         );
