@@ -27,7 +27,8 @@ pub async fn get_schema(
     let planner = SqlToRel::new(&context);
 
     let logical_plan = planner.sql_statement_to_plan(statement)?;
-    let fields = new_fields_with_ids(logical_plan.schema().fields(), &mut 1);
+    let fields = new_fields_with_ids(logical_plan.schema().fields(), &mut 1)
+        .map_err(|err| DataFusionError::External(Box::new(err)))?;
     let struct_type = StructType::try_from(&Schema::new(fields))
         .map_err(|err| DataFusionError::External(Box::new(err)))?;
     Ok(struct_type)
