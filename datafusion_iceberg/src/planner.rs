@@ -168,11 +168,10 @@ async fn plan_create_table(
 
     let catalog = iceberg_catalog.catalog();
 
-    let schema = StructType::try_from(&new_fields_with_ids(
-        node.0.schema.as_arrow().fields(),
-        &mut 0,
-    ))
-    .map_err(|err| DataFusionError::External(Box::new(err)))?;
+    let fields_with_ids = new_fields_with_ids(node.0.schema.as_arrow().fields(), &mut 0)
+        .map_err(|err| DataFusionError::External(Box::new(err)))?;
+    let schema = StructType::try_from(&fields_with_ids)
+        .map_err(|err| DataFusionError::External(Box::new(err)))?;
 
     let pacrtition_spec = node
         .0
@@ -274,7 +273,9 @@ async fn plan_create_view(
             Arc::new((**f).clone().with_metadata(md))
         })
         .collect();
-    let schema = StructType::try_from(&new_fields_with_ids(&stripped, &mut 0))
+    let fields_with_ids = new_fields_with_ids(&stripped, &mut 0)
+        .map_err(|err| DataFusionError::External(Box::new(err)))?;
+    let schema = StructType::try_from(&fields_with_ids)
         .map_err(|err| DataFusionError::External(Box::new(err)))?;
     let arrow_id_mapping: std::collections::HashMap<i32, i32> = schema
         .iter()

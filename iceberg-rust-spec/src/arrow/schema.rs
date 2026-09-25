@@ -2,7 +2,11 @@
  * Convert between datafusion and iceberg schema
 */
 
-use std::{collections::HashMap, convert::TryInto, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    convert::TryInto,
+    sync::Arc,
+};
 
 use crate::{
     spec::types::{MapType, PrimitiveType, StructField, StructType, Type},
@@ -263,11 +267,50 @@ fn get_field_id(field: &Field) -> Result<i32, Error> {
         .and_then(|x| x.parse().map_err(Error::from))
 }
 
-pub fn new_fields_with_ids(fields: &Fields, index: &mut i32) -> Fields {
-    fields
+pub fn new_fields_with_ids(fields: &Fields, index: &mut i32) -> Result<Fields, Error> {
+    let mut reserved = HashSet::new();
+    for field in fields {
+        reserve_existing_field_ids(field, &mut reserved);
+    }
+    assign_fields_with_ids(fields, index, &mut reserved)
+}
+
+fn reserve_existing_field_ids(field: &Field, reserved: &mut HashSet<i32>) {
+    if let Some(existing) = field
+        .metadata()
+        .get(PARQUET_FIELD_ID_META_KEY)
+        .and_then(|id| id.parse::<i32>().ok())
+    {
+        reserved.insert(existing);
+    }
+    if field.extension_type_name() == Some(PARQUET_VARIANT_EXTENSION_NAME) {
+        return;
+    }
+    match field.data_type() {
+        DataType::Struct(fields) => {
+            for child in fields {
+                reserve_existing_field_ids(child, reserved);
+            }
+        }
+        DataType::List(child)
+        | DataType::LargeList(child)
+        | DataType::ListView(child)
+        | DataType::LargeListView(child)
+        | DataType::FixedSizeList(child, _)
+        | DataType::Map(child, _) => reserve_existing_field_ids(child, reserved),
+        _ => {}
+    }
+}
+
+fn assign_fields_with_ids(
+    fields: &Fields,
+    index: &mut i32,
+    reserved: &mut HashSet<i32>,
+) -> Result<Fields, Error> {
+    let assigned = fields
         .into_iter()
-        .map(|field| {
-            let id = resolve_field_id(field, index);
+        .map(|field| -> Result<Field, Error> {
+            let id = resolve_field_id(field, index, reserved)?;
             let with_field_id = |field: Field, source: &Field, id: i32| {
                 let mut metadata = source.metadata().clone();
                 metadata.insert(PARQUET_FIELD_ID_META_KEY.to_string(), id.to_string());
@@ -275,27 +318,29 @@ pub fn new_fields_with_ids(fields: &Fields, index: &mut i32) -> Fields {
             };
 
             if field.extension_type_name() == Some(PARQUET_VARIANT_EXTENSION_NAME) {
-                return with_field_id(field.as_ref().clone(), field, id);
+                return Ok(with_field_id(field.as_ref().clone(), field, id));
             }
 
-            match field.data_type() {
+            Ok(match field.data_type() {
                 DataType::Struct(fields) => with_field_id(
                     Field::new(
                         field.name(),
-                        DataType::Struct(new_fields_with_ids(fields, index)),
+                        DataType::Struct(assign_fields_with_ids(fields, index, reserved)?),
                         field.is_nullable(),
                     ),
                     field,
                     id,
                 ),
                 DataType::List(list_field) => {
-                    let element_id = resolve_field_id(list_field, index);
-                    let element =
-                        with_field_id(list_field.as_ref().clone(), list_field, element_id);
+                    let element = assign_fields_with_ids(
+                        &Fields::from(vec![Arc::clone(list_field)]),
+                        index,
+                        reserved,
+                    )?;
                     with_field_id(
                         Field::new(
                             field.name(),
-                            DataType::List(Arc::new(element)),
+                            DataType::List(Arc::clone(&element[0])),
                             field.is_nullable(),
                         ),
                         field,
@@ -304,11 +349,11 @@ pub fn new_fields_with_ids(fields: &Fields, index: &mut i32) -> Fields {
                 }
                 DataType::Map(entries, sorted) => {
                     let DataType::Struct(entry_fields) = entries.data_type() else {
-                        return with_field_id(field.as_ref().clone(), field, id);
+                        return Ok(with_field_id(field.as_ref().clone(), field, id));
                     };
                     let entries = Field::new(
                         entries.name(),
-                        DataType::Struct(new_fields_with_ids(entry_fields, index)),
+                        DataType::Struct(assign_fields_with_ids(entry_fields, index, reserved)?),
                         entries.is_nullable(),
                     )
                     .with_metadata(entries.metadata().clone());
@@ -323,24 +368,33 @@ pub fn new_fields_with_ids(fields: &Fields, index: &mut i32) -> Fields {
                     )
                 }
                 _ => with_field_id(field.as_ref().clone(), field, id),
-            }
+            })
         })
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(assigned.into())
 }
 
-fn resolve_field_id(field: &Field, index: &mut i32) -> i32 {
+fn resolve_field_id(
+    field: &Field,
+    index: &mut i32,
+    reserved: &mut HashSet<i32>,
+) -> Result<i32, Error> {
     if let Some(existing) = field
         .metadata()
         .get(PARQUET_FIELD_ID_META_KEY)
         .and_then(|s| s.parse::<i32>().ok())
     {
-        if existing > *index {
-            *index = existing;
-        }
-        existing
+        *index = (*index).max(existing);
+        Ok(existing)
     } else {
-        *index += 1;
-        *index
+        let exhausted = || Error::NotSupported("Iceberg field ID space is exhausted".to_string());
+        let mut candidate = index.checked_add(1).ok_or_else(exhausted)?;
+        while reserved.contains(&candidate) {
+            candidate = candidate.checked_add(1).ok_or_else(exhausted)?;
+        }
+        *index = candidate;
+        reserved.insert(candidate);
+        Ok(candidate)
     }
 }
 
@@ -388,7 +442,7 @@ mod tests {
             ARROW_EXTENSION_TYPE_NAME_KEY.to_string(),
             PARQUET_VARIANT_EXTENSION_NAME.to_string(),
         )]));
-        let fields = new_fields_with_ids(&Fields::from(vec![variant]), &mut 0);
+        let fields = new_fields_with_ids(&Fields::from(vec![variant]), &mut 0).unwrap();
         assert_eq!(get_field_id(&fields[0]).unwrap(), 1);
         assert_eq!(
             fields[0].extension_type_name(),
@@ -400,6 +454,108 @@ mod tests {
         assert!(storage
             .iter()
             .all(|field| !field.metadata().contains_key(PARQUET_FIELD_ID_META_KEY)));
+    }
+
+    #[test]
+    fn assigning_ids_recurses_into_list_element_struct() {
+        let variant = Field::new(
+            "v",
+            DataType::Struct(Fields::from(vec![
+                Field::new("metadata", DataType::BinaryView, false),
+                Field::new("value", DataType::BinaryView, true),
+            ])),
+            true,
+        )
+        .with_metadata(HashMap::from([(
+            ARROW_EXTENSION_TYPE_NAME_KEY.to_string(),
+            PARQUET_VARIANT_EXTENSION_NAME.to_string(),
+        )]));
+        let element = Field::new("item", DataType::Struct(Fields::from(vec![variant])), true);
+        let entries = Field::new("entries", DataType::List(Arc::new(element)), true);
+        let fields = new_fields_with_ids(&Fields::from(vec![entries]), &mut 0).unwrap();
+        let DataType::List(element) = fields[0].data_type() else {
+            panic!("expected list");
+        };
+        let DataType::Struct(members) = element.data_type() else {
+            panic!("expected struct element");
+        };
+        assert_eq!(get_field_id(&fields[0]).unwrap(), 1);
+        assert_eq!(get_field_id(element).unwrap(), 2);
+        assert_eq!(get_field_id(&members[0]).unwrap(), 3);
+        assert_eq!(
+            StructType::try_from(&ArrowSchema::new(fields)).unwrap()[0].field_type,
+            Type::List(ListType {
+                element_id: 2,
+                element_required: false,
+                element: Box::new(Type::Struct(StructType::new(vec![StructField::new(
+                    3,
+                    "v",
+                    false,
+                    Type::Primitive(PrimitiveType::Variant),
+                    None,
+                )]))),
+            })
+        );
+    }
+
+    #[test]
+    fn assigning_ids_in_list_does_not_reuse_later_existing_id() {
+        let kept = Field::new("kept", DataType::Int32, true).with_metadata(HashMap::from([(
+            PARQUET_FIELD_ID_META_KEY.to_string(),
+            "3".to_string(),
+        )]));
+        let element = Field::new(
+            "item",
+            DataType::Struct(Fields::from(vec![
+                Field::new("fresh", DataType::Int32, true),
+                kept,
+            ])),
+            true,
+        );
+        let fields = new_fields_with_ids(
+            &Fields::from(vec![Field::new(
+                "entries",
+                DataType::List(Arc::new(element)),
+                true,
+            )]),
+            &mut 0,
+        )
+        .unwrap();
+        let DataType::List(element) = fields[0].data_type() else {
+            panic!("expected list");
+        };
+        let DataType::Struct(members) = element.data_type() else {
+            panic!("expected struct element");
+        };
+        assert_eq!(get_field_id(&members[1]).unwrap(), 3);
+        assert_eq!(get_field_id(&fields[0]).unwrap(), 1);
+        assert_eq!(get_field_id(element).unwrap(), 2);
+        assert_eq!(get_field_id(&members[0]).unwrap(), 4);
+    }
+
+    #[test]
+    fn assigning_ids_before_max_existing_id_does_not_overflow() {
+        let kept = Field::new("kept", DataType::Int32, true).with_metadata(HashMap::from([(
+            PARQUET_FIELD_ID_META_KEY.to_string(),
+            i32::MAX.to_string(),
+        )]));
+        let fields = new_fields_with_ids(
+            &Fields::from(vec![Field::new("fresh", DataType::Int32, true), kept]),
+            &mut 0,
+        )
+        .unwrap();
+        assert_eq!(get_field_id(&fields[0]).unwrap(), 1);
+        assert_eq!(get_field_id(&fields[1]).unwrap(), i32::MAX);
+    }
+
+    #[test]
+    fn assigning_ids_after_max_existing_id_returns_error() {
+        let mut index = i32::MAX;
+        let result = new_fields_with_ids(
+            &Fields::from(vec![Field::new("fresh", DataType::Int32, true)]),
+            &mut index,
+        );
+        assert!(matches!(result, Err(Error::NotSupported(_))));
     }
 
     #[test]
@@ -582,7 +738,7 @@ mod tests {
             true,
         );
 
-        let fields = new_fields_with_ids(&Fields::from(vec![map]), &mut 0);
+        let fields = new_fields_with_ids(&Fields::from(vec![map]), &mut 0).unwrap();
         assert_eq!(get_field_id(&fields[0]).unwrap(), 1);
         let DataType::Map(entries, _) = fields[0].data_type() else {
             panic!("expected map");
@@ -1161,7 +1317,7 @@ mod tests {
         ]
         .into();
         let mut index = 0;
-        let result = new_fields_with_ids(&fields, &mut index);
+        let result = new_fields_with_ids(&fields, &mut index).unwrap();
 
         assert_eq!(field_id(&result[0]), Some(1));
         assert_eq!(field_id(&result[1]), Some(2));
@@ -1182,7 +1338,7 @@ mod tests {
         ]
         .into();
         let mut index = 0;
-        let result = new_fields_with_ids(&fields, &mut index);
+        let result = new_fields_with_ids(&fields, &mut index).unwrap();
 
         assert_eq!(field_id(&result[0]), Some(1));
         assert_eq!(field_id(&result[1]), Some(3));
@@ -1204,7 +1360,7 @@ mod tests {
         ]
         .into();
         let mut index = 0;
-        let result = new_fields_with_ids(&fields, &mut index);
+        let result = new_fields_with_ids(&fields, &mut index).unwrap();
 
         assert_eq!(field_id(&result[0]), Some(5));
         assert_eq!(
