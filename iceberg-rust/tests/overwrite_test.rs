@@ -17,7 +17,63 @@ use iceberg_rust_spec::spec::manifest::Status;
 use iceberg_rust_spec::spec::partition::{PartitionField, PartitionSpec, Transform};
 use iceberg_rust_spec::spec::schema::Schema;
 use iceberg_rust_spec::spec::types::{PrimitiveType, StructField, Type};
+use iceberg_rust_spec::spec::values::Value;
 use iceberg_sql_catalog::SqlCatalog;
+
+#[tokio::test]
+async fn partitioned_writer_uses_exact_string_bucket() {
+    let catalog: Arc<dyn Catalog> = Arc::new(
+        SqlCatalog::new("sqlite://", "test", ObjectStoreBuilder::memory())
+            .await
+            .unwrap(),
+    );
+    let schema = Schema::builder()
+        .with_struct_field(StructField::new(
+            1,
+            "id",
+            true,
+            Type::Primitive(PrimitiveType::String),
+            None,
+        ))
+        .build()
+        .unwrap();
+    let partition_spec = PartitionSpec::builder()
+        .with_partition_field(PartitionField::new(
+            1,
+            1000,
+            "partition_id",
+            Transform::Bucket(16),
+        ))
+        .build()
+        .unwrap();
+    let table = Table::builder()
+        .with_name("string_bucket")
+        .with_location("/test/string_bucket")
+        .with_schema(schema)
+        .with_partition_spec(partition_spec)
+        .build(&["test".to_owned()], catalog)
+        .await
+        .unwrap();
+
+    let value = format!("{}Fx", "a".repeat(63));
+    let batch = RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Utf8,
+            false,
+        )])),
+        vec![Arc::new(StringArray::from(vec![value.as_str()]))],
+    )
+    .unwrap();
+    let files = write_parquet_partitioned(&table, stream::iter(vec![Ok(batch)]), None)
+        .await
+        .unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(
+        files[0].partition().get("partition_id"),
+        Some(&Some(Value::Int(2)))
+    );
+}
 
 /// Test for the overwrite functionality of TableTransaction
 /// This test demonstrates the complete workflow of:

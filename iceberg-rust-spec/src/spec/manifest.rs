@@ -21,7 +21,10 @@ use serde::{de::DeserializeOwned, ser::SerializeSeq, Deserialize, Serialize};
 use serde_bytes::ByteBuf;
 use serde_repr::{Deserialize_repr, Serialize_repr};
 
-use crate::{error::Error, partition::BoundPartitionField};
+use crate::{
+    error::Error,
+    partition::{BoundPartitionField, Transform},
+};
 
 use super::{
     decimal::decimal_scale,
@@ -556,7 +559,11 @@ pub fn partition_value_schema(spec: &[BoundPartitionField<'_>]) -> Result<String
     Ok(spec
         .iter()
         .map(|field| {
-            let data_type = avro_schema_datatype(field.field_type());
+            let partition_type = match field.transform() {
+                Transform::Void => field.field_type().clone(),
+                transform => field.field_type().tranform(transform)?,
+            };
+            let data_type = avro_schema_datatype(&partition_type);
             Ok::<_, Error>(
                 r#"
                 {
@@ -565,7 +572,7 @@ pub fn partition_value_schema(spec: &[BoundPartitionField<'_>]) -> Result<String
                     + field.name()
                     + r#"", 
                     "type":  ["null",""#
-                    + &format!("{}", &data_type)
+                    + &format!("{data_type}")
                     + r#""],
                     "field-id": "#
                     + &field.field_id().to_string()
@@ -2924,7 +2931,7 @@ mod tests {
             id: 4,
             name: "day".to_owned(),
             required: false,
-            field_type: Type::Primitive(PrimitiveType::Int),
+            field_type: Type::Primitive(PrimitiveType::Date),
             doc: None,
             initial_default: None,
             write_default: None,
@@ -2947,5 +2954,57 @@ mod tests {
             let result = apache_avro::from_value::<Struct>(&record.unwrap()).unwrap();
             assert_eq!(partition_values, result);
         }
+    }
+
+    #[test]
+    fn bucket_partition_schema_uses_transformed_type() {
+        let source = StructField::new(
+            1,
+            "value",
+            false,
+            Type::Primitive(PrimitiveType::String),
+            None,
+        );
+        let partition = PartitionField::new(1, 1000, "bucket", Transform::Bucket(16));
+        let bound = [BoundPartitionField::new(&partition, &source)];
+        let raw_schema = partition_value_schema(&bound).unwrap();
+        let schema = apache_avro::Schema::parse_str(&raw_schema).unwrap();
+        let value = Struct::from_iter(vec![("bucket".to_owned(), Some(Value::Int(2)))]);
+
+        let mut writer = apache_avro::Writer::new(&schema, Vec::new());
+        writer.append_ser(value.clone()).unwrap();
+        let encoded = writer.into_inner().unwrap();
+        let decoded = apache_avro::Reader::new(&encoded[..])
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(apache_avro::from_value::<Struct>(&decoded).unwrap(), value);
+    }
+
+    #[test]
+    fn void_partition_schema_accepts_null_value() {
+        let source = StructField::new(
+            1,
+            "value",
+            false,
+            Type::Primitive(PrimitiveType::String),
+            None,
+        );
+        let partition = PartitionField::new(1, 1000, "void_value", Transform::Void);
+        let bound = [BoundPartitionField::new(&partition, &source)];
+        let raw_schema = partition_value_schema(&bound).unwrap();
+        let schema = apache_avro::Schema::parse_str(&raw_schema).unwrap();
+        let value = Struct::from_iter(vec![("void_value".to_owned(), None)]);
+
+        let mut writer = apache_avro::Writer::new(&schema, Vec::new());
+        writer.append_ser(value.clone()).unwrap();
+        let encoded = writer.into_inner().unwrap();
+        let decoded = apache_avro::Reader::new(&encoded[..])
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(apache_avro::from_value::<Struct>(&decoded).unwrap(), value);
     }
 }

@@ -18,7 +18,8 @@ use arrow::{
     buffer::ScalarBuffer,
     compute::{binary, cast, date_part, unary, DatePart},
     datatypes::{
-        DataType, Date32Type, Int16Type, Int32Type, Int64Type, TimeUnit, TimestampMicrosecondType,
+        DataType, Date32Type, Int16Type, Int32Type, Int64Type, Time64MicrosecondType, TimeUnit,
+        TimestampMicrosecondType,
     },
     error::ArrowError,
 };
@@ -53,6 +54,11 @@ static MICROS_IN_DAY: i64 = 86_400_000_000;
 /// * Time32 - Use hash of value to repart it between bucket
 /// * Utf8 - Use hash of value to repart it between bucket
 pub fn transform_arrow(array: ArrayRef, transform: &Transform) -> Result<ArrayRef, ArrowError> {
+    if let Transform::Bucket(width) = transform {
+        if *width == 0 || *width > i32::MAX as u32 {
+            return Err(ArrowError::ComputeError("Invalid bucket width".to_owned()));
+        }
+    }
     match (array.data_type(), transform) {
         (_, Transform::Identity) => Ok(array),
         (DataType::Date32, Transform::Day) => cast(&array, &DataType::Int32),
@@ -125,18 +131,12 @@ pub fn transform_arrow(array: ArrayRef, transform: &Transform) -> Result<ArrayRe
         )),
         (DataType::Int32, Transform::Bucket(m)) => Ok(Arc::<PrimitiveArray<Int32Type>>::new(
             unary(as_primitive_array::<Int32Type>(&array), |i| {
-                let mut buffer = std::io::Cursor::new((i as i64).to_le_bytes());
-                (murmur3::murmur3_32(&mut buffer, 0).expect("murmur3 hash failled for some reason")
-                    as i32)
-                    .rem_euclid(*m as i32)
+                bucket(&(i as i64).to_le_bytes(), *m)
             }),
         )),
         (DataType::Int64, Transform::Bucket(m)) => Ok(Arc::<PrimitiveArray<Int32Type>>::new(
             unary(as_primitive_array::<Int64Type>(&array), |i| {
-                let mut buffer = std::io::Cursor::new((i).to_le_bytes());
-                (murmur3::murmur3_32(&mut buffer, 0).expect("murmur3 hash failled for some reason")
-                    as i32)
-                    .rem_euclid(*m as i32)
+                bucket(&i.to_le_bytes(), *m)
             }),
         )),
         (DataType::Date32, Transform::Bucket(m)) => {
@@ -144,25 +144,21 @@ pub fn transform_arrow(array: ArrayRef, transform: &Transform) -> Result<ArrayRe
 
             Ok(Arc::<PrimitiveArray<Int32Type>>::new(unary(
                 as_primitive_array::<Int32Type>(&temp),
-                |i| {
-                    let mut buffer = std::io::Cursor::new((i as i64).to_le_bytes());
-                    (murmur3::murmur3_32(&mut buffer, 0)
-                        .expect("murmur3 hash failled for some reason") as i32)
-                        .rem_euclid(*m as i32)
-                },
+                // The Java reference writer hashes dates as long despite Appendix B.
+                |i| bucket(&(i as i64).to_le_bytes(), *m),
             )))
         }
         (DataType::Time32(TimeUnit::Millisecond), Transform::Bucket(m)) => {
             let temp = cast(&array, &DataType::Int32)?;
-
             Ok(Arc::<PrimitiveArray<Int32Type>>::new(unary(
                 as_primitive_array::<Int32Type>(&temp),
-                |i: i32| {
-                    let mut buffer = std::io::Cursor::new((i as i64).to_le_bytes());
-                    (murmur3::murmur3_32(&mut buffer, 0)
-                        .expect("murmur3 hash failled for some reason") as i32)
-                        .rem_euclid(*m as i32)
-                },
+                |i| bucket(&(i as i64).to_le_bytes(), *m),
+            )))
+        }
+        (DataType::Time64(TimeUnit::Microsecond), Transform::Bucket(m)) => {
+            Ok(Arc::<PrimitiveArray<Int32Type>>::new(unary(
+                as_primitive_array::<Time64MicrosecondType>(&array),
+                |i| bucket(&i.to_le_bytes(), *m),
             )))
         }
         (DataType::Utf8, Transform::Bucket(m)) => {
@@ -172,13 +168,10 @@ pub fn transform_arrow(array: ArrayRef, transform: &Transform) -> Result<ArrayRe
             Ok(Arc::new(PrimitiveArray::<Int32Type>::new(
                 ScalarBuffer::from_iter(local_array.iter().map(|a| {
                     if let Some(value) = a {
-                        murmur3::murmur3_32(&mut value.as_bytes(), 0)
-                            .expect("murmur3 hash failled for some reason")
-                            as i32
+                        bucket(value.as_bytes(), *m)
                     } else {
                         0
                     }
-                    .rem_euclid(*m as i32)
                 })),
                 nulls.cloned(),
             )))
@@ -191,12 +184,12 @@ pub fn transform_arrow(array: ArrayRef, transform: &Transform) -> Result<ArrayRe
 
 #[inline]
 fn micros_to_days(a: i64) -> i32 {
-    (a / MICROS_IN_DAY) as i32
+    a.div_euclid(MICROS_IN_DAY) as i32
 }
 
 #[inline]
 fn micros_to_hours(a: i64) -> i32 {
-    (a / MICROS_IN_HOUR) as i32
+    a.div_euclid(MICROS_IN_HOUR) as i32
 }
 
 #[inline]
@@ -206,7 +199,14 @@ fn datepart_to_years(year: i32) -> i32 {
 
 #[inline]
 fn datepart_to_months(year: i32, month: i32) -> i32 {
-    12 * (year - YEARS_BEFORE_UNIX_EPOCH) + month
+    12 * (year - YEARS_BEFORE_UNIX_EPOCH) + month - 1
+}
+
+#[inline]
+fn bucket(bytes: &[u8], width: u32) -> i32 {
+    let mut input = bytes;
+    let hash = murmur3::murmur3_32(&mut input, 0).expect("hashing in-memory bytes cannot fail");
+    ((hash & i32::MAX as u32) % width) as i32
 }
 
 #[cfg(test)]
@@ -270,9 +270,9 @@ mod tests {
         let array = create_date32_array();
         let result = transform_arrow(array, &Transform::Month).unwrap();
         let expected = Arc::new(arrow::array::Int32Array::from(vec![
+            Some(640),
             Some(641),
-            Some(642),
-            Some(649),
+            Some(648),
             None,
         ])) as ArrayRef;
         assert_eq!(&expected, &result);
@@ -322,9 +322,9 @@ mod tests {
         let array = create_timestamp_micro_array();
         let result = transform_arrow(array, &Transform::Month).unwrap();
         let expected = Arc::new(arrow::array::Int32Array::from(vec![
+            Some(640),
             Some(641),
-            Some(642),
-            Some(649),
+            Some(648),
             None,
         ])) as ArrayRef;
         assert_eq!(&expected, &result);
@@ -374,9 +374,9 @@ mod tests {
         let array = create_timestamptz_micro_array();
         let result = transform_arrow(array, &Transform::Month).unwrap();
         let expected = Arc::new(arrow::array::Int32Array::from(vec![
+            Some(640),
             Some(641),
-            Some(642),
-            Some(649),
+            Some(648),
             None,
         ])) as ArrayRef;
         assert_eq!(&expected, &result);
@@ -500,11 +500,11 @@ mod tests {
         ])) as ArrayRef;
         let result = transform_arrow(array, &Transform::Bucket(1000)).unwrap();
         let expected = Arc::new(arrow::array::Int32Array::from(vec![
-            Some(2017239379i32.rem_euclid(1000)),
-            Some(578), // -653330422 % 1000 not match I don't know why
-            Some(988822981i32.rem_euclid(1000)),
-            Some(964620854i32.rem_euclid(1000)),
-            Some(1669671676i32.rem_euclid(1000)),
+            Some(379),
+            Some(226),
+            Some(981),
+            Some(854),
+            Some(676),
             None,
         ])) as ArrayRef;
         assert_eq!(&expected, &result);
@@ -522,11 +522,11 @@ mod tests {
         ])) as ArrayRef;
         let result = transform_arrow(array, &Transform::Bucket(1000)).unwrap();
         let expected = Arc::new(arrow::array::Int32Array::from(vec![
-            Some(2017239379i32.rem_euclid(1000)),
-            Some(578), // -653_330_422 % 1000 not match probably like to signed number
-            Some(117), // 716_914_497 = 1000 not match probably like to signed number
-            Some(964_620_854i32.rem_euclid(1000)),
-            Some(1669671676i32.rem_euclid(1000)),
+            Some(379),
+            Some(226),
+            Some(765),
+            Some(854),
+            Some(676),
             None,
         ])) as ArrayRef;
         assert_eq!(&expected, &result);
@@ -540,26 +540,35 @@ mod tests {
         ])) as ArrayRef;
         let result = transform_arrow(array, &Transform::Bucket(1000)).unwrap();
 
-        let expected = Arc::new(arrow::array::Int32Array::from(vec![
-            Some(578), // -653330422 % 1000 not match probably like to signed number
-            None,
-        ])) as ArrayRef;
+        let expected = Arc::new(arrow::array::Int32Array::from(vec![Some(226), None])) as ArrayRef;
 
         assert_eq!(&expected, &result);
     }
 
     #[test]
-    fn test_time32_bucket_transform() {
-        let array = Arc::new(arrow::array::Time32MillisecondArray::from(vec![
-            Some(81_068_000), // number of micros from midnight 22:31:08
+    fn test_time64_bucket_transform() {
+        let array = Arc::new(arrow::array::Time64MicrosecondArray::from(vec![
+            Some(81_068_000_000), // microseconds from midnight at 22:31:08
             None,
         ])) as ArrayRef;
         let result = transform_arrow(array, &Transform::Bucket(1000)).unwrap();
-        let expected = Arc::new(arrow::array::Int32Array::from(vec![
-            Some(693), // -662762989 % 1000 not match probably like to signed number
+        let expected = Arc::new(arrow::array::Int32Array::from(vec![Some(659), None])) as ArrayRef;
+        assert_eq!(&expected, &result);
+    }
+
+    #[test]
+    fn test_time32_bucket_transform_remains_supported() {
+        let array = Arc::new(arrow::array::Time32MillisecondArray::from(vec![
+            Some(81_068_000),
             None,
         ])) as ArrayRef;
-        assert_eq!(&expected, &result);
+        let result = transform_arrow(array, &Transform::Bucket(1000)).unwrap();
+        let result = result
+            .as_any()
+            .downcast_ref::<arrow::array::Int32Array>()
+            .unwrap();
+        assert!(result.value(0) < 1000);
+        assert!(result.is_null(1));
     }
 
     #[test]
@@ -567,11 +576,37 @@ mod tests {
         let array =
             Arc::new(arrow::array::StringArray::from(vec![Some("iceberg"), None])) as ArrayRef;
         let result = transform_arrow(array, &Transform::Bucket(1000)).unwrap();
-        let expected = Arc::new(arrow::array::Int32Array::from(vec![
-            Some(1_210_000_089i32.rem_euclid(1000)),
-            None,
-        ])) as ArrayRef;
+        let expected = Arc::new(arrow::array::Int32Array::from(vec![Some(89), None])) as ArrayRef;
         assert_eq!(&expected, &result);
+    }
+
+    #[test]
+    fn test_partition_transforms_at_epoch_boundary() {
+        let dates = Arc::new(arrow::array::Date32Array::from(vec![-1, 0])) as ArrayRef;
+        let years = transform_arrow(dates.clone(), &Transform::Year).unwrap();
+        let months = transform_arrow(dates, &Transform::Month).unwrap();
+        assert_eq!(years.as_ref(), &arrow::array::Int32Array::from(vec![-1, 0]));
+        assert_eq!(
+            months.as_ref(),
+            &arrow::array::Int32Array::from(vec![-1, 0])
+        );
+
+        let times =
+            Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![-1, 0])) as ArrayRef;
+        for transform in [Transform::Day, Transform::Hour, Transform::Month] {
+            let result = transform_arrow(times.clone(), &transform).unwrap();
+            assert_eq!(
+                result.as_ref(),
+                &arrow::array::Int32Array::from(vec![-1, 0])
+            );
+        }
+    }
+
+    #[test]
+    fn test_date_bucket_matches_java_reference_hash() {
+        let date = Arc::new(arrow::array::Date32Array::from(vec![17_486])) as ArrayRef;
+        let buckets = transform_arrow(date, &Transform::Bucket(1000)).unwrap();
+        assert_eq!(buckets.as_ref(), &arrow::array::Int32Array::from(vec![226]));
     }
 
     #[test]

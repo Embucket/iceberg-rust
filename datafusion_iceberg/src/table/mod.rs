@@ -15,7 +15,8 @@ use futures::{StreamExt, TryStreamExt};
 use iceberg_rust::arrow::partition::partition_record_batch;
 use iceberg_rust::arrow::write::{generate_file_path, generate_partition_path};
 use iceberg_rust::file_format::parquet::{
-    parquet_to_datafile, ICEBERG_ESTIMATE_INT64_DISTINCT_COUNT_META_KEY,
+    parquet_to_datafile, parquet_to_datafile_with_partition,
+    ICEBERG_ESTIMATE_INT64_DISTINCT_COUNT_META_KEY,
 };
 use iceberg_rust::object_store::Bucket;
 use iceberg_rust::spec::partition::BoundPartitionField;
@@ -783,25 +784,11 @@ async fn table_scan(
         physical_predicate.clone()
     {
         let partition_schema = Arc::new(ArrowSchema::new(table_partition_cols.clone()));
-        let partition_column_names = partition_fields
-            .iter()
-            .map(|field| Ok(field.source_name().to_owned()))
-            .collect::<Result<HashSet<_>, Error>>()
-            .map_err(DataFusionIcebergError::from)?;
-
         let partition_predicates = conjunction(
             filters
                 .iter()
-                .filter(|expr| {
-                    let set: HashSet<String> = expr
-                        .column_refs()
-                        .into_iter()
-                        .map(|x| x.name.clone())
-                        .collect();
-                    set.is_subset(&partition_column_names)
-                })
                 .cloned()
-                .map(|x| transform_predicate(x, partition_fields).unwrap()),
+                .filter_map(|expr| transform_predicate(expr, partition_fields)),
         );
 
         // If there is a filter expression on the partition column, the manifest files to read are pruned.
@@ -2463,7 +2450,8 @@ async fn write_parquet_files(
 
     let sink = ParquetSink::new(config, table_parquet_options);
 
-    let (demux_task, file_receiver) = start_demuxer_task(metadata, batches, context)?;
+    let (demux_task, file_receiver, partition_values_by_path) =
+        start_demuxer_task(metadata, batches, context)?;
 
     sink.spawn_writer_tasks_and_join(context, demux_task, file_receiver, object_store.clone())
         .await?;
@@ -2478,9 +2466,10 @@ async fn write_parquet_files(
             .await
             .map_err(DataFusionIcebergError::from)?
             .size;
-        datafiles.push(
+        let location = bucket.to_string() + "/" + path.as_ref();
+        let datafile = if partition_fields.is_empty() {
             parquet_to_datafile(
-                &(bucket.to_string() + "/" + path.as_ref()),
+                &location,
                 size,
                 &file,
                 schema,
@@ -2488,24 +2477,43 @@ async fn write_parquet_files(
                 equality_ids,
                 &metadata.properties,
             )
-            .map_err(DataFusionIcebergError::from)?,
-        );
+        } else {
+            let values = partition_values_by_path
+                .read()
+                .map_err(|_| DataFusionError::Internal("Partition map lock poisoned".to_owned()))?
+                .get(&path)
+                .cloned()
+                .ok_or_else(|| DataFusionError::Internal("Missing written partition".to_owned()))?;
+            parquet_to_datafile_with_partition(
+                &location,
+                size,
+                &file,
+                schema,
+                &partition_fields,
+                equality_ids,
+                &metadata.properties,
+                &values,
+            )
+        };
+        datafiles.push(datafile.map_err(DataFusionIcebergError::from)?);
     }
     Ok(datafiles)
 }
+
+type PartitionValuesByPath = Arc<RwLock<HashMap<Path, Vec<Value>>>>;
+type DemuxerTask = (
+    SpawnedTask<Result<(), DataFusionError>>,
+    DemuxedStreamReceiver,
+    PartitionValuesByPath,
+);
 
 pub(crate) fn start_demuxer_task(
     metadata: &TableMetadata,
     data: SendableRecordBatchStream,
     context: &Arc<TaskContext>,
-) -> Result<
-    (
-        SpawnedTask<Result<(), DataFusionError>>,
-        DemuxedStreamReceiver,
-    ),
-    DataFusionError,
-> {
+) -> Result<DemuxerTask, DataFusionError> {
     let (tx, rx) = mpsc::unbounded_channel();
+    let partition_values_by_path = Arc::new(RwLock::new(HashMap::new()));
     let context = Arc::clone(context);
     let partition_spec = metadata
         .default_partition_spec()
@@ -2527,15 +2535,24 @@ pub(crate) fn start_demuxer_task(
                 .clone();
             let location = metadata.location.clone();
             let hash_map = metadata.properties.clone();
+            let partition_values_by_path = Arc::clone(&partition_values_by_path);
             async move {
                 let partition_fields = table_metadata::partition_fields(&partition_spec, &schema)
                     .map_err(DataFusionIcebergError::from)?;
-                partitions_demuxer(tx, data, &partition_fields, &hash_map, &location).await
+                partitions_demuxer(
+                    tx,
+                    data,
+                    &partition_fields,
+                    &hash_map,
+                    &location,
+                    &partition_values_by_path,
+                )
+                .await
             }
         })
     };
 
-    Ok((task, rx))
+    Ok((task, rx, partition_values_by_path))
 }
 
 async fn partitions_demuxer(
@@ -2544,6 +2561,7 @@ async fn partitions_demuxer(
     partition_fields: &[BoundPartitionField<'_>],
     table_properties: &HashMap<String, String>,
     table_location: &str,
+    partition_values_by_path: &PartitionValuesByPath,
 ) -> Result<(), DataFusionError> {
     let mut senders: LruCache<Vec<Value>, mpsc::Sender<RecordBatch>> = LruCache::unbounded();
 
@@ -2580,9 +2598,15 @@ async fn partitions_demuxer(
                     )?)
                 };
                 let data_location = table_location.trim_end_matches('/').to_string() + "/data/";
-                let path = generate_file_path(&data_location, partition_path);
+                let path: Path = generate_file_path(&data_location, partition_path).into();
+                partition_values_by_path
+                    .write()
+                    .map_err(|_| {
+                        DataFusionError::Internal("Partition map lock poisoned".to_owned())
+                    })?
+                    .insert(path.clone(), partition_values);
                 partition_sender
-                    .send((path.into(), reciever))
+                    .send((path, reciever))
                     .map_err(DataFusionIcebergError::from)?;
             };
         }
@@ -2687,6 +2711,7 @@ mod tests {
             snapshot::SnapshotBuilder,
             types::{PrimitiveType, StructField, Type},
             util,
+            values::Value,
         },
     };
     use iceberg_rust::{
@@ -3886,6 +3911,29 @@ mod tests {
         .await
         .expect("Failed to insert values into table");
 
+        let boundary_rows = ctx
+            .sql("SELECT id FROM orders WHERE created_at < '2020-01-01 00:45:00+01' ORDER BY id")
+            .await
+            .expect("Failed to create plan for hour boundary query")
+            .collect()
+            .await
+            .expect("Failed to scan hour boundary partition");
+        let ids: Vec<i64> = boundary_rows
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(ids, vec![1, 2, 3]);
+
         let batches = ctx
             .sql("select product_id, sum(amount) from orders where customer_id = 1 group by product_id;")
             .await
@@ -4193,6 +4241,172 @@ mod tests {
             panic!();
         };
         assert_eq!(table.manifests(None, None).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn transformed_partition_equality_preserves_rows() {
+        let catalog: Arc<dyn Catalog> = Arc::new(
+            SqlCatalog::new("sqlite://", "test", ObjectStoreBuilder::memory())
+                .await
+                .unwrap(),
+        );
+        let ctx = SessionContext::new();
+
+        for (name, transform) in [
+            ("bucket_table", Transform::Bucket(16)),
+            ("truncate_table", Transform::Truncate(10)),
+        ] {
+            let schema = Schema::builder()
+                .with_struct_field(StructField::new(
+                    1,
+                    "id",
+                    true,
+                    Type::Primitive(PrimitiveType::Long),
+                    None,
+                ))
+                .build()
+                .unwrap();
+            let partition_spec = PartitionSpec::builder()
+                .with_partition_field(PartitionField::new(1, 1000, "partition_id", transform))
+                .build()
+                .unwrap();
+            let table = Table::builder()
+                .with_name(name)
+                .with_location(format!("/test/{name}"))
+                .with_schema(schema)
+                .with_partition_spec(partition_spec)
+                .build(&["test".to_owned()], Arc::clone(&catalog))
+                .await
+                .unwrap();
+            ctx.register_table(name, Arc::new(DataFusionTable::from(table)))
+                .unwrap();
+            ctx.sql(&format!("INSERT INTO {name} VALUES (123)"))
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+
+            let batches = ctx
+                .sql(&format!("SELECT id FROM {name} WHERE id = 123"))
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            let values: Vec<i64> = batches
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .values()
+                        .iter()
+                        .copied()
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            assert_eq!(values, vec![123], "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn bucketed_long_string_remains_visible_after_insert() {
+        let catalog: Arc<dyn Catalog> = Arc::new(
+            SqlCatalog::new("sqlite://", "test", ObjectStoreBuilder::memory())
+                .await
+                .unwrap(),
+        );
+        let schema = Schema::builder()
+            .with_struct_field(StructField::new(
+                1,
+                "id",
+                true,
+                Type::Primitive(PrimitiveType::String),
+                None,
+            ))
+            .build()
+            .unwrap();
+        let partition_spec = PartitionSpec::builder()
+            .with_partition_field(PartitionField::new(
+                1,
+                1000,
+                "partition_id",
+                Transform::Bucket(16),
+            ))
+            .build()
+            .unwrap();
+        let table = Table::builder()
+            .with_name("long_string_bucket")
+            .with_location("/test/long_string_bucket")
+            .with_schema(schema)
+            .with_partition_spec(partition_spec)
+            .build(&["test".to_owned()], catalog)
+            .await
+            .unwrap();
+        let ctx = SessionContext::new();
+        let runtime = Arc::new(DataFusionTable::from(table));
+        ctx.register_table("long_string_bucket", runtime.clone())
+            .unwrap();
+
+        // Parquet may truncate String min/max at 64 bytes. The manifest must
+        // use the exact partition key, not the hash of those truncated bounds.
+        let value = format!("{}Fx", "a".repeat(63));
+        ctx.sql(&format!(
+            "INSERT INTO long_string_bucket VALUES ('{value}')"
+        ))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+        assert_eq!(
+            Value::String(value.clone())
+                .transform(&Transform::Bucket(16))
+                .unwrap(),
+            Value::Int(2)
+        );
+        assert_eq!(
+            Value::String(format!("{}F", "a".repeat(63)))
+                .transform(&Transform::Bucket(16))
+                .unwrap(),
+            Value::Int(0)
+        );
+        let committed = match runtime.tabular.read().unwrap().clone() {
+            Tabular::Table(table) => table,
+            _ => panic!("expected table"),
+        };
+        let manifests = committed.manifests(None, None).await.unwrap();
+        assert_eq!(manifests.len(), 1);
+        let partition = &manifests[0].partitions.as_ref().unwrap()[0];
+        assert_eq!(partition.lower_bound, Some(Value::Int(2)));
+        assert_eq!(partition.upper_bound, Some(Value::Int(2)));
+        let batches = ctx
+            .sql(&format!(
+                "SELECT id FROM long_string_bucket WHERE id = '{value}'"
+            ))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let values: Vec<String> = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .iter()
+                    .flatten()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(values, vec![value]);
     }
 
     #[tokio::test]

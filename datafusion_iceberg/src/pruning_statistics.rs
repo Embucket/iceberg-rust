@@ -20,16 +20,13 @@ use datafusion::{
         array::ArrayRef,
         datatypes::{DataType, Schema as ArrowSchema, TimeUnit},
     },
-    common::{
-        tree_node::{Transformed, TreeNode},
-        DataFusionError,
-    },
+    common::DataFusionError,
     physical_optimizer::pruning::PruningStatistics,
     prelude::Column,
     scalar::ScalarValue,
 };
 use datafusion_expr::{
-    expr::ScalarFunction, BinaryExpr, ColumnarValue, Expr, ScalarFunctionArgs, ScalarUDF,
+    expr::ScalarFunction, BinaryExpr, ColumnarValue, Expr, Operator, ScalarFunctionArgs, ScalarUDF,
     ScalarUDFImpl, Signature, TypeSignature, Volatility,
 };
 use iceberg_rust::{
@@ -41,6 +38,7 @@ use iceberg_rust::{
         manifest_list::ManifestListEntry,
         partition::{BoundPartitionField, Transform},
         schema::Schema,
+        types::{PrimitiveType, Type},
         values::Value,
     },
     table::ManifestPath,
@@ -324,67 +322,192 @@ fn any_iter_to_array(
 pub(crate) fn transform_predicate(
     expr: Expr,
     partition_fields: &[BoundPartitionField],
-) -> Result<Expr, DataFusionError> {
-    expr.transform_down(|expr| match expr {
-        Expr::BinaryExpr(bin) => match (*bin.left, *bin.right) {
-            (Expr::Column(column), right) => {
-                let field = partition_fields
-                    .iter()
-                    .find(|x| x.source_name() == column.name())
-                    .unwrap();
-                Ok(Transformed::yes(Expr::BinaryExpr(BinaryExpr::new(
-                    Box::new(Expr::Column(Column::new(
-                        column.relation,
-                        field.name().to_owned(),
-                    ))),
-                    bin.op,
-                    Box::new(transform_literal(right, field.transform())?),
-                ))))
-            }
-            (left, Expr::Column(column)) => {
-                let field = partition_fields
-                    .iter()
-                    .find(|x| x.source_name() == column.name())
-                    .unwrap();
-                Ok(Transformed::yes(Expr::BinaryExpr(BinaryExpr::new(
-                    Box::new(Expr::Column(Column::new(
-                        column.relation,
-                        field.name().to_owned(),
-                    ))),
-                    bin.op,
-                    Box::new(transform_literal(left, field.transform())?),
-                ))))
-            }
-            (left, right) => Ok(Transformed::no(Expr::BinaryExpr(BinaryExpr::new(
-                Box::new(left),
-                bin.op,
-                Box::new(right),
-            )))),
+) -> Option<Expr> {
+    let expr = match expr {
+        Expr::BinaryExpr(BinaryExpr { left, op, right })
+            if matches!(op, Operator::And | Operator::Or) =>
+        {
+            let left = transform_predicate(*left, partition_fields);
+            let right = transform_predicate(*right, partition_fields);
+            return match (left, right, op) {
+                (Some(left), Some(right), op) => Some(Expr::BinaryExpr(BinaryExpr::new(
+                    Box::new(left),
+                    op,
+                    Box::new(right),
+                ))),
+                (left, right, Operator::And) => left.or(right),
+                _ => None,
+            };
+        }
+        expr => expr,
+    };
+    if expr.column_refs().iter().all(|column| {
+        partition_fields.iter().any(|field| {
+            field.source_name() == column.name()
+                && field.name() == column.name()
+                && field.transform() == &Transform::Identity
+        })
+    }) {
+        return Some(expr);
+    }
+
+    let Expr::BinaryExpr(BinaryExpr { left, op, right }) = expr else {
+        return None;
+    };
+    let (column, literal, column_on_left) = match (*left, *right) {
+        (Expr::Column(column), literal @ Expr::Literal(..)) => (column, literal, true),
+        (literal @ Expr::Literal(..), Expr::Column(column)) => (column, literal, false),
+        _ => return None,
+    };
+    let field = partition_fields
+        .iter()
+        .find(|field| field.source_name() == column.name())?;
+    if field.transform() != &Transform::Identity {
+        let Expr::Literal(value, _) = &literal else {
+            return None;
+        };
+        if !literal_matches_source(value, field) {
+            return None;
+        }
+        if matches!(field.transform(), Transform::Day | Transform::Hour)
+            && matches!(value, ScalarValue::TimestampMicrosecond(Some(value), _) if *value < 0)
+        {
+            return None;
+        }
+    }
+    let op = if column_on_left {
+        op
+    } else {
+        match op {
+            Operator::Lt => Operator::Gt,
+            Operator::LtEq => Operator::GtEq,
+            Operator::Gt => Operator::Lt,
+            Operator::GtEq => Operator::LtEq,
+            Operator::Eq | Operator::NotEq => op,
+            _ => return None,
+        }
+    };
+    let op = match field.transform() {
+        Transform::Identity => op,
+        // Legacy numeric manifests and truncated String min/max statistics can
+        // record a bucket unrelated to a matching row. Keep the row predicate,
+        // but do not use bucket metadata to prune manifests.
+        Transform::Bucket(_) => return None,
+        Transform::Year
+        | Transform::Month
+        | Transform::Day
+        | Transform::Hour
+        | Transform::Truncate(_) => match op {
+            Operator::Eq | Operator::LtEq | Operator::GtEq => op,
+            Operator::Lt => Operator::LtEq,
+            Operator::Gt => Operator::GtEq,
+            _ => return None,
         },
-        x => Ok(Transformed::no(x)),
-    })
-    .map(|x| x.data)
+        _ => return None,
+    };
+    let literal = transform_literal(literal, field.transform())?;
+    let column = Expr::Column(Column::new(column.relation, field.name().to_owned()));
+    if field.transform() == &Transform::Month {
+        let legacy = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(literal.clone()),
+            Operator::Plus,
+            Box::new(Expr::Literal(ScalarValue::Int32(Some(1)), None)),
+        ));
+        return match op {
+            Operator::Eq => Some(Expr::BinaryExpr(BinaryExpr::new(
+                Box::new(partition_comparison(
+                    column.clone(),
+                    Operator::GtEq,
+                    literal,
+                )),
+                Operator::And,
+                Box::new(partition_comparison(column, Operator::LtEq, legacy)),
+            ))),
+            Operator::LtEq => Some(partition_comparison(column, op, legacy)),
+            Operator::GtEq => Some(partition_comparison(column, op, literal)),
+            _ => None,
+        };
+    }
+    Some(partition_comparison(column, op, literal))
 }
 
-fn transform_literal(expr: Expr, transform: &Transform) -> Result<Expr, DataFusionError> {
+fn partition_comparison(column: Expr, op: Operator, literal: Expr) -> Expr {
+    Expr::BinaryExpr(BinaryExpr::new(Box::new(column), op, Box::new(literal)))
+}
+
+fn literal_matches_source(value: &ScalarValue, field: &BoundPartitionField<'_>) -> bool {
+    matches!(
+        (field.field_type(), value),
+        (
+            Type::Primitive(PrimitiveType::Int),
+            ScalarValue::Int32(Some(_))
+        ) | (
+            Type::Primitive(PrimitiveType::Long),
+            ScalarValue::Int64(Some(_))
+        ) | (
+            Type::Primitive(PrimitiveType::Date),
+            ScalarValue::Date32(Some(_))
+        ) | (
+            Type::Primitive(PrimitiveType::Time),
+            ScalarValue::Time64Microsecond(Some(_))
+        ) | (
+            Type::Primitive(PrimitiveType::String),
+            ScalarValue::Utf8(Some(_))
+        ) | (
+            Type::Primitive(PrimitiveType::Timestamp),
+            ScalarValue::TimestampMicrosecond(Some(_), None)
+        )
+    ) || matches!(
+        (field.field_type(), value),
+        (
+            Type::Primitive(PrimitiveType::Timestamptz),
+            ScalarValue::TimestampMicrosecond(Some(_), Some(tz))
+        ) if tz.as_ref() == "UTC"
+    )
+}
+
+fn transform_literal(expr: Expr, transform: &Transform) -> Option<Expr> {
+    let Expr::Literal(value, _) = &expr else {
+        return None;
+    };
+    if value.is_null() {
+        return None;
+    }
     match transform {
-        Transform::Year => Ok(Expr::ScalarFunction(ScalarFunction::new_udf(
+        Transform::Year => Some(Expr::ScalarFunction(ScalarFunction::new_udf(
             Arc::new(ScalarUDF::new_from_impl(DateTransform::new())),
             vec![Expr::Literal(ScalarValue::new_utf8("year"), None), expr],
         ))),
-        Transform::Month => Ok(Expr::ScalarFunction(ScalarFunction::new_udf(
+        Transform::Month => Some(Expr::ScalarFunction(ScalarFunction::new_udf(
             Arc::new(ScalarUDF::new_from_impl(DateTransform::new())),
             vec![Expr::Literal(ScalarValue::new_utf8("month"), None), expr],
         ))),
-        Transform::Day => Ok(Expr::ScalarFunction(ScalarFunction::new_udf(
+        Transform::Day => Some(Expr::ScalarFunction(ScalarFunction::new_udf(
             Arc::new(ScalarUDF::new_from_impl(DateTransform::new())),
             vec![Expr::Literal(ScalarValue::new_utf8("day"), None), expr],
         ))),
-        Transform::Hour => Ok(Expr::ScalarFunction(ScalarFunction::new_udf(
+        Transform::Hour => Some(Expr::ScalarFunction(ScalarFunction::new_udf(
             Arc::new(ScalarUDF::new_from_impl(DateTransform::new())),
             vec![Expr::Literal(ScalarValue::new_utf8("hour"), None), expr],
         ))),
-        _ => Ok(expr),
+        Transform::Identity => Some(expr),
+        Transform::Truncate(width) if *width == 0 => None,
+        Transform::Truncate(width) => {
+            let value = match value {
+                ScalarValue::Int16(Some(value)) if *width <= i16::MAX as u32 => {
+                    ScalarValue::Int16(Some(value.checked_sub(value.rem_euclid(*width as i16))?))
+                }
+                ScalarValue::Int32(Some(value)) if *width <= i32::MAX as u32 => {
+                    ScalarValue::Int32(Some(value.checked_sub(value.rem_euclid(*width as i32))?))
+                }
+                ScalarValue::Int64(Some(value)) => ScalarValue::Int64(Some(
+                    value.checked_sub(value.rem_euclid(i64::from(*width)))?,
+                )),
+                _ => return None,
+            };
+            Some(Expr::Literal(value, None))
+        }
+        _ => None,
     }
 }
 
@@ -527,6 +650,10 @@ mod tests {
     };
     use datafusion::arrow::datatypes::Field;
     use datafusion::common::config::ConfigOptions;
+    use datafusion::execution::context::SessionContext;
+    use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
+    use datafusion::physical_expr::create_physical_expr;
+    use datafusion::physical_optimizer::pruning::PruningPredicateBuilder;
     use iceberg_rust::spec::decimal::decimal_from_i128_with_scale;
     use iceberg_rust::spec::{
         manifest::{Content, DataFile, FileFormat, Status},
@@ -585,6 +712,71 @@ mod tests {
         assert_eq!(maximums.value(2), -42);
         let null_counts = pruning.null_counts(&Column::from_name("b")).unwrap();
         assert!(null_counts.is_null(0));
+    }
+
+    #[test]
+    fn month_projection_keeps_legacy_and_spec_manifests() {
+        let source = StructField::new(1, "d", false, Type::Primitive(PrimitiveType::Date), None);
+        let partition = PartitionField::new(1, 1000, "month", Transform::Month);
+        let fields = [BoundPartitionField::new(&partition, &source)];
+        let predicate = transform_predicate(
+            partition_comparison(
+                Expr::Column(Column::from_name("d")),
+                Operator::Eq,
+                Expr::Literal(ScalarValue::Date32(Some(0)), None),
+            ),
+            &fields,
+        )
+        .unwrap();
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "month",
+            DataType::Int32,
+            true,
+        )]));
+        let session = SessionContext::new();
+        let state = session.state();
+        let physical = create_physical_expr(
+            &predicate,
+            &schema.clone().try_into().unwrap(),
+            state.execution_props(),
+            &PhysicalPlanningContext::default(),
+        )
+        .unwrap();
+        let pruning = PruningPredicateBuilder::new()
+            .with_file_schema(schema)
+            .try_build(physical)
+            .unwrap();
+        let manifests: Vec<_> = [-1, 0, 1, 2]
+            .into_iter()
+            .map(|month| ManifestListEntry {
+                format_version: FormatVersion::V2,
+                manifest_path: format!("/{month}.avro"),
+                manifest_length: 1,
+                partition_spec_id: 1,
+                content: ManifestContent::Data,
+                sequence_number: 1,
+                min_sequence_number: 1,
+                added_snapshot_id: 1,
+                added_files_count: Some(1),
+                existing_files_count: Some(0),
+                deleted_files_count: Some(0),
+                added_rows_count: Some(1),
+                existing_rows_count: Some(0),
+                deleted_rows_count: Some(0),
+                partitions: Some(vec![FieldSummary {
+                    contains_null: false,
+                    contains_nan: None,
+                    lower_bound: Some(Value::Int(month)),
+                    upper_bound: Some(Value::Int(month)),
+                }]),
+                key_metadata: None,
+                first_row_id: None,
+            })
+            .collect();
+        let selected = pruning
+            .prune(&PruneManifests::new(&fields, 1, &manifests))
+            .unwrap();
+        assert_eq!(selected, vec![false, true, true, false]);
     }
 
     #[test]
@@ -682,8 +874,7 @@ mod tests {
     #[test]
     fn month_on_date32() {
         let result = invoke_date_transform("month", ScalarValue::Date32(Some(19797))).unwrap();
-        // (2024 - 1970) * 12 + 3 = 651 (month is 1-based)
-        assert_eq!(unwrap_int32(result), 651);
+        assert_eq!(unwrap_int32(result), 650);
     }
 
     #[test]
@@ -722,8 +913,7 @@ mod tests {
             ScalarValue::TimestampMicrosecond(Some(TS_MICROS), None),
         )
         .unwrap();
-        // (2024 - 1970) * 12 + 3 = 651 (month is 1-based)
-        assert_eq!(unwrap_int32(result), 651);
+        assert_eq!(unwrap_int32(result), 650);
     }
 
     #[test]
@@ -767,7 +957,7 @@ mod tests {
             ScalarValue::TimestampMicrosecond(Some(TS_MICROS), Some("UTC".into())),
         )
         .unwrap();
-        assert_eq!(unwrap_int32(result), 651);
+        assert_eq!(unwrap_int32(result), 650);
     }
 
     #[test]
@@ -796,10 +986,10 @@ mod tests {
     fn epoch_zero_transforms() {
         // 1970-01-01T00:00:00Z
         let cases = vec![
-            ("year", 0),  // 1970 - 1970 = 0
-            ("month", 1), // 0 * 12 + 1 = 1 (month is 1-based)
-            ("day", 0),   // day 0 since epoch
-            ("hour", 0),  // hour 0 since epoch
+            ("year", 0), // 1970 - 1970 = 0
+            ("month", 0),
+            ("day", 0),  // day 0 since epoch
+            ("hour", 0), // hour 0 since epoch
         ];
         for (name, expected) in cases {
             let result =
@@ -810,6 +1000,12 @@ mod tests {
                 expected,
                 "epoch zero: {name} transform"
             );
+        }
+        for (name, expected) in [("month", -1), ("day", -1), ("hour", -1)] {
+            let result =
+                invoke_date_transform(name, ScalarValue::TimestampMicrosecond(Some(-1), None))
+                    .unwrap();
+            assert_eq!(unwrap_int32(result), expected, "pre-epoch {name}");
         }
     }
 
@@ -861,6 +1057,194 @@ mod tests {
         let result = transform_literal(input.clone(), &Transform::Identity)
             .expect("identity should pass through");
         assert_eq!(result, input);
+    }
+
+    fn project_id_predicate(
+        transform: Transform,
+        source_type: PrimitiveType,
+        op: Operator,
+        value: ScalarValue,
+    ) -> Option<Expr> {
+        let source = StructField::new(1, "id", false, Type::Primitive(source_type), None);
+        let partition = PartitionField::new(1, 1000, "partition_id", transform);
+        let fields = [BoundPartitionField::new(&partition, &source)];
+        transform_predicate(
+            Expr::BinaryExpr(BinaryExpr::new(
+                Box::new(Expr::Column(Column::from_name("id"))),
+                op,
+                Box::new(Expr::Literal(value, None)),
+            )),
+            &fields,
+        )
+    }
+
+    #[test]
+    fn bucket_predicates_do_not_prune_manifests() {
+        for (source_type, value) in [
+            (PrimitiveType::Int, ScalarValue::Int32(Some(2))),
+            (PrimitiveType::Long, ScalarValue::Int64(Some(2))),
+            (PrimitiveType::Date, ScalarValue::Date32(Some(2))),
+            (
+                PrimitiveType::String,
+                ScalarValue::Utf8(Some("iceberg".to_owned())),
+            ),
+            (PrimitiveType::Time, ScalarValue::Time64Microsecond(Some(2))),
+        ] {
+            assert!(
+                project_id_predicate(Transform::Bucket(16), source_type, Operator::Eq, value)
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn promoted_int_bucket_skips_manifest_pruning() {
+        // A bucket[10] Int file containing 6, 9, 70 was grouped in signed
+        // bucket 9 but its legacy min/max metadata recorded bucket 2. Iceberg
+        // permits the source field to become Long under the same spec ID.
+        assert!(project_id_predicate(
+            Transform::Bucket(10),
+            PrimitiveType::Int,
+            Operator::Eq,
+            ScalarValue::Int32(Some(9)),
+        )
+        .is_none());
+        assert!(project_id_predicate(
+            Transform::Bucket(10),
+            PrimitiveType::Long,
+            Operator::Eq,
+            ScalarValue::Int64(Some(9)),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn monotone_partition_strict_bound_includes_boundary_partition() {
+        let projected = project_id_predicate(
+            Transform::Truncate(10),
+            PrimitiveType::Long,
+            Operator::Lt,
+            ScalarValue::Int64(Some(27)),
+        )
+        .expect("truncated range can prune");
+        let Expr::BinaryExpr(BinaryExpr { left, op, right }) = projected else {
+            panic!("expected comparison");
+        };
+        assert_eq!(op, Operator::LtEq);
+        assert_eq!(*left, Expr::Column(Column::from_name("partition_id")));
+        assert_eq!(*right, Expr::Literal(ScalarValue::Int64(Some(20)), None));
+
+        let projected = project_id_predicate(
+            Transform::Year,
+            PrimitiveType::Date,
+            Operator::Gt,
+            ScalarValue::Date32(Some(18_628)),
+        )
+        .expect("year range can prune");
+        let Expr::BinaryExpr(BinaryExpr { op, .. }) = projected else {
+            panic!("expected comparison");
+        };
+        assert_eq!(op, Operator::GtEq);
+        assert!(project_id_predicate(
+            Transform::Truncate(10),
+            PrimitiveType::Long,
+            Operator::Eq,
+            ScalarValue::Int64(Some(i64::MIN)),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn month_projection_accepts_old_and_new_partition_encodings() {
+        let projected = project_id_predicate(
+            Transform::Month,
+            PrimitiveType::Date,
+            Operator::Eq,
+            ScalarValue::Date32(Some(0)),
+        )
+        .expect("month equality can prune both encodings");
+        let Expr::BinaryExpr(BinaryExpr { left, op, right }) = projected else {
+            panic!("expected interval");
+        };
+        assert_eq!(op, Operator::And);
+        assert!(matches!(
+            *left,
+            Expr::BinaryExpr(BinaryExpr {
+                op: Operator::GtEq,
+                ..
+            })
+        ));
+        assert!(matches!(
+            *right,
+            Expr::BinaryExpr(BinaryExpr {
+                op: Operator::LtEq,
+                ..
+            })
+        ));
+
+        let source = StructField::new(1, "id", false, Type::Primitive(PrimitiveType::Date), None);
+        let partition = PartitionField::new(1, 1000, "partition_id", Transform::Month);
+        let fields = [BoundPartitionField::new(&partition, &source)];
+        let literal_left = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(Expr::Literal(ScalarValue::Date32(Some(0)), None)),
+            Operator::Lt,
+            Box::new(Expr::Column(Column::from_name("id"))),
+        ));
+        let projected = transform_predicate(literal_left, &fields).unwrap();
+        assert!(matches!(
+            projected,
+            Expr::BinaryExpr(BinaryExpr {
+                op: Operator::GtEq,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn negative_timestamp_day_and_hour_skip_legacy_unsafe_pruning() {
+        for transform in [Transform::Day, Transform::Hour] {
+            assert!(project_id_predicate(
+                transform,
+                PrimitiveType::Timestamp,
+                Operator::Eq,
+                ScalarValue::TimestampMicrosecond(Some(-1), None),
+            )
+            .is_none());
+        }
+        assert!(project_id_predicate(
+            Transform::Day,
+            PrimitiveType::Date,
+            Operator::Eq,
+            ScalarValue::Date32(Some(-1)),
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn unsupported_partition_predicates_do_not_affect_safe_conjunctions() {
+        let source = StructField::new(1, "id", false, Type::Primitive(PrimitiveType::Long), None);
+        let partition = PartitionField::new(1, 1000, "partition_id", Transform::Truncate(10));
+        let fields = [BoundPartitionField::new(&partition, &source)];
+        let compare = |op| {
+            Expr::BinaryExpr(BinaryExpr::new(
+                Box::new(Expr::Column(Column::from_name("id"))),
+                op,
+                Box::new(Expr::Literal(ScalarValue::Int64(Some(123)), None)),
+            ))
+        };
+        let safe = transform_predicate(compare(Operator::Eq), &fields).unwrap();
+        let conjunction = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(compare(Operator::Eq)),
+            Operator::And,
+            Box::new(compare(Operator::NotEq)),
+        ));
+        assert_eq!(transform_predicate(conjunction, &fields), Some(safe));
+        let disjunction = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(compare(Operator::Eq)),
+            Operator::Or,
+            Box::new(compare(Operator::NotEq)),
+        ));
+        assert!(transform_predicate(disjunction, &fields).is_none());
     }
 
     #[test]
