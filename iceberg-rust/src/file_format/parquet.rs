@@ -58,7 +58,10 @@ pub fn attested_sort_order_id(file_metadata: &ParquetMetaData) -> Option<i32> {
         .and_then(|value| value.parse::<i32>().ok())
 }
 
-/// Read datafile statistics from parquetfile
+/// Read data-file statistics from a Parquet file.
+/// Writers with exact partition values should use
+/// [`parquet_to_datafile_with_partition`]: Parquet bounds can be truncated and
+/// need not reproduce the file's actual partition key.
 #[instrument(name = "iceberg_rust::file_format::parquet::parquet_to_datafile", level = "debug", skip(file_metadata, schema, partition_fields, table_properties), fields(
     location = location,
     file_size = file_size,
@@ -74,13 +77,72 @@ pub fn parquet_to_datafile(
     equality_ids: Option<&[i32]>,
     table_properties: &HashMap<String, String>,
 ) -> Result<DataFile, Error> {
+    parquet_to_datafile_impl(
+        location,
+        file_size,
+        file_metadata,
+        schema,
+        partition_fields,
+        equality_ids,
+        table_properties,
+        None,
+    )
+}
+
+/// Build data-file metadata using the exact partition values used to group its rows.
+/// This avoids deriving partition values from potentially truncated Parquet bounds.
+#[allow(clippy::too_many_arguments)]
+pub fn parquet_to_datafile_with_partition(
+    location: &str,
+    file_size: u64,
+    file_metadata: &ParquetMetaData,
+    schema: &Schema,
+    partition_fields: &[BoundPartitionField<'_>],
+    equality_ids: Option<&[i32]>,
+    table_properties: &HashMap<String, String>,
+    partition_values: &[Value],
+) -> Result<DataFile, Error> {
+    parquet_to_datafile_impl(
+        location,
+        file_size,
+        file_metadata,
+        schema,
+        partition_fields,
+        equality_ids,
+        table_properties,
+        Some(partition_values),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn parquet_to_datafile_impl(
+    location: &str,
+    file_size: u64,
+    file_metadata: &ParquetMetaData,
+    schema: &Schema,
+    partition_fields: &[BoundPartitionField<'_>],
+    equality_ids: Option<&[i32]>,
+    table_properties: &HashMap<String, String>,
+    partition_values: Option<&[Value]>,
+) -> Result<DataFile, Error> {
     let write_distinct_counts = table_properties
         .get(WRITE_METADATA_METRICS_DISTINCT_COUNTS_ENABLED)
         .is_some_and(|x| x == "true");
-    let mut partition = partition_fields
-        .iter()
-        .map(|field| Ok((field.name().to_owned(), None)))
-        .collect::<Result<Struct, Error>>()?;
+    let mut partition = if let Some(values) = partition_values {
+        if values.len() != partition_fields.len() {
+            return Err(Error::InvalidFormat("Partition value count".to_owned()));
+        }
+        partition_fields
+            .iter()
+            .zip(values)
+            .map(|(field, value)| (field.name().to_owned(), Some(value.clone())))
+            .collect::<Struct>()
+    } else {
+        partition_fields
+            .iter()
+            .map(|field| (field.name().to_owned(), None))
+            .collect::<Struct>()
+    };
     let partition_fields = partition_fields
         .iter()
         .map(|field| {

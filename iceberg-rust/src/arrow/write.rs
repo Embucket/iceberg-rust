@@ -82,8 +82,8 @@ use uuid::Uuid;
 use crate::{
     error::Error,
     file_format::parquet::{
-        parquet_to_datafile, ICEBERG_ESTIMATE_INT64_DISTINCT_COUNT_META_KEY,
-        ICEBERG_SORT_ORDER_ID_META_KEY,
+        parquet_to_datafile, parquet_to_datafile_with_partition,
+        ICEBERG_ESTIMATE_INT64_DISTINCT_COUNT_META_KEY, ICEBERG_SORT_ORDER_ID_META_KEY,
     },
     object_store::Bucket,
     table::Table,
@@ -312,6 +312,7 @@ async fn store_parquet_partitioned(
             &arrow_schema,
             partition_fields,
             partition_path,
+            None,
             batches,
             object_store.clone(),
             equality_ids,
@@ -378,6 +379,7 @@ async fn store_parquet_partitioned(
                                 &arrow_schema,
                                 &partition_fields,
                                 partition_path,
+                                Some(partition_values),
                                 reciever,
                                 object_store.clone(),
                                 equality_ids.as_deref(),
@@ -442,6 +444,7 @@ async fn write_parquet_files(
     arrow_schema: &ArrowSchema,
     partition_fields: &[BoundPartitionField<'_>],
     partition_path: Option<String>,
+    partition_values: Option<Vec<Value>>,
     batches: impl Stream<Item = Result<RecordBatch, ArrowError>> + Send,
     object_store: Arc<dyn ObjectStore>,
     equality_ids: Option<&[i32]>,
@@ -543,6 +546,7 @@ async fn write_parquet_files(
         .then(|writer| {
             let object_store = object_store.clone();
             let bucket = bucket.to_string();
+            let partition_values = partition_values.clone();
             async move {
                 let metadata = writer.1;
                 let size = object_store
@@ -550,15 +554,28 @@ async fn write_parquet_files(
                     .await
                     .map_err(|err| ArrowError::from_external_error(err.into()))?
                     .size;
-                Ok(parquet_to_datafile(
-                    &(bucket + &writer.0),
-                    size,
-                    &metadata,
-                    schema,
-                    partition_fields,
-                    equality_ids,
-                    table_properties,
-                )?)
+                let location = bucket + &writer.0;
+                Ok(match partition_values {
+                    Some(values) => parquet_to_datafile_with_partition(
+                        &location,
+                        size,
+                        &metadata,
+                        schema,
+                        partition_fields,
+                        equality_ids,
+                        table_properties,
+                        &values,
+                    )?,
+                    None => parquet_to_datafile(
+                        &location,
+                        size,
+                        &metadata,
+                        schema,
+                        partition_fields,
+                        equality_ids,
+                        table_properties,
+                    )?,
+                })
             }
         })
         .try_collect::<Vec<_>>()

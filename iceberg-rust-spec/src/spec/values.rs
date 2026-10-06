@@ -396,9 +396,18 @@ impl Value {
         match transform {
             Transform::Identity => Ok(self.clone()),
             Transform::Bucket(n) => {
-                let mut bytes = Cursor::new(<Value as Into<ByteBuf>>::into(self.clone()));
-                let hash = murmur3::murmur3_32(&mut bytes, 0).unwrap();
-                Ok(Value::Int((hash % n) as i32))
+                if *n == 0 || *n > i32::MAX as u32 {
+                    return Err(Error::InvalidFormat("bucket width".to_owned()));
+                }
+                let bytes = match self {
+                    // Iceberg hashes int as long so promotion does not change the bucket.
+                    Value::Int(value) => ByteBuf::from((*value as i64).to_le_bytes()),
+                    // Apache Iceberg Java also hashes date as long, despite Appendix B.
+                    Value::Date(value) => ByteBuf::from((*value as i64).to_le_bytes()),
+                    _ => <Value as Into<ByteBuf>>::into(self.clone()),
+                };
+                let hash = murmur3::murmur3_32(&mut Cursor::new(bytes), 0)?;
+                Ok(Value::Int(((hash & i32::MAX as u32) % n) as i32))
             }
             Transform::Truncate(w) => match self {
                 Value::Int(i) => Ok(Value::Int(i - i.rem_euclid(*w as i32))),
@@ -966,29 +975,18 @@ impl From<&Value> for JsonValue {
 mod datetime {
     #[inline]
     pub(crate) fn date_to_years(date: &NaiveDate) -> i32 {
-        date.years_since(
-            // This is always the same and shouldn't fail
-            NaiveDate::from_ymd_opt(YEARS_BEFORE_UNIX_EPOCH, 1, 1).unwrap(),
-        )
-        .unwrap() as i32
+        date.year() - YEARS_BEFORE_UNIX_EPOCH
     }
 
     #[inline]
     pub(crate) fn date_to_months(date: &NaiveDate) -> i32 {
-        let years = date
-            .years_since(
-                // This is always the same and shouldn't fail
-                NaiveDate::from_ymd_opt(YEARS_BEFORE_UNIX_EPOCH, 1, 1).unwrap(),
-            )
-            .unwrap() as i32;
-        let months = date.month();
-        years * 12 + months as i32
+        (date.year() - YEARS_BEFORE_UNIX_EPOCH) * 12 + date.month0() as i32
     }
 
     #[inline]
     pub(crate) fn datetime_to_months(date: &NaiveDateTime) -> i32 {
         let years = date.year() - YEARS_BEFORE_UNIX_EPOCH;
-        let months = date.month();
+        let months = date.month0();
         years * 12 + months as i32
     }
 
@@ -1039,20 +1037,12 @@ mod datetime {
 
     #[inline]
     pub(crate) fn datetime_to_days(time: &NaiveDateTime) -> i64 {
-        time.signed_duration_since(
-            // This is always the same and shouldn't fail
-            DateTime::from_timestamp_micros(0).unwrap().naive_utc(),
-        )
-        .num_days()
+        time.and_utc().timestamp_micros().div_euclid(86_400_000_000)
     }
 
     #[inline]
     pub(crate) fn datetime_to_hours(time: &NaiveDateTime) -> i64 {
-        time.signed_duration_since(
-            // This is always the same and shouldn't fail
-            DateTime::from_timestamp_micros(0).unwrap().naive_utc(),
-        )
-        .num_hours()
+        time.and_utc().timestamp_micros().div_euclid(3_600_000_000)
     }
 
     use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
@@ -1582,6 +1572,30 @@ mod tests {
         let value = Value::String("test".to_string());
         let result = value.transform(&Transform::Bucket(10)).unwrap();
         assert!(matches!(result, Value::Int(_)));
+
+        assert_eq!(
+            Value::Int(34).transform(&Transform::Bucket(1000)).unwrap(),
+            Value::Int(379)
+        );
+        assert_eq!(
+            Value::LongInt(34)
+                .transform(&Transform::Bucket(1000))
+                .unwrap(),
+            Value::Int(379)
+        );
+        assert_eq!(
+            Value::Date(17_486)
+                .transform(&Transform::Bucket(1000))
+                .unwrap(),
+            Value::Int(226)
+        );
+        assert_eq!(
+            Value::Time(81_068_000_000)
+                .transform(&Transform::Bucket(1000))
+                .unwrap(),
+            Value::Int(659)
+        );
+        assert!(Value::Int(1).transform(&Transform::Bucket(0)).is_err());
     }
 
     #[test]
@@ -1646,30 +1660,30 @@ mod tests {
     fn test_transform_month_date() {
         let value = Value::Date(19478);
         let result = value.transform(&Transform::Month).unwrap();
-        assert_eq!(result, Value::Int(641)); // 0-based month index
+        assert_eq!(result, Value::Int(640));
 
         let value = Value::Date(19523);
         let result = value.transform(&Transform::Month).unwrap();
-        assert_eq!(result, Value::Int(642)); // 0-based month index
+        assert_eq!(result, Value::Int(641));
 
         let value = Value::Date(19723);
         let result = value.transform(&Transform::Month).unwrap();
-        assert_eq!(result, Value::Int(649)); // 0-based month index
+        assert_eq!(result, Value::Int(648));
     }
 
     #[test]
     fn test_transform_month_timestamp() {
         let value = Value::Timestamp(1682937000000000);
         let result = value.transform(&Transform::Month).unwrap();
-        assert_eq!(result, Value::Int(641)); // 0-based month index
+        assert_eq!(result, Value::Int(640));
 
         let value = Value::Timestamp(1686840330000000);
         let result = value.transform(&Transform::Month).unwrap();
-        assert_eq!(result, Value::Int(642)); // 0-based month index
+        assert_eq!(result, Value::Int(641));
 
         let value = Value::Timestamp(1704067200000000);
         let result = value.transform(&Transform::Month).unwrap();
-        assert_eq!(result, Value::Int(649)); // 0-based month index
+        assert_eq!(result, Value::Int(648));
     }
 
     #[test]
@@ -1737,6 +1751,34 @@ mod tests {
         let value = Value::Timestamp(1704067200000000);
         let result = value.transform(&Transform::Hour).unwrap();
         assert_eq!(result, Value::Int(473352)); // Assuming the timestamp is at 12:00 UTC
+    }
+
+    #[test]
+    fn temporal_transforms_floor_before_unix_epoch() {
+        assert_eq!(
+            Value::Date(-1).transform(&Transform::Year).unwrap(),
+            Value::Int(-1)
+        );
+        assert_eq!(
+            Value::Date(-1).transform(&Transform::Month).unwrap(),
+            Value::Int(-1)
+        );
+        assert_eq!(
+            Value::Date(0).transform(&Transform::Month).unwrap(),
+            Value::Int(0)
+        );
+        assert_eq!(
+            Value::Timestamp(-1).transform(&Transform::Day).unwrap(),
+            Value::Int(-1)
+        );
+        assert_eq!(
+            Value::Timestamp(-1).transform(&Transform::Hour).unwrap(),
+            Value::Int(-1)
+        );
+        assert_eq!(
+            Value::Timestamp(0).transform(&Transform::Month).unwrap(),
+            Value::Int(0)
+        );
     }
 
     #[test]
