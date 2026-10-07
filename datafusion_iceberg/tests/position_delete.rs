@@ -1,4 +1,8 @@
-use std::{collections::HashMap, fs::File, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    fs::File,
+    sync::Arc,
+};
 
 use datafusion::{
     arrow::{
@@ -315,6 +319,41 @@ async fn applies_v2_position_deletes() {
     else {
         panic!("orders should be an Iceberg table");
     };
+    let excluded_paths = data_files
+        .iter()
+        .filter(|(_, entry)| {
+            entry.status() != &Status::Deleted && entry.data_file().content() == &Content::Data
+        })
+        .map(|(_, entry)| entry.data_file().file_path().clone())
+        .collect::<HashSet<_>>();
+    let excluded_config = DataFusionTableConfigBuilder::default()
+        .enable_data_file_path_column(false)
+        .enable_data_file_row_position_column(false)
+        .enable_manifest_file_path_column(false)
+        .excluded_data_file_paths(Arc::new(excluded_paths))
+        .build()
+        .unwrap();
+    let excluded_ctx = SessionContext::new();
+    excluded_ctx
+        .register_table(
+            "orders_excluded",
+            Arc::new(DataFusionTable::new_with_config(
+                Tabular::Table(table_with_manifest_metadata.clone()),
+                None,
+                None,
+                None,
+                Some(excluded_config),
+            )),
+        )
+        .unwrap();
+    for query in [
+        "SELECT id FROM orders_excluded",
+        "SELECT id FROM orders_excluded WHERE id >= 1",
+    ] {
+        let batches = run_query(query, &excluded_ctx).await;
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
+    }
+
     let metadata_config = DataFusionTableConfigBuilder::default()
         .enable_data_file_path_column(false)
         .enable_data_file_row_position_column(false)
@@ -473,6 +512,33 @@ async fn applies_v2_position_deletes() {
         ["+----+", "| id |", "+----+", "| 1  |", "| 4  |", "| 8  |", "+----+",],
         &batches
     );
+
+    let Tabular::Table(partial_table) = catalog.clone().load_tabular(&identifier).await.unwrap()
+    else {
+        panic!("orders should be an Iceberg table");
+    };
+    let partial_config = DataFusionTableConfigBuilder::default()
+        .enable_data_file_path_column(false)
+        .enable_data_file_row_position_column(false)
+        .enable_manifest_file_path_column(false)
+        .excluded_data_file_paths(Arc::new(HashSet::from([data_file_path])))
+        .build()
+        .unwrap();
+    let partial_ctx = SessionContext::new();
+    partial_ctx
+        .register_table(
+            "orders_partial",
+            Arc::new(DataFusionTable::new_with_config(
+                Tabular::Table(partial_table),
+                None,
+                None,
+                None,
+                Some(partial_config),
+            )),
+        )
+        .unwrap();
+    let batches = run_query("SELECT id FROM orders_partial ORDER BY id", &partial_ctx).await;
+    assert_batches_eq!(["+----+", "| id |", "+----+", "| 8  |", "+----+"], &batches);
 }
 
 #[tokio::test]
@@ -564,4 +630,27 @@ async fn applies_v3_puffin_deletion_vector() {
         ["+----+", "| id |", "+----+", "| 10 |", "| 30 |", "| 50 |", "+----+",],
         &batches
     );
+
+    let config = DataFusionTableConfigBuilder::default()
+        .enable_data_file_path_column(false)
+        .enable_data_file_row_position_column(false)
+        .enable_manifest_file_path_column(false)
+        .excluded_data_file_paths(Arc::new(HashSet::from([data_file_path])))
+        .build()
+        .unwrap();
+    let excluded_ctx = SessionContext::new();
+    excluded_ctx
+        .register_table(
+            "orders_v3_excluded",
+            Arc::new(DataFusionTable::new_with_config(
+                Tabular::Table(table),
+                None,
+                None,
+                None,
+                Some(config),
+            )),
+        )
+        .unwrap();
+    let batches = run_query("SELECT id FROM orders_v3_excluded", &excluded_ctx).await;
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
 }
