@@ -286,9 +286,9 @@ impl Operation {
                 let snapshot = snapshot_builder.build()?;
 
                 Ok((
-                    old_snapshot.map(|x| TableRequirement::AssertRefSnapshotId {
+                    Some(TableRequirement::AssertRefSnapshotId {
                         r#ref: branch.clone().unwrap_or("main".to_owned()),
-                        snapshot_id: *x.snapshot_id(),
+                        snapshot_id: old_snapshot.map(|snapshot| *snapshot.snapshot_id()),
                     }),
                     vec![
                         TableUpdate::AddSnapshot { snapshot },
@@ -465,9 +465,9 @@ impl Operation {
                 let snapshot = snapshot_builder.build()?;
 
                 Ok((
-                    old_snapshot.map(|x| TableRequirement::AssertRefSnapshotId {
+                    Some(TableRequirement::AssertRefSnapshotId {
                         r#ref: branch.clone().unwrap_or("main".to_owned()),
-                        snapshot_id: *x.snapshot_id(),
+                        snapshot_id: old_snapshot.map(|snapshot| *snapshot.snapshot_id()),
                     }),
                     vec![
                         TableUpdate::AddSnapshot { snapshot },
@@ -634,9 +634,9 @@ impl Operation {
                 let snapshot = snapshot_builder.build()?;
 
                 Ok((
-                    old_snapshot.map(|x| TableRequirement::AssertRefSnapshotId {
+                    Some(TableRequirement::AssertRefSnapshotId {
                         r#ref: branch.clone().unwrap_or("main".to_owned()),
-                        snapshot_id: *x.snapshot_id(),
+                        snapshot_id: old_snapshot.map(|snapshot| *snapshot.snapshot_id()),
                     }),
                     vec![
                         TableUpdate::AddSnapshot { snapshot },
@@ -855,7 +855,7 @@ impl Operation {
                 Ok((
                     Some(TableRequirement::AssertRefSnapshotId {
                         r#ref: branch.clone().unwrap_or("main".to_owned()),
-                        snapshot_id: *old_snapshot.snapshot_id(),
+                        snapshot_id: Some(*old_snapshot.snapshot_id()),
                     }),
                     vec![
                         TableUpdate::AddSnapshot { snapshot },
@@ -887,13 +887,13 @@ impl Operation {
                     key, value
                 );
                 Ok((
-                    table_metadata
-                        .refs
-                        .get(&key)
-                        .map(|x| TableRequirement::AssertRefSnapshotId {
-                            r#ref: key.clone(),
-                            snapshot_id: x.snapshot_id,
-                        }),
+                    Some(TableRequirement::AssertRefSnapshotId {
+                        r#ref: key.clone(),
+                        snapshot_id: table_metadata
+                            .refs
+                            .get(&key)
+                            .map(|reference| reference.snapshot_id),
+                    }),
                     vec![TableUpdate::SetSnapshotRef {
                         ref_name: key,
                         snapshot_reference: value,
@@ -1448,6 +1448,75 @@ mod tests {
             )
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_first_appends_require_an_absent_main_ref() {
+        let metadata = sample_metadata(&[], None, &[]);
+        let store = Arc::new(InMemory::new());
+        let first = Operation::Append {
+            branch: None,
+            data_files: vec![data_file("s3://tests/table/data/first.parquet", 1)],
+            delete_files: Vec::new(),
+            additional_summary: None,
+        };
+        let second = Operation::Append {
+            branch: None,
+            data_files: vec![data_file("s3://tests/table/data/second.parquet", 1)],
+            delete_files: Vec::new(),
+            additional_summary: None,
+        };
+        let (first_requirement, first_updates) =
+            first.execute(&metadata, store.clone()).await.unwrap();
+        let (second_requirement, _) = second.execute(&metadata, store).await.unwrap();
+        let absent_main = TableRequirement::AssertRefSnapshotId {
+            r#ref: "main".to_owned(),
+            snapshot_id: None,
+        };
+        assert_eq!(first_requirement, Some(absent_main.clone()));
+        assert_eq!(second_requirement, Some(absent_main.clone()));
+        assert!(crate::catalog::commit::check_table_requirements(
+            std::slice::from_ref(&absent_main),
+            &metadata
+        ));
+
+        let mut committed = metadata;
+        crate::catalog::commit::apply_table_updates(&mut committed, first_updates).unwrap();
+        assert!(!crate::catalog::commit::check_table_requirements(
+            std::slice::from_ref(&absent_main),
+            &committed
+        ));
+        assert!(serde_json::to_value(&absent_main).unwrap()["snapshot-id"].is_null());
+        let decoded: TableRequirement = serde_json::from_value(serde_json::json!({
+            "type": "assert-ref-snapshot-id",
+            "ref": "main"
+        }))
+        .unwrap();
+        assert_eq!(decoded, absent_main);
+    }
+
+    #[tokio::test]
+    async fn first_append_after_empty_v1_metadata_round_trip() {
+        let mut metadata = sample_metadata(&[], None, &[]);
+        metadata.format_version = FormatVersion::V1;
+        let encoded = serde_json::to_string(&metadata).unwrap();
+        let mut loaded: TableMetadata = serde_json::from_str(&encoded).unwrap();
+        assert!(loaded.refs.is_empty());
+
+        let store = Arc::new(InMemory::new());
+        let append = Operation::Append {
+            branch: None,
+            data_files: vec![data_file("s3://tests/table/data/first-v1.parquet", 1)],
+            delete_files: Vec::new(),
+            additional_summary: None,
+        };
+        let (requirement, updates) = append.execute(&loaded, store).await.unwrap();
+        assert!(crate::catalog::commit::check_table_requirements(
+            std::slice::from_ref(&requirement.unwrap()),
+            &loaded
+        ));
+        crate::catalog::commit::apply_table_updates(&mut loaded, updates).unwrap();
+        assert!(loaded.refs.contains_key("main"));
     }
 
     #[tokio::test]
