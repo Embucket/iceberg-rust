@@ -303,6 +303,10 @@ pub struct DataFusionTableConfig {
     /// Scan only data files added or deleted by the selected snapshot range.
     #[builder(default)]
     scan_changed_data_files: bool,
+    /// Omit these data files at scan planning time, without reading their Parquet bytes.
+    /// Intended for session-local overlays that replace uncommitted files.
+    #[builder(default)]
+    excluded_data_file_paths: Arc<HashSet<String>>,
 }
 
 impl DataFusionTable {
@@ -679,6 +683,7 @@ async fn table_scan(
     let scan_changed_data_files = config
         .map(|x| x.scan_changed_data_files)
         .unwrap_or_default();
+    let excluded_data_file_paths = config.map(|x| x.excluded_data_file_paths.as_ref());
 
     let partition_fields = &snapshot_range
         .1
@@ -829,7 +834,13 @@ async fn table_scan(
                     .await
                     .map_err(DataFusionIcebergError::from)?
             };
-        let data_files = prepare_changed_data_files(data_files, scan_changed_data_files);
+        let mut data_files = prepare_changed_data_files(data_files, scan_changed_data_files);
+        if let Some(excluded) = excluded_data_file_paths.filter(|paths| !paths.is_empty()) {
+            data_files.retain(|(_, entry)| {
+                entry.data_file().content() != &Content::Data
+                    || !excluded.contains(entry.data_file().file_path())
+            });
+        }
 
         let pruning_predicate = PruningPredicateBuilder::new()
             .with_file_schema(arrow_schema.clone())
@@ -867,7 +878,13 @@ async fn table_scan(
             .try_collect()
             .await
             .map_err(DataFusionIcebergError::from)?;
-        let data_files = prepare_changed_data_files(data_files, scan_changed_data_files);
+        let mut data_files = prepare_changed_data_files(data_files, scan_changed_data_files);
+        if let Some(excluded) = excluded_data_file_paths.filter(|paths| !paths.is_empty()) {
+            data_files.retain(|(_, entry)| {
+                entry.data_file().content() != &Content::Data
+                    || !excluded.contains(entry.data_file().file_path())
+            });
+        }
 
         let mut statistics = statistics_from_datafiles(&schema, &data_files);
         for _ in 0..usize::from(enable_row_id_column)
@@ -948,6 +965,11 @@ async fn table_scan(
                 }
             }
         });
+    }
+
+    if excluded_data_file_paths.is_some_and(|paths| !paths.is_empty()) {
+        // Delete files cannot affect a partition with no retained data files.
+        delete_file_groups.retain(|partition, _| data_file_groups.contains_key(partition));
     }
 
     let has_position_deletes = delete_file_groups
@@ -2858,6 +2880,157 @@ mod tests {
             count_caching_parquet_sources(plan.as_ref()) > 0,
             "expected at least one parquet scan node in the plan"
         );
+    }
+
+    #[tokio::test]
+    async fn test_scan_excludes_only_selected_data_files() {
+        let catalog: Arc<dyn Catalog> = Arc::new(
+            SqlCatalog::new("sqlite://", "test", ObjectStoreBuilder::memory())
+                .await
+                .unwrap(),
+        );
+        let schema = Schema::builder()
+            .with_struct_field(StructField {
+                id: 1,
+                name: "id".to_string(),
+                required: true,
+                field_type: Type::Primitive(PrimitiveType::Long),
+                doc: None,
+                initial_default: None,
+                write_default: None,
+            })
+            .build()
+            .unwrap();
+        let table = Table::builder()
+            .with_name("numbers")
+            .with_location("memory:///test/numbers")
+            .with_schema(schema)
+            .build(&["test".to_owned()], catalog)
+            .await
+            .unwrap();
+        let config = super::DataFusionTableConfigBuilder::default()
+            .enable_data_file_path_column(true)
+            .enable_data_file_row_position_column(false)
+            .enable_manifest_file_path_column(false)
+            .build()
+            .unwrap();
+        let table = Arc::new(DataFusionTable::new_with_config(
+            Tabular::Table(table),
+            None,
+            None,
+            None,
+            Some(config),
+        ));
+        let ctx = SessionContext::new();
+        ctx.register_table("numbers", table.clone()).unwrap();
+        for id in [1, 2] {
+            ctx.sql(&format!("INSERT INTO numbers (id) VALUES ({id})"))
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+        }
+
+        let rows = ctx
+            .sql("SELECT id, __data_file_path FROM numbers ORDER BY id")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let file_paths: Vec<String> = rows
+            .iter()
+            .flat_map(|batch| {
+                let paths = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                (0..batch.num_rows()).map(|row| paths.value(row).to_owned())
+            })
+            .collect();
+        assert_eq!(file_paths.len(), 2);
+        assert_ne!(file_paths[0], file_paths[1]);
+
+        let config = super::DataFusionTableConfigBuilder::default()
+            .enable_data_file_path_column(false)
+            .enable_data_file_row_position_column(false)
+            .enable_manifest_file_path_column(false)
+            .excluded_data_file_paths(Arc::new(std::collections::HashSet::from([
+                file_paths[0].clone()
+            ])))
+            .build()
+            .unwrap();
+        let tabular = table.tabular.read().unwrap().clone();
+        let filtered = Arc::new(DataFusionTable::new_with_config(
+            tabular,
+            None,
+            None,
+            None,
+            Some(config),
+        ));
+        assert_eq!(filtered.schema().fields().len(), 1);
+        ctx.deregister_table("numbers").unwrap();
+        ctx.register_table("numbers", filtered.clone()).unwrap();
+
+        let rows = ctx
+            .sql("SELECT id FROM numbers")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(rows.iter().map(|batch| batch.num_rows()).sum::<usize>(), 1);
+        let row = rows.iter().find(|batch| batch.num_rows() > 0).unwrap();
+        assert_eq!(
+            row.column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            2
+        );
+        let plan = filtered.scan(&ctx.state(), None, &[], None).await.unwrap();
+        fn scanned_file_count(plan: &dyn ExecutionPlan) -> usize {
+            let current = plan
+                .downcast_ref::<DataSourceExec>()
+                .and_then(|exec| exec.data_source().downcast_ref::<FileScanConfig>())
+                .map(|config| {
+                    config
+                        .file_groups
+                        .iter()
+                        .map(|group| group.files().len())
+                        .sum::<usize>()
+                })
+                .unwrap_or_default();
+            current
+                + plan
+                    .children()
+                    .iter()
+                    .map(|child| scanned_file_count(child.as_ref()))
+                    .sum::<usize>()
+        }
+        assert_eq!(scanned_file_count(plan.as_ref()), 1);
+
+        let rows = ctx
+            .sql("SELECT id FROM numbers WHERE id >= 1")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(rows.iter().map(|batch| batch.num_rows()).sum::<usize>(), 1);
+        let filtered_plan = filtered
+            .scan(
+                &ctx.state(),
+                None,
+                &[datafusion::prelude::col("id").gt_eq(datafusion::prelude::lit(1_i64))],
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(scanned_file_count(filtered_plan.as_ref()), 1);
     }
 
     #[tokio::test]

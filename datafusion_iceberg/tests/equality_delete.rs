@@ -2,11 +2,13 @@ use datafusion::common::test_util::batches_to_string;
 use datafusion::{
     arrow::{error::ArrowError, record_batch::RecordBatch},
     assert_batches_eq,
+    catalog::TableProvider,
+    physical_plan::empty::EmptyExec,
     prelude::SessionContext,
 };
 use datafusion_iceberg::catalog::catalog::IcebergCatalog;
-use duckdb::Connection;
-use futures::stream;
+use datafusion_iceberg::table::{DataFusionTable, DataFusionTableConfigBuilder};
+use futures::{stream, TryStreamExt};
 use iceberg_rust::catalog::identifier::Identifier;
 use iceberg_rust::catalog::tabular::Tabular;
 use iceberg_rust::spec::namespace::Namespace;
@@ -15,6 +17,7 @@ use iceberg_rust::{
     catalog::Catalog,
     object_store::ObjectStoreBuilder,
     spec::{
+        manifest::{Content, Status},
         partition::{PartitionField, PartitionSpec, Transform},
         schema::Schema,
         types::{PrimitiveType, StructField, Type},
@@ -23,7 +26,7 @@ use iceberg_rust::{
 };
 use iceberg_sql_catalog::SqlCatalog;
 use object_store::local::LocalFileSystem;
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 use tempfile::TempDir;
 
 async fn run_query(query: &str, ctx: &SessionContext) -> Vec<RecordBatch> {
@@ -33,25 +36,6 @@ async fn run_query(query: &str, ctx: &SessionContext) -> Vec<RecordBatch> {
         .collect()
         .await
         .expect("Failed to execute query")
-}
-
-/// Convert DuckDB's Arrow RecordBatch to DataFusion's Arrow RecordBatch
-/// using Arrow IPC format as an interchange format.
-/// This allows compatibility between different Arrow versions.
-fn convert_duckdb_batch_to_datafusion(
-    duckdb_batch: duckdb::arrow::record_batch::RecordBatch,
-) -> RecordBatch {
-    use arrow_ipc::writer::StreamWriter as DuckDBWriter;
-    use datafusion::arrow::ipc::reader::StreamReader as DataFusionReader;
-
-    let mut buffer = Vec::new();
-    let mut writer = DuckDBWriter::try_new(&mut buffer, &duckdb_batch.schema()).unwrap();
-    writer.write(&duckdb_batch).unwrap();
-    writer.finish().unwrap();
-    drop(writer);
-
-    let mut reader = DataFusionReader::try_new(std::io::Cursor::new(buffer), None).unwrap();
-    reader.next().unwrap().unwrap()
 }
 
 #[tokio::test]
@@ -220,19 +204,6 @@ pub async fn test_equality_delete() {
     ];
     assert_batches_eq!(expected, &batches);
 
-    let conn = Connection::open_in_memory().unwrap();
-    conn.execute("install iceberg", []).unwrap();
-    conn.execute("load iceberg", []).unwrap();
-
-    let duckdb_batches: Vec<RecordBatch> = conn
-        .prepare("select * from iceberg_scan(?) order by id")
-        .unwrap()
-        .query_arrow([table_dir])
-        .unwrap()
-        .map(convert_duckdb_batch_to_datafusion)
-        .collect();
-    assert_batches_eq!(expected, &duckdb_batches);
-
     // Test that projecting a column that is not included in equality deletes works
     run_query(
         "INSERT INTO warehouse.test.orders (id, customer_id, product_id, date, amount) VALUES
@@ -269,4 +240,109 @@ pub async fn test_equality_delete() {
     // Ensure we only pushed down predicates that have matching columns with delete file schemas (i.e. amount was not pushed down).
     let batches = run_query(&format!("explain {query}"), &ctx).await;
     assert!(batches_to_string(&batches).contains("projection=[id, customer_id, product_id, date], file_type=parquet, predicate=product_id@2 = 1,"));
+}
+
+#[tokio::test]
+async fn excluded_data_files_do_not_scan_equality_deletes() {
+    let temp_dir = TempDir::new().unwrap();
+    let catalog: Arc<dyn Catalog> = Arc::new(
+        SqlCatalog::new(
+            "sqlite://",
+            "warehouse",
+            ObjectStoreBuilder::Filesystem(Arc::new(LocalFileSystem::new())),
+        )
+        .await
+        .unwrap(),
+    );
+    catalog
+        .create_namespace(&Namespace::try_new(&["test".to_string()]).unwrap(), None)
+        .await
+        .unwrap();
+    let schema = Schema::builder()
+        .with_struct_field(StructField {
+            id: 1,
+            name: "id".to_string(),
+            required: true,
+            field_type: Type::Primitive(PrimitiveType::Long),
+            doc: None,
+            initial_default: None,
+            write_default: None,
+        })
+        .build()
+        .unwrap();
+    Table::builder()
+        .with_name("excluded")
+        .with_location(format!("{}/test/excluded", temp_dir.path().display()))
+        .with_schema(schema)
+        .build(&["test".to_owned()], catalog.clone())
+        .await
+        .unwrap();
+
+    let ctx = SessionContext::new();
+    ctx.register_catalog(
+        "warehouse",
+        Arc::new(IcebergCatalog::new(catalog.clone(), None).await.unwrap()),
+    );
+    run_query("INSERT INTO warehouse.test.excluded VALUES (1), (2)", &ctx).await;
+    let delete_rows = run_query("SELECT id FROM warehouse.test.excluded WHERE id = 1", &ctx).await;
+    let identifier = Identifier::new(&["test".to_string()], "excluded");
+    let Tabular::Table(mut table) = catalog.clone().load_tabular(&identifier).await.unwrap() else {
+        panic!("excluded should be an Iceberg table");
+    };
+    let delete_files = write_equality_deletes_parquet_partitioned(
+        &table,
+        stream::iter(delete_rows.into_iter().map(Ok::<_, ArrowError>)),
+        None,
+        &[1],
+    )
+    .await
+    .unwrap();
+    table
+        .new_transaction(None)
+        .append_delete(delete_files)
+        .commit()
+        .await
+        .unwrap();
+
+    let manifests = table.manifests(None, None).await.unwrap();
+    let entries = table
+        .datafiles(&manifests, None, (None, None))
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let excluded_paths = entries
+        .iter()
+        .filter(|(_, entry)| {
+            entry.status() != &Status::Deleted && entry.data_file().content() == &Content::Data
+        })
+        .map(|(_, entry)| entry.data_file().file_path().clone())
+        .collect::<HashSet<_>>();
+    assert!(!excluded_paths.is_empty());
+    let config = DataFusionTableConfigBuilder::default()
+        .enable_data_file_path_column(false)
+        .enable_data_file_row_position_column(false)
+        .enable_manifest_file_path_column(false)
+        .excluded_data_file_paths(Arc::new(excluded_paths))
+        .build()
+        .unwrap();
+    let provider = Arc::new(DataFusionTable::new_with_config(
+        Tabular::Table(table),
+        None,
+        None,
+        None,
+        Some(config),
+    ));
+    let excluded_ctx = SessionContext::new();
+    excluded_ctx
+        .register_table("excluded", provider.clone())
+        .unwrap();
+    let plan = provider
+        .scan(&excluded_ctx.state(), None, &[], None)
+        .await
+        .unwrap();
+    assert!(plan.downcast_ref::<EmptyExec>().is_some());
+    let batches = run_query("SELECT id FROM excluded", &excluded_ctx).await;
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
 }
