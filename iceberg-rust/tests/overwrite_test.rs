@@ -9,6 +9,7 @@ use futures::StreamExt;
 
 use iceberg_rust::arrow::read::read;
 use iceberg_rust::arrow::write::write_parquet_partitioned;
+use iceberg_rust::catalog::tabular::Tabular;
 use iceberg_rust::catalog::Catalog;
 use iceberg_rust::error::Error;
 use iceberg_rust::object_store::ObjectStoreBuilder;
@@ -16,9 +17,110 @@ use iceberg_rust::table::Table;
 use iceberg_rust_spec::spec::manifest::Status;
 use iceberg_rust_spec::spec::partition::{PartitionField, PartitionSpec, Transform};
 use iceberg_rust_spec::spec::schema::Schema;
+use iceberg_rust_spec::spec::table_metadata::FormatVersion;
 use iceberg_rust_spec::spec::types::{PrimitiveType, StructField, Type};
 use iceberg_rust_spec::spec::values::Value;
 use iceberg_sql_catalog::SqlCatalog;
+
+#[tokio::test]
+async fn stale_table_transaction_cannot_modify_recreated_table() {
+    let catalog: Arc<dyn Catalog> = Arc::new(
+        SqlCatalog::new("sqlite://", "test", ObjectStoreBuilder::memory())
+            .await
+            .unwrap(),
+    );
+    let schema = Schema::builder()
+        .with_struct_field(StructField::new(
+            1,
+            "id",
+            true,
+            Type::Primitive(PrimitiveType::Long),
+            None,
+        ))
+        .build()
+        .unwrap();
+    let mut stale = Table::builder()
+        .with_name("recreated")
+        .with_location("/test/recreated")
+        .with_schema(schema.clone())
+        .build(&["test".to_owned()], catalog.clone())
+        .await
+        .unwrap();
+    catalog.drop_table(stale.identifier()).await.unwrap();
+    let replacement = Table::builder()
+        .with_name("recreated")
+        .with_location("/test/recreated")
+        .with_schema(schema)
+        .build(&["test".to_owned()], catalog.clone())
+        .await
+        .unwrap();
+    assert_ne!(
+        stale.metadata().table_uuid,
+        replacement.metadata().table_uuid
+    );
+
+    assert!(stale
+        .new_transaction(None)
+        .update_properties(vec![("stale".to_owned(), "value".to_owned())])
+        .commit()
+        .await
+        .is_err());
+    let loaded = catalog
+        .load_tabular(replacement.identifier())
+        .await
+        .unwrap();
+    let Tabular::Table(loaded) = loaded else {
+        panic!("replacement is not a table");
+    };
+    assert!(!loaded.metadata().properties.contains_key("stale"));
+}
+
+#[tokio::test]
+async fn uuidless_v1_table_write_is_rejected_before_commit() {
+    let catalog: Arc<dyn Catalog> = Arc::new(
+        SqlCatalog::new("sqlite://", "test", ObjectStoreBuilder::memory())
+            .await
+            .unwrap(),
+    );
+    let schema = Schema::builder()
+        .with_struct_field(StructField::new(
+            1,
+            "id",
+            true,
+            Type::Primitive(PrimitiveType::Long),
+            None,
+        ))
+        .build()
+        .unwrap();
+    let table = Table::builder()
+        .with_name("uuidless")
+        .with_location("/test/uuidless")
+        .with_schema(schema)
+        .build(&["test".to_owned()], catalog.clone())
+        .await
+        .unwrap();
+    let mut metadata = table.metadata().clone();
+    metadata.format_version = FormatVersion::V1;
+    let mut json = serde_json::to_value(metadata).unwrap();
+    json.as_object_mut().unwrap().remove("table-uuid");
+    let loaded = serde_json::from_value(json).unwrap();
+    let mut uuidless = Table::new(
+        table.identifier().clone(),
+        catalog,
+        table.object_store(),
+        loaded,
+    )
+    .await
+    .unwrap();
+    assert!(uuidless.metadata().table_uuid.is_nil());
+    let error = uuidless
+        .new_transaction(None)
+        .update_properties(vec![("stale".to_owned(), "value".to_owned())])
+        .commit()
+        .await
+        .expect_err("UUID-less v1 table writes cannot be fenced");
+    assert!(matches!(error, Error::NotSupported(_)));
+}
 
 #[tokio::test]
 async fn partitioned_writer_uses_exact_string_bucket() {
