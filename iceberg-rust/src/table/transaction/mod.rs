@@ -24,7 +24,11 @@ use iceberg_rust_spec::spec::{
 
 use crate::table::transaction::append::append_summary;
 use crate::table::transaction::operation::SequenceGroup;
-use crate::{catalog::commit::CommitTable, error::Error, table::Table};
+use crate::{
+    catalog::commit::{CommitTable, TableRequirement},
+    error::Error,
+    table::Table,
+};
 
 use self::operation::Operation;
 
@@ -494,11 +498,23 @@ impl<'table> TableTransaction<'table> {
         branch = ?self.branch
     ))]
     pub async fn commit(self) -> Result<(), Error> {
+        if self.table.metadata().table_uuid.is_nil() && self.operations.iter().any(Option::is_some)
+        {
+            return Err(Error::NotSupported(
+                "writes to Iceberg tables without a table UUID cannot be fenced against DROP/recreate"
+                    .to_owned(),
+            ));
+        }
         let catalog = self.table.catalog();
         let identifier = self.table.identifier.clone();
 
         // Execute the table operations
-        let (mut requirements, mut updates) = (Vec::new(), Vec::new());
+        let (mut requirements, mut updates) = (
+            vec![TableRequirement::AssertTableUuid {
+                uuid: self.table.metadata().table_uuid,
+            }],
+            Vec::new(),
+        );
         for operation in self.operations.into_iter().flatten() {
             let (requirement, update) = operation
                 .execute(self.table.metadata(), self.table.object_store())
