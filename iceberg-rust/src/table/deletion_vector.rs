@@ -10,7 +10,7 @@
 
 use std::{collections::HashMap, ops::Range, sync::Arc};
 
-use futures::{stream, StreamExt, TryStreamExt};
+use futures::{stream::FuturesUnordered, StreamExt};
 use iceberg_rust_spec::{
     spec::{deletion_vector::DeletionVector, manifest::ManifestEntry},
     util,
@@ -42,19 +42,22 @@ pub async fn load_deletion_vectors(
     entries: &[ManifestEntry],
     object_store: Arc<dyn ObjectStore>,
 ) -> Result<HashMap<String, DeletionVector>, Error> {
-    let mut fetches = stream::iter(entries)
-        .map(|entry| {
-            let object_store = object_store.clone();
-            async move { fetch_one(entry, object_store).await }
-        })
-        .buffer_unordered(MAX_CONCURRENT_DELETE_FILE_READS);
+    let mut remaining = entries.iter();
+    let mut fetches = FuturesUnordered::new();
+    for entry in remaining.by_ref().take(MAX_CONCURRENT_DELETE_FILE_READS) {
+        fetches.push(fetch_one(entry, object_store.clone()));
+    }
 
     let mut index = HashMap::with_capacity(entries.len());
-    while let Some((path, vector)) = fetches.try_next().await? {
+    while let Some(result) = fetches.next().await {
+        let (path, vector) = result?;
         if index.insert(path.clone(), vector).is_some() {
             return Err(Error::InvalidFormat(format!(
                 "more than one deletion vector references data file {path}"
             )));
+        }
+        if let Some(entry) = remaining.next() {
+            fetches.push(fetch_one(entry, object_store.clone()));
         }
     }
     Ok(index)
