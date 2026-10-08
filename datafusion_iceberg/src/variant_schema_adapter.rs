@@ -412,7 +412,9 @@ impl PhysicalExpr for UnshredVariantExpr {
 
 #[cfg(test)]
 mod tests {
-    use datafusion::arrow::array::{BinaryViewArray, BooleanArray, Int64Array, StringArray};
+    use datafusion::arrow::array::{
+        BinaryViewArray, BooleanArray, Decimal128Array, Int64Array, StringArray,
+    };
     use datafusion::arrow::datatypes::{Field, Fields};
 
     use super::*;
@@ -467,6 +469,57 @@ mod tests {
         let variant = VariantArray::try_new(output.as_ref())?;
         assert!(variant.typed_value_column().is_none());
         assert_eq!(format!("{:?}", variant.try_value(0)?), "BooleanTrue");
+        Ok(())
+    }
+
+    #[test]
+    fn unshreds_snowflake_decimal_variant_without_losing_type_or_scale() -> Result<()> {
+        let physical_fields = Fields::from(vec![
+            Field::new("metadata", DataType::BinaryView, false),
+            Field::new("value", DataType::BinaryView, true),
+            Field::new("typed_value", DataType::Decimal128(10, 2), true),
+        ]);
+        let payload = StructArray::try_new(
+            physical_fields.clone(),
+            vec![
+                Arc::new(BinaryViewArray::from_iter_values([&[1, 0, 0]])),
+                Arc::new(BinaryViewArray::from(vec![None::<&[u8]>])),
+                Arc::new(
+                    Decimal128Array::from(vec![Some(12_345)]).with_precision_and_scale(10, 2)?,
+                ),
+            ],
+            None,
+        )?;
+        let with_field_id = |field: FieldRef| {
+            let mut metadata = field.metadata().clone();
+            metadata.insert(PARQUET_FIELD_ID_META_KEY.to_owned(), "2".to_owned());
+            Arc::new(field.as_ref().clone().with_metadata(metadata))
+        };
+        let physical_field = with_field_id(variant_field("writer_payload", physical_fields));
+        let physical_schema = Arc::new(Schema::new(vec![physical_field]));
+        let batch = RecordBatch::try_new(Arc::clone(&physical_schema), vec![Arc::new(payload)])?;
+        let logical_field = with_field_id(variant_field(
+            "payload",
+            Fields::from(vec![
+                Field::new("metadata", DataType::BinaryView, false),
+                Field::new("value", DataType::BinaryView, true),
+            ]),
+        ));
+        let logical_schema = Arc::new(Schema::new(vec![Arc::clone(&logical_field)]));
+        let adapter = IcebergPhysicalExprAdapterFactory.create(logical_schema, physical_schema)?;
+        let expr = adapter.rewrite(Arc::new(Column::new("payload", 0)))?;
+
+        let ColumnarValue::Array(output) = expr.evaluate(&batch)? else {
+            return internal_err!("expected array output");
+        };
+        assert_eq!(expr.return_field(batch.schema().as_ref())?, logical_field);
+        assert_eq!(output.data_type(), logical_field.data_type());
+        let variant = VariantArray::try_new(output.as_ref())?;
+        let Some(decimal) = variant.try_value(0)?.as_decimal16() else {
+            return internal_err!("expected decimal VARIANT");
+        };
+        assert_eq!(decimal.integer(), 12_345);
+        assert_eq!(decimal.scale(), 2);
         Ok(())
     }
 
