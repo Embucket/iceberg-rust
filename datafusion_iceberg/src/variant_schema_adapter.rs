@@ -4,6 +4,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use datafusion::arrow::array::{Array, ArrayRef, StructArray};
+use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::{DataType, FieldRef, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
@@ -376,11 +377,24 @@ impl PhysicalExpr for UnshredVariantExpr {
         let DataType::Struct(target_fields) = self.target_field.data_type() else {
             return internal_err!("Variant target field must use Struct storage");
         };
-        let output = StructArray::try_new(
-            target_fields.clone(),
-            unshredded.columns().to_vec(),
-            unshredded.nulls().cloned(),
-        )?;
+        if unshredded.columns().len() != target_fields.len() {
+            return internal_err!("Unshredded Variant columns do not match the target schema");
+        }
+        // Parquet can yield Binary even when the logical Variant schema uses BinaryView.
+        let columns = unshredded
+            .columns()
+            .iter()
+            .zip(target_fields.iter())
+            .map(|(column, field)| {
+                if column.data_type() == field.data_type() {
+                    Ok(Arc::clone(column))
+                } else {
+                    Ok(cast(column.as_ref(), field.data_type())?)
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let output =
+            StructArray::try_new(target_fields.clone(), columns, unshredded.nulls().cloned())?;
         Ok(ColumnarValue::Array(Arc::new(output) as ArrayRef))
     }
 
@@ -413,9 +427,11 @@ impl PhysicalExpr for UnshredVariantExpr {
 #[cfg(test)]
 mod tests {
     use datafusion::arrow::array::{
-        BinaryViewArray, BooleanArray, Decimal128Array, Int64Array, StringArray,
+        BinaryArray, BinaryViewArray, BooleanArray, Decimal128Array, Int64Array, StringArray,
     };
     use datafusion::arrow::datatypes::{Field, Fields};
+    use parquet::variant::Variant;
+    use parquet_variant_compute::VariantArrayBuilder;
 
     use super::*;
 
@@ -475,15 +491,15 @@ mod tests {
     #[test]
     fn unshreds_snowflake_decimal_variant_without_losing_type_or_scale() -> Result<()> {
         let physical_fields = Fields::from(vec![
-            Field::new("metadata", DataType::BinaryView, false),
-            Field::new("value", DataType::BinaryView, true),
+            Field::new("metadata", DataType::Binary, false),
+            Field::new("value", DataType::Binary, true),
             Field::new("typed_value", DataType::Decimal128(10, 2), true),
         ]);
         let payload = StructArray::try_new(
             physical_fields.clone(),
             vec![
-                Arc::new(BinaryViewArray::from_iter_values([&[1, 0, 0]])),
-                Arc::new(BinaryViewArray::from(vec![None::<&[u8]>])),
+                Arc::new(BinaryArray::from_iter_values([&[1, 0, 0]])),
+                Arc::new(BinaryArray::from(vec![None::<&[u8]>])),
                 Arc::new(
                     Decimal128Array::from(vec![Some(12_345)]).with_precision_and_scale(10, 2)?,
                 ),
@@ -520,6 +536,111 @@ mod tests {
         };
         assert_eq!(decimal.integer(), 12_345);
         assert_eq!(decimal.scale(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn adapts_unshredded_binary_variant_columns_and_nulls() -> Result<()> {
+        let mut builder = VariantArrayBuilder::new(2);
+        builder.append_variant(Variant::BooleanTrue);
+        builder.append_null();
+        let source = builder.build().into_inner();
+        let physical_fields = Fields::from(vec![
+            Field::new("metadata", DataType::Binary, false),
+            Field::new("value", DataType::Binary, false),
+        ]);
+        let physical_columns: Vec<ArrayRef> = source
+            .columns()
+            .iter()
+            .map(|column| cast(column.as_ref(), &DataType::Binary))
+            .collect::<std::result::Result<_, _>>()?;
+        let physical =
+            StructArray::try_new(physical_fields, physical_columns, source.nulls().cloned())?;
+        let physical_schema = Arc::new(Schema::new(vec![Field::new(
+            "payload",
+            physical.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(physical_schema, vec![Arc::new(physical)])?;
+        let target_field = variant_field(
+            "payload",
+            Fields::from(vec![
+                Field::new("metadata", DataType::BinaryView, false),
+                Field::new("value", DataType::BinaryView, false),
+            ]),
+        );
+        let expr = UnshredVariantExpr::new(
+            Arc::new(Column::new("payload", 0)),
+            Arc::clone(&target_field),
+        );
+
+        let ColumnarValue::Array(output) = expr.evaluate(&batch)? else {
+            return internal_err!("expected array output");
+        };
+        assert_eq!(output.data_type(), target_field.data_type());
+        let variant = VariantArray::try_new(output.as_ref())?;
+        assert_eq!(format!("{:?}", variant.try_value(0)?), "BooleanTrue");
+        assert!(variant.is_null(1));
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "manual Variant binary-width adaptation benchmark"]
+    fn benchmark_variant_binary_width_adaptation() -> Result<()> {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let target_field = variant_field(
+            "payload",
+            Fields::from(vec![
+                Field::new("metadata", DataType::BinaryView, false),
+                Field::new("value", DataType::BinaryView, false),
+            ]),
+        );
+        for (row_count, iterations) in [(1_usize, 1000_u32), (4096, 100)] {
+            let mut builder = VariantArrayBuilder::new(row_count);
+            for _ in 0..row_count {
+                builder.append_variant(Variant::BooleanTrue);
+            }
+            let source = builder.build().into_inner();
+            for binary_storage in [false, true] {
+                let physical = if binary_storage {
+                    let columns = source
+                        .columns()
+                        .iter()
+                        .map(|column| cast(column.as_ref(), &DataType::Binary))
+                        .collect::<std::result::Result<Vec<_>, _>>()?;
+                    StructArray::try_new(
+                        Fields::from(vec![
+                            Field::new("metadata", DataType::Binary, false),
+                            Field::new("value", DataType::Binary, false),
+                        ]),
+                        columns,
+                        source.nulls().cloned(),
+                    )?
+                } else {
+                    source.clone()
+                };
+                let schema = Arc::new(Schema::new(vec![Field::new(
+                    "payload",
+                    physical.data_type().clone(),
+                    true,
+                )]));
+                let batch = RecordBatch::try_new(schema, vec![Arc::new(physical)])?;
+                let expr = UnshredVariantExpr::new(
+                    Arc::new(Column::new("payload", 0)),
+                    Arc::clone(&target_field),
+                );
+                let start = Instant::now();
+                for _ in 0..iterations {
+                    black_box(expr.evaluate(black_box(&batch))?);
+                }
+                eprintln!(
+                    "rows={row_count} binary_storage={binary_storage} average_ns_per_batch={}",
+                    (start.elapsed() / iterations).as_nanos()
+                );
+            }
+        }
         Ok(())
     }
 
