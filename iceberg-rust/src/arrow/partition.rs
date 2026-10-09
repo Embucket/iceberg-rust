@@ -12,11 +12,11 @@ use std::{collections::HashSet, hash::Hash};
 
 use arrow::{
     array::{
-        as_primitive_array, as_string_array, ArrayRef, BooleanArray, BooleanBufferBuilder,
+        as_primitive_array, as_string_array, Array, ArrayRef, BooleanArray, BooleanBufferBuilder,
         PrimitiveArray, Scalar, StringArray,
     },
     compute::{
-        and, filter, filter_record_batch,
+        and, filter, filter_record_batch, is_not_null, is_null,
         kernels::cmp::{distinct, eq},
     },
     datatypes::{
@@ -30,6 +30,9 @@ use itertools::{iproduct, Itertools};
 use iceberg_rust_spec::{partition::BoundPartitionField, spec::values::Value};
 
 use super::transform::transform_arrow;
+
+/// A record batch and the partition values shared by all its rows.
+pub type PartitionedRecordBatch = (Vec<Option<Value>>, RecordBatch);
 
 /// Partitions a record batch according to the given partition fields.
 ///
@@ -53,7 +56,7 @@ use super::transform::transform_arrow;
 pub fn partition_record_batch<'a>(
     record_batch: &'a RecordBatch,
     partition_fields: &[BoundPartitionField<'_>],
-) -> Result<impl Iterator<Item = Result<(Vec<Value>, RecordBatch), ArrowError>> + 'a, ArrowError> {
+) -> Result<impl Iterator<Item = Result<PartitionedRecordBatch, ArrowError>> + 'a, ArrowError> {
     let partition_columns: Vec<ArrayRef> = partition_fields
         .iter()
         .map(|field| {
@@ -72,48 +75,56 @@ pub fn partition_record_batch<'a>(
     let predicates = distinct_values
         .into_iter()
         .zip(partition_columns.iter())
-        .map(|(distinct, value)| match distinct {
-            DistinctValues::Int(set) => set
-                .into_iter()
-                .map(|x| {
-                    Ok((
-                        Value::Int(x),
-                        eq(&PrimitiveArray::<Int32Type>::new_scalar(x), value)?,
-                    ))
-                })
-                .collect::<Result<Vec<_>, ArrowError>>(),
-            DistinctValues::Long(set) => set
-                .into_iter()
-                .map(|x| {
-                    Ok((
-                        Value::LongInt(x),
-                        eq(&PrimitiveArray::<Int64Type>::new_scalar(x), value)?,
-                    ))
-                })
-                .collect::<Result<Vec<_>, ArrowError>>(),
-            DistinctValues::Timestamp(set, timezone) => set
-                .into_iter()
-                .map(|x| {
-                    let scalar = Scalar::new(
-                        PrimitiveArray::<TimestampMicrosecondType>::from(vec![x])
-                            .with_timezone_opt(timezone.clone()),
-                    );
-                    let partition_value = if timezone.is_some() {
-                        Value::TimestampTZ(x)
-                    } else {
-                        Value::Timestamp(x)
-                    };
-                    Ok((partition_value, eq(&scalar, value)?))
-                })
-                .collect::<Result<Vec<_>, ArrowError>>(),
-            DistinctValues::String(set) => set
-                .into_iter()
-                .map(|x| {
-                    let res = eq(&StringArray::new_scalar(&x), value)?;
-                    Ok((Value::String(x), res))
-                })
-                .collect::<Result<Vec<_>, ArrowError>>(),
-        })
+        .map(
+            |(distinct, value)| -> Result<Vec<(Option<Value>, BooleanArray)>, ArrowError> {
+                let mut predicates = match distinct {
+                    DistinctValues::Int(set) => set
+                        .into_iter()
+                        .map(|x| {
+                            Ok((
+                                Some(Value::Int(x)),
+                                eq(&PrimitiveArray::<Int32Type>::new_scalar(x), value)?,
+                            ))
+                        })
+                        .collect::<Result<Vec<_>, ArrowError>>(),
+                    DistinctValues::Long(set) => set
+                        .into_iter()
+                        .map(|x| {
+                            Ok((
+                                Some(Value::LongInt(x)),
+                                eq(&PrimitiveArray::<Int64Type>::new_scalar(x), value)?,
+                            ))
+                        })
+                        .collect::<Result<Vec<_>, ArrowError>>(),
+                    DistinctValues::Timestamp(set, timezone) => set
+                        .into_iter()
+                        .map(|x| {
+                            let scalar = Scalar::new(
+                                PrimitiveArray::<TimestampMicrosecondType>::from(vec![x])
+                                    .with_timezone_opt(timezone.clone()),
+                            );
+                            let partition_value = if timezone.is_some() {
+                                Value::TimestampTZ(x)
+                            } else {
+                                Value::Timestamp(x)
+                            };
+                            Ok((Some(partition_value), eq(&scalar, value)?))
+                        })
+                        .collect::<Result<Vec<_>, ArrowError>>(),
+                    DistinctValues::String(set) => set
+                        .into_iter()
+                        .map(|x| {
+                            let res = eq(&StringArray::new_scalar(&x), value)?;
+                            Ok((Some(Value::String(x)), res))
+                        })
+                        .collect::<Result<Vec<_>, ArrowError>>(),
+                }?;
+                if value.null_count() != 0 {
+                    predicates.push((None, is_null(value.as_ref())?));
+                }
+                Ok(predicates)
+            },
+        )
         .try_fold(
             vec![(vec![], BooleanArray::new(true_buffer.finish(), None))],
             |acc, predicates| {
@@ -123,7 +134,7 @@ pub fn partition_record_batch<'a>(
                         Ok((values, and(&x, y)?))
                     })
                     .filter_ok(|x| x.1.true_count() != 0)
-                    .collect::<Result<Vec<(Vec<Value>, _)>, ArrowError>>()
+                    .collect::<Result<Vec<(Vec<Option<Value>>, _)>, ArrowError>>()
             },
         )?;
     Ok(predicates.into_iter().map(move |(values, predicate)| {
@@ -145,11 +156,11 @@ pub fn partition_record_batch<'a>(
 /// * Int64 - Converted to DistinctValues::Long
 /// * Utf8 - Converted to DistinctValues::String
 fn distinct_values(array: ArrayRef) -> Result<DistinctValues, ArrowError> {
-    if array.null_count() != 0 {
-        return Err(ArrowError::ComputeError(
-            "Null partition values are not supported".to_owned(),
-        ));
-    }
+    let array = if array.null_count() == 0 {
+        array
+    } else {
+        filter(array.as_ref(), &is_not_null(array.as_ref())?)?
+    };
     match array.data_type() {
         DataType::Int32 => Ok(DistinctValues::Int(distinct_values_primitive::<
             i32,
@@ -185,6 +196,10 @@ fn distinct_values_primitive<T: Eq + Hash, P: ArrowPrimitiveType<Native = T>>(
     array: ArrayRef,
 ) -> Result<HashSet<P::Native>, ArrowError> {
     let array = as_primitive_array::<P>(&array);
+
+    if array.is_empty() {
+        return Ok(HashSet::new());
+    }
 
     let first = array.value(0);
 
@@ -223,9 +238,13 @@ fn distinct_values_primitive<T: Eq + Hash, P: ArrowPrimitiveType<Native = T>>(
 /// # Returns
 /// A HashSet containing all unique string values from the array
 fn distinct_values_string(array: ArrayRef) -> Result<HashSet<String>, ArrowError> {
-    let slice_len = array.len() - 1;
-
     let array = as_string_array(&array);
+
+    if array.is_empty() {
+        return Ok(HashSet::new());
+    }
+
+    let slice_len = array.len() - 1;
 
     let first = array.value(0).to_owned();
 
@@ -305,9 +324,9 @@ mod tests {
                 .collect::<Result<Vec<_>, ArrowError>>()?;
             values.sort();
             let expected = if timezone.is_some() {
-                vec![Value::TimestampTZ(10), Value::TimestampTZ(20)]
+                vec![Some(Value::TimestampTZ(10)), Some(Value::TimestampTZ(20))]
             } else {
-                vec![Value::Timestamp(10), Value::Timestamp(20)]
+                vec![Some(Value::Timestamp(10)), Some(Value::Timestamp(20))]
             };
             assert_eq!(values, expected);
         }
@@ -315,7 +334,7 @@ mod tests {
     }
 
     #[test]
-    fn null_partition_values_fail_instead_of_dropping_rows() -> Result<(), ArrowError> {
+    fn nullable_partition_values_keep_every_row() -> Result<(), ArrowError> {
         for (array, source_type) in [
             (
                 Arc::new(arrow::array::Int64Array::from(vec![Some(10), None])) as ArrayRef,
@@ -331,10 +350,35 @@ mod tests {
             let source = StructField::new(1, "ts", false, Type::Primitive(source_type), None);
             let partition = PartitionField::new(1, 1000, "ts", Transform::Identity);
             let bound = BoundPartitionField::new(&partition, &source);
-            let result = partition_record_batch(&batch, &[bound]);
-            assert!(
-                matches!(result, Err(ArrowError::ComputeError(message)) if message.contains("Null partition values"))
-            );
+            let mut groups = partition_record_batch(&batch, &[bound])?
+                .map(|group| group.map(|(values, rows)| (values[0].clone(), rows.num_rows())))
+                .collect::<Result<Vec<_>, ArrowError>>()?;
+            groups.sort();
+            assert_eq!(groups.len(), 2);
+            assert_eq!(groups[0], (None, 1));
+            assert_eq!(groups[1].1, 1);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn all_null_and_empty_partition_batches() -> Result<(), ArrowError> {
+        for values in [vec![None, None], vec![]] {
+            let array: ArrayRef = Arc::new(arrow::array::Int64Array::from(values.clone()));
+            let batch = RecordBatch::try_from_iter(vec![("id", array)])?;
+            let source =
+                StructField::new(1, "id", false, Type::Primitive(PrimitiveType::Long), None);
+            let partition = PartitionField::new(1, 1000, "id", Transform::Identity);
+            let bound = BoundPartitionField::new(&partition, &source);
+            let groups = partition_record_batch(&batch, &[bound])?
+                .collect::<Result<Vec<_>, ArrowError>>()?;
+            if values.is_empty() {
+                assert!(groups.is_empty());
+            } else {
+                assert_eq!(groups.len(), 1);
+                assert_eq!(groups[0].0, vec![None]);
+                assert_eq!(groups[0].1.num_rows(), values.len());
+            }
         }
         Ok(())
     }

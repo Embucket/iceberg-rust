@@ -2522,7 +2522,7 @@ async fn write_parquet_files(
     Ok(datafiles)
 }
 
-type PartitionValuesByPath = Arc<RwLock<HashMap<Path, Vec<Value>>>>;
+type PartitionValuesByPath = Arc<RwLock<HashMap<Path, Vec<Option<Value>>>>>;
 type DemuxerTask = (
     SpawnedTask<Result<(), DataFusionError>>,
     DemuxedStreamReceiver,
@@ -2585,7 +2585,8 @@ async fn partitions_demuxer(
     table_location: &str,
     partition_values_by_path: &PartitionValuesByPath,
 ) -> Result<(), DataFusionError> {
-    let mut senders: LruCache<Vec<Value>, mpsc::Sender<RecordBatch>> = LruCache::unbounded();
+    let mut senders: LruCache<Vec<Option<Value>>, mpsc::Sender<RecordBatch>> =
+        LruCache::unbounded();
 
     // Get partition column indices
 
@@ -2718,7 +2719,7 @@ mod tests {
         prelude::SessionContext,
         scalar::ScalarValue,
     };
-    use futures::stream;
+    use futures::{stream, TryStreamExt};
     use iceberg_rust::{
         catalog::tabular::Tabular,
         object_store::ObjectStoreBuilder,
@@ -2742,7 +2743,7 @@ mod tests {
             partition::PartitionSpec,
             view_metadata::{Version, ViewRepresentation},
         },
-        table::Table,
+        table::{manifest_list::snapshot_partition_bounds_with_nulls, Table},
         view::View,
     };
     use iceberg_sql_catalog::SqlCatalog;
@@ -3988,6 +3989,189 @@ mod tests {
             panic!();
         };
         assert_eq!(table.manifests(None, None).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_nullable_partition_write_and_reload() {
+        let object_store = ObjectStoreBuilder::memory();
+        let catalog: Arc<dyn Catalog> = Arc::new(
+            SqlCatalog::new("sqlite://", "test", object_store)
+                .await
+                .unwrap(),
+        );
+        let schema = Schema::builder()
+            .with_struct_field(StructField {
+                id: 1,
+                name: "id".to_string(),
+                required: false,
+                field_type: Type::Primitive(PrimitiveType::Long),
+                doc: None,
+                initial_default: None,
+                write_default: None,
+            })
+            .with_struct_field(StructField {
+                id: 2,
+                name: "payload".to_string(),
+                required: true,
+                field_type: Type::Primitive(PrimitiveType::Long),
+                doc: None,
+                initial_default: None,
+                write_default: None,
+            })
+            .build()
+            .unwrap();
+        let partition_spec = PartitionSpec::builder()
+            .with_partition_field(PartitionField::new(
+                1,
+                1000,
+                "id_partition",
+                Transform::Identity,
+            ))
+            .build()
+            .unwrap();
+        let table = Table::builder()
+            .with_name("nullable_partition")
+            .with_location("/test/nullable_partition")
+            .with_schema(schema)
+            .with_partition_spec(partition_spec)
+            .build(&["test".to_owned()], Arc::clone(&catalog))
+            .await
+            .unwrap();
+        let identifier = table.identifier().clone();
+        let ctx = SessionContext::new();
+        ctx.register_table("nullable_partition", Arc::new(DataFusionTable::from(table)))
+            .unwrap();
+
+        ctx.sql("INSERT INTO nullable_partition VALUES (NULL, 10), (NULL, 11)")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let first_commit = match Arc::clone(&catalog)
+            .load_tabular(&identifier)
+            .await
+            .unwrap()
+        {
+            Tabular::Table(table) => table,
+            _ => panic!("expected table"),
+        };
+        let first_manifests = first_commit.manifests(None, None).await.unwrap();
+        assert_eq!(first_manifests.len(), 1);
+        let first_summary = &first_manifests[0].partitions.as_ref().unwrap()[0];
+        assert!(first_summary.contains_null);
+        assert_eq!(first_summary.lower_bound, None);
+        assert_eq!(first_summary.upper_bound, None);
+        let first_bounds = snapshot_partition_bounds_with_nulls(
+            first_commit
+                .metadata()
+                .current_snapshot(None)
+                .unwrap()
+                .unwrap(),
+            first_commit.metadata(),
+            first_commit.object_store().clone(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(first_bounds.contains_null, [true]);
+        assert!(first_bounds.bounds.min.is_empty());
+
+        for sql in [
+            "INSERT INTO nullable_partition VALUES (1, 20)",
+            "INSERT INTO nullable_partition VALUES (NULL, 12)",
+            "INSERT INTO nullable_partition VALUES (NULL, 13), (2, 21)",
+        ] {
+            ctx.sql(sql).await.unwrap().collect().await.unwrap();
+        }
+
+        let reloaded = match catalog.load_tabular(&identifier).await.unwrap() {
+            Tabular::Table(table) => table,
+            _ => panic!("expected table"),
+        };
+        let manifests = reloaded.manifests(None, None).await.unwrap();
+        let bounds = snapshot_partition_bounds_with_nulls(
+            reloaded.metadata().current_snapshot(None).unwrap().unwrap(),
+            reloaded.metadata(),
+            reloaded.object_store().clone(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(bounds.contains_null, [true]);
+        assert_eq!(bounds.bounds.min.as_slice(), [Value::LongInt(1)]);
+        assert_eq!(bounds.bounds.max.as_slice(), [Value::LongInt(2)]);
+        assert!(manifests.iter().any(|manifest| {
+            manifest
+                .partitions
+                .as_ref()
+                .is_some_and(|parts| parts[0].contains_null)
+        }));
+        let files = reloaded
+            .datafiles(&manifests, None, (None, None))
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(files.len(), 5);
+        assert_eq!(
+            files
+                .iter()
+                .filter(
+                    |(_, entry)| entry.data_file().partition().get("id_partition") == Some(&None)
+                )
+                .count(),
+            3
+        );
+
+        let fresh_ctx = SessionContext::new();
+        fresh_ctx
+            .register_table("reloaded", Arc::new(DataFusionTable::from(reloaded)))
+            .unwrap();
+        let batches = fresh_ctx
+            .sql("SELECT payload FROM reloaded WHERE id IS NULL ORDER BY payload")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let values: Vec<i64> = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect();
+        assert_eq!(values, [10, 11, 12, 13]);
+
+        let batches = fresh_ctx
+            .sql("SELECT payload FROM reloaded WHERE id = 2")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let nonnull: Vec<i64> = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect();
+        assert_eq!(nonnull, [21]);
     }
 
     #[tokio::test]
