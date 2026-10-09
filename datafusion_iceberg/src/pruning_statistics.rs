@@ -429,8 +429,8 @@ pub(crate) fn transform_predicate(
         return None;
     };
     let (column, literal, column_on_left) = match (*left, *right) {
-        (Expr::Column(column), literal @ Expr::Literal(..)) => (column, literal, true),
-        (literal @ Expr::Literal(..), Expr::Column(column)) => (column, literal, false),
+        (Expr::Column(column), literal) => (column, fold_cast_literal(literal)?, true),
+        (literal, Expr::Column(column)) => (column, fold_cast_literal(literal)?, false),
         _ => return None,
     };
     let field = partition_fields
@@ -503,6 +503,27 @@ pub(crate) fn transform_predicate(
         };
     }
     Some(partition_comparison(column, op, literal))
+}
+
+fn fold_cast_literal(expr: Expr) -> Option<Expr> {
+    match expr {
+        literal @ Expr::Literal(..) => Some(literal),
+        Expr::Cast(cast) => {
+            let Expr::Literal(value, _) = *cast.expr else {
+                return None;
+            };
+            let value = value.cast_to(cast.field.data_type()).ok()?;
+            let value = match value {
+                ScalarValue::TimestampNanosecond(Some(nanos), None) if nanos % 1_000 == 0 => {
+                    ScalarValue::TimestampMicrosecond(Some(nanos / 1_000), None)
+                }
+                ScalarValue::TimestampNanosecond(..) => return None,
+                value => value,
+            };
+            Some(Expr::Literal(value, None))
+        }
+        _ => None,
+    }
 }
 
 fn partition_comparison(column: Expr, op: Operator, literal: Expr) -> Expr {
@@ -1218,6 +1239,62 @@ mod tests {
         let result = transform_literal(input.clone(), &Transform::Identity)
             .expect("identity should pass through");
         assert_eq!(result, input);
+    }
+
+    #[test]
+    fn year_projection_folds_only_exact_timestamp_literal_casts() {
+        use datafusion_expr::expr::Cast;
+
+        let source = StructField::new(
+            1,
+            "ts",
+            false,
+            Type::Primitive(PrimitiveType::Timestamp),
+            None,
+        );
+        let partition = PartitionField::new(1, 1000, "ts_year", Transform::Year);
+        let fields = [BoundPartitionField::new(&partition, &source)];
+        let timestamp = Expr::Cast(Cast::new(
+            Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some("2024-06-15".to_owned())),
+                None,
+            )),
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+        ));
+        assert!(matches!(
+            fold_cast_literal(timestamp.clone()),
+            Some(Expr::Literal(
+                ScalarValue::TimestampMicrosecond(Some(_), None),
+                _
+            ))
+        ));
+        assert!(transform_predicate(
+            partition_comparison(
+                Expr::Column(Column::from_name("ts")),
+                Operator::Eq,
+                timestamp,
+            ),
+            &fields,
+        )
+        .is_some());
+
+        let sub_microsecond = Expr::Cast(Cast::new(
+            Box::new(Expr::Literal(
+                ScalarValue::TimestampNanosecond(Some(-1), None),
+                None,
+            )),
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+        ));
+        assert!(fold_cast_literal(sub_microsecond.clone()).is_none());
+        assert!(transform_predicate(
+            partition_comparison(
+                Expr::Column(Column::from_name("ts")),
+                Operator::Eq,
+                sub_microsecond,
+            ),
+            &fields,
+        )
+        .is_none());
     }
 
     fn project_id_predicate(
