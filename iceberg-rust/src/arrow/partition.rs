@@ -338,4 +338,39 @@ mod tests {
         }
         Ok(())
     }
+
+    #[test]
+    #[ignore = "local partition-key benchmark; run with --ignored --nocapture"]
+    fn benchmark_identity_partition_key_extraction() -> Result<(), ArrowError> {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const ROWS: u32 = 100_000;
+        const REPEATS: u32 = 100;
+        let values = (0..ROWS)
+            .map(|index| i64::from(index % 1024))
+            .collect::<Vec<_>>();
+        let columns: [(&str, ArrayRef); 2] = [
+            (
+                "int64",
+                Arc::new(arrow::array::Int64Array::from(values.clone())) as ArrayRef,
+            ),
+            (
+                "timestamptz",
+                Arc::new(TimestampMicrosecondArray::from(values).with_timezone("UTC")) as ArrayRef,
+            ),
+        ];
+        for (name, column) in columns {
+            let start = Instant::now();
+            for _ in 0..REPEATS {
+                black_box(distinct_values(Arc::clone(&column))?);
+            }
+            let elapsed = start.elapsed().as_secs_f64();
+            eprintln!(
+                "{name}: {:.1} million rows/s",
+                f64::from(ROWS) * f64::from(REPEATS) / elapsed / 1_000_000.0
+            );
+        }
+        Ok(())
+    }
 }
