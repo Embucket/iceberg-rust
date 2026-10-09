@@ -12,7 +12,7 @@
  * For the second level the trait PruningStatistics is implemented for the Manifest
 */
 
-use std::{any::Any, sync::Arc};
+use std::{any::Any, collections::HashSet, sync::Arc};
 
 use crate::error::Error as DatafusionIcebergError;
 use datafusion::{
@@ -34,7 +34,7 @@ use iceberg_rust::{
     error::Error,
     spec::{
         decimal::{decimal_mantissa, decimal_scale, Decimal},
-        manifest::ManifestEntry,
+        manifest::{Content, ManifestEntry},
         manifest_list::ManifestListEntry,
         partition::{BoundPartitionField, Transform},
         schema::Schema,
@@ -152,6 +152,80 @@ pub(crate) struct PruneDataFiles<'table, 'manifests> {
     schema: &'table Schema,
     arrow_schema: &'table ArrowSchema,
     files: &'manifests [(ManifestPath, ManifestEntry)],
+}
+
+pub(crate) struct PrunePartitionedDataFiles<'table, 'manifests> {
+    partition_fields: &'table [BoundPartitionField<'table>],
+    compatible_manifests: &'manifests HashSet<&'manifests str>,
+    files: &'manifests [(ManifestPath, ManifestEntry)],
+}
+
+impl<'table, 'manifests> PrunePartitionedDataFiles<'table, 'manifests> {
+    pub(crate) fn new(
+        partition_fields: &'table [BoundPartitionField<'table>],
+        compatible_manifests: &'manifests HashSet<&'manifests str>,
+        files: &'manifests [(ManifestPath, ManifestEntry)],
+    ) -> Self {
+        Self {
+            partition_fields,
+            compatible_manifests,
+            files,
+        }
+    }
+
+    fn partition_values(&self, column: &Column) -> Option<ArrayRef> {
+        let field = self
+            .partition_fields
+            .iter()
+            .find(|field| field.name() == column.name())?;
+        let field_type = field.field_type().tranform(field.transform()).ok()?;
+        let data_type = (&field_type).try_into().ok()?;
+        let values = self.files.iter().map(|(path, entry)| {
+            (entry.data_file().content() == &Content::Data
+                && self.compatible_manifests.contains(path.as_str()))
+            .then(|| entry.data_file().partition().get(column.name()))
+            .flatten()
+            .and_then(Option::as_ref)
+            .and_then(|value| value.clone().cast(&field_type).ok())
+            .map(Value::into_any)
+        });
+        any_iter_to_array(values, &data_type).ok()
+    }
+}
+
+impl PruningStatistics for PrunePartitionedDataFiles<'_, '_> {
+    fn min_values(&self, column: &Column) -> Option<ArrayRef> {
+        self.partition_values(column)
+    }
+
+    fn max_values(&self, column: &Column) -> Option<ArrayRef> {
+        self.partition_values(column)
+    }
+
+    fn num_containers(&self) -> usize {
+        self.files.len()
+    }
+
+    fn null_counts(&self, _column: &Column) -> Option<ArrayRef> {
+        None
+    }
+
+    fn contained(
+        &self,
+        _column: &Column,
+        _values: &std::collections::HashSet<ScalarValue>,
+    ) -> Option<datafusion::arrow::array::BooleanArray> {
+        None
+    }
+
+    fn row_counts(&self) -> Option<ArrayRef> {
+        ScalarValue::iter_to_array(
+            self.files
+                .iter()
+                .map(|(_, entry)| ScalarValue::Int64(Some(*entry.data_file().record_count()))),
+        )
+        .ok()
+    }
 }
 
 impl<'table, 'manifests> PruneDataFiles<'table, 'manifests> {
@@ -355,8 +429,8 @@ pub(crate) fn transform_predicate(
         return None;
     };
     let (column, literal, column_on_left) = match (*left, *right) {
-        (Expr::Column(column), literal @ Expr::Literal(..)) => (column, literal, true),
-        (literal @ Expr::Literal(..), Expr::Column(column)) => (column, literal, false),
+        (Expr::Column(column), literal) => (column, fold_cast_literal(literal)?, true),
+        (literal, Expr::Column(column)) => (column, fold_cast_literal(literal)?, false),
         _ => return None,
     };
     let field = partition_fields
@@ -429,6 +503,27 @@ pub(crate) fn transform_predicate(
         };
     }
     Some(partition_comparison(column, op, literal))
+}
+
+fn fold_cast_literal(expr: Expr) -> Option<Expr> {
+    match expr {
+        literal @ Expr::Literal(..) => Some(literal),
+        Expr::Cast(cast) => {
+            let Expr::Literal(value, _) = *cast.expr else {
+                return None;
+            };
+            let value = value.cast_to(cast.field.data_type()).ok()?;
+            let value = match value {
+                ScalarValue::TimestampNanosecond(Some(nanos), None) if nanos % 1_000 == 0 => {
+                    ScalarValue::TimestampMicrosecond(Some(nanos / 1_000), None)
+                }
+                ScalarValue::TimestampNanosecond(..) => return None,
+                value => value,
+            };
+            Some(Expr::Literal(value, None))
+        }
+        _ => None,
+    }
 }
 
 fn partition_comparison(column: Expr, op: Operator, literal: Expr) -> Expr {
@@ -712,6 +807,102 @@ mod tests {
         assert_eq!(maximums.value(2), -42);
         let null_counts = pruning.null_counts(&Column::from_name("b")).unwrap();
         assert!(null_counts.is_null(0));
+    }
+
+    #[test]
+    fn partitioned_file_pruning_preserves_unknown_specs_and_delete_files() {
+        use datafusion::arrow::array::Int32Array;
+        use datafusion_expr::expr::Cast;
+
+        let source = StructField::new(
+            1,
+            "ts",
+            false,
+            Type::Primitive(PrimitiveType::Timestamp),
+            None,
+        );
+        let partition = PartitionField::new(1, 1000, "ts_year", Transform::Year);
+        let fields = [BoundPartitionField::new(&partition, &source)];
+        let entry = |content: Content, year: Option<i32>| {
+            let file = DataFile::builder()
+                .with_content(content)
+                .with_file_path("/data.parquet".into())
+                .with_file_format(FileFormat::Parquet)
+                .with_partition(Struct::from_iter(vec![(
+                    "ts_year".to_owned(),
+                    year.map(Value::Int),
+                )]))
+                .with_record_count(1)
+                .with_file_size_in_bytes(1)
+                .with_column_sizes(None)
+                .with_value_counts(None)
+                .with_null_value_counts(None)
+                .with_nan_value_counts(None)
+                .with_distinct_counts(None)
+                .with_lower_bounds(None)
+                .with_upper_bounds(None)
+                .build()
+                .unwrap();
+            ManifestEntry::builder()
+                .with_format_version(FormatVersion::V2)
+                .with_status(Status::Added)
+                .with_data_file(file)
+                .build()
+                .unwrap()
+        };
+        let files = vec![
+            ("current".into(), entry(Content::Data, Some(54))),
+            ("current".into(), entry(Content::Data, Some(55))),
+            ("old_spec".into(), entry(Content::Data, Some(54))),
+            ("current".into(), entry(Content::Data, None)),
+            ("current".into(), entry(Content::PositionDeletes, Some(54))),
+        ];
+        let compatible = HashSet::from(["current"]);
+        let pruning = PrunePartitionedDataFiles::new(&fields, &compatible, &files);
+        let values = pruning.min_values(&Column::from_name("ts_year")).unwrap();
+        let values = values.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(values.len(), 5);
+        assert_eq!(values.value(0), 54);
+        assert_eq!(values.value(1), 55);
+        assert!(values.is_null(2));
+        assert!(values.is_null(3));
+        assert!(values.is_null(4));
+        assert_eq!(pruning.num_containers(), 5);
+
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "ts_year",
+            DataType::Int32,
+            true,
+        )]));
+        let session = SessionContext::new();
+        let state = session.state();
+        let source_predicate = partition_comparison(
+            Expr::Column(Column::from_name("ts")),
+            Operator::Eq,
+            Expr::Cast(Cast::new(
+                Box::new(Expr::Literal(
+                    ScalarValue::Utf8(Some("2025-06-15".to_owned())),
+                    None,
+                )),
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+            )),
+        );
+        let projected = transform_predicate(source_predicate, &fields).unwrap();
+        let physical = create_physical_expr(
+            &projected,
+            &schema.clone().try_into().unwrap(),
+            state.execution_props(),
+            &PhysicalPlanningContext::default(),
+        )
+        .unwrap();
+        let predicate = PruningPredicateBuilder::new()
+            .with_file_schema(schema)
+            .try_build(physical)
+            .unwrap();
+        assert_eq!(
+            predicate.prune(&pruning).unwrap(),
+            vec![false, true, true, true, true]
+        );
     }
 
     #[test]
@@ -1057,6 +1248,62 @@ mod tests {
         let result = transform_literal(input.clone(), &Transform::Identity)
             .expect("identity should pass through");
         assert_eq!(result, input);
+    }
+
+    #[test]
+    fn year_projection_folds_only_exact_timestamp_literal_casts() {
+        use datafusion_expr::expr::Cast;
+
+        let source = StructField::new(
+            1,
+            "ts",
+            false,
+            Type::Primitive(PrimitiveType::Timestamp),
+            None,
+        );
+        let partition = PartitionField::new(1, 1000, "ts_year", Transform::Year);
+        let fields = [BoundPartitionField::new(&partition, &source)];
+        let timestamp = Expr::Cast(Cast::new(
+            Box::new(Expr::Literal(
+                ScalarValue::Utf8(Some("2024-06-15".to_owned())),
+                None,
+            )),
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+        ));
+        assert!(matches!(
+            fold_cast_literal(timestamp.clone()),
+            Some(Expr::Literal(
+                ScalarValue::TimestampMicrosecond(Some(_), None),
+                _
+            ))
+        ));
+        assert!(transform_predicate(
+            partition_comparison(
+                Expr::Column(Column::from_name("ts")),
+                Operator::Eq,
+                timestamp,
+            ),
+            &fields,
+        )
+        .is_some());
+
+        let sub_microsecond = Expr::Cast(Cast::new(
+            Box::new(Expr::Literal(
+                ScalarValue::TimestampNanosecond(Some(-1), None),
+                None,
+            )),
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+        ));
+        assert!(fold_cast_literal(sub_microsecond.clone()).is_none());
+        assert!(transform_predicate(
+            partition_comparison(
+                Expr::Column(Column::from_name("ts")),
+                Operator::Eq,
+                sub_microsecond,
+            ),
+            &fields,
+        )
+        .is_none());
     }
 
     fn project_id_predicate(

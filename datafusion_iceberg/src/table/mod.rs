@@ -50,7 +50,9 @@ use crate::statistics::statistics_from_datafiles;
 use crate::variant_schema_adapter::IcebergPhysicalExprAdapterFactory;
 use crate::{
     error::Error as DataFusionIcebergError,
-    pruning_statistics::{transform_predicate, PruneDataFiles, PruneManifests},
+    pruning_statistics::{
+        transform_predicate, PruneDataFiles, PruneManifests, PrunePartitionedDataFiles,
+    },
     statistics::manifest_statistics,
 };
 use datafusion::arrow::compute::SortOptions;
@@ -796,50 +798,72 @@ async fn table_scan(
                 .filter_map(|expr| transform_predicate(expr, partition_fields)),
         );
 
-        // If there is a filter expression on the partition column, the manifest files to read are pruned.
-        let data_files: Vec<(ManifestPath, ManifestEntry)> =
-            if let Some(predicate) = partition_predicates {
-                let physical_partition_predicate = create_physical_expr(
-                    &predicate,
-                    &partition_schema.clone().try_into()?,
-                    session.execution_props(),
-                    &PhysicalPlanningContext::default(),
-                )?;
-                let pruning_predicate = PruningPredicateBuilder::new()
+        let partition_pruning_predicate = if let Some(predicate) = partition_predicates {
+            let physical_partition_predicate = create_physical_expr(
+                &predicate,
+                &partition_schema.clone().try_into()?,
+                session.execution_props(),
+                &PhysicalPlanningContext::default(),
+            )?;
+            Some(
+                PruningPredicateBuilder::new()
                     .with_file_schema(partition_schema.clone())
-                    .try_build(physical_partition_predicate)?;
-                let manifests_to_prune = pruning_predicate.prune(&PruneManifests::new(
+                    .try_build(physical_partition_predicate)?,
+            )
+        } else {
+            None
+        };
+        let manifests_to_prune = partition_pruning_predicate
+            .as_ref()
+            .map(|predicate| {
+                predicate.prune(&PruneManifests::new(
                     partition_fields,
                     table.metadata().default_spec_id,
                     &manifests,
-                ))?;
-
-                table
-                    .datafiles(
-                        &manifests,
-                        Some(manifests_to_prune),
-                        manifest_entry_sequence_range,
-                    )
-                    .await
-                    .map_err(DataFusionIcebergError::from)?
-                    .try_collect()
-                    .await
-                    .map_err(DataFusionIcebergError::from)?
-            } else {
-                table
-                    .datafiles(&manifests, None, manifest_entry_sequence_range)
-                    .await
-                    .map_err(DataFusionIcebergError::from)?
-                    .try_collect()
-                    .await
-                    .map_err(DataFusionIcebergError::from)?
-            };
+                ))
+            })
+            .transpose()?;
+        let data_files: Vec<(ManifestPath, ManifestEntry)> = table
+            .datafiles(
+                &manifests,
+                manifests_to_prune,
+                manifest_entry_sequence_range,
+            )
+            .await
+            .map_err(DataFusionIcebergError::from)?
+            .try_collect()
+            .await
+            .map_err(DataFusionIcebergError::from)?;
         let mut data_files = prepare_changed_data_files(data_files, scan_changed_data_files);
         if let Some(excluded) = excluded_data_file_paths.filter(|paths| !paths.is_empty()) {
             data_files.retain(|(_, entry)| {
                 entry.data_file().content() != &Content::Data
                     || !excluded.contains(entry.data_file().file_path())
             });
+        }
+
+        if let Some(predicate) = partition_pruning_predicate {
+            let compatible_manifests: HashSet<&str> = manifests
+                .iter()
+                .filter(|manifest| manifest.partition_spec_id == table.metadata().default_spec_id)
+                .map(|manifest| manifest.manifest_path.as_str())
+                .collect();
+            let has_prunable_files = data_files.iter().any(|(path, entry)| {
+                entry.data_file().content() == &Content::Data
+                    && compatible_manifests.contains(path.as_str())
+            });
+            if has_prunable_files {
+                let files_to_keep = predicate.prune(&PrunePartitionedDataFiles::new(
+                    partition_fields,
+                    &compatible_manifests,
+                    &data_files,
+                ))?;
+                data_files = data_files
+                    .into_iter()
+                    .zip(files_to_keep)
+                    .filter_map(|(file, keep)| keep.then_some(file))
+                    .collect();
+            }
         }
 
         let pruning_predicate = PruningPredicateBuilder::new()
