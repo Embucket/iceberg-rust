@@ -13,13 +13,15 @@ use std::{collections::HashSet, hash::Hash};
 use arrow::{
     array::{
         as_primitive_array, as_string_array, ArrayRef, BooleanArray, BooleanBufferBuilder,
-        PrimitiveArray, StringArray,
+        PrimitiveArray, Scalar, StringArray,
     },
     compute::{
         and, filter, filter_record_batch,
         kernels::cmp::{distinct, eq},
     },
-    datatypes::{ArrowPrimitiveType, DataType, Int32Type, Int64Type},
+    datatypes::{
+        ArrowPrimitiveType, DataType, Int32Type, Int64Type, TimeUnit, TimestampMicrosecondType,
+    },
     error::ArrowError,
     record_batch::RecordBatch,
 };
@@ -89,6 +91,21 @@ pub fn partition_record_batch<'a>(
                     ))
                 })
                 .collect::<Result<Vec<_>, ArrowError>>(),
+            DistinctValues::Timestamp(set, timezone) => set
+                .into_iter()
+                .map(|x| {
+                    let scalar = Scalar::new(
+                        PrimitiveArray::<TimestampMicrosecondType>::from(vec![x])
+                            .with_timezone_opt(timezone.clone()),
+                    );
+                    let partition_value = if timezone.is_some() {
+                        Value::TimestampTZ(x)
+                    } else {
+                        Value::Timestamp(x)
+                    };
+                    Ok((partition_value, eq(&scalar, value)?))
+                })
+                .collect::<Result<Vec<_>, ArrowError>>(),
             DistinctValues::String(set) => set
                 .into_iter()
                 .map(|x| {
@@ -128,6 +145,11 @@ pub fn partition_record_batch<'a>(
 /// * Int64 - Converted to DistinctValues::Long
 /// * Utf8 - Converted to DistinctValues::String
 fn distinct_values(array: ArrayRef) -> Result<DistinctValues, ArrowError> {
+    if array.null_count() != 0 {
+        return Err(ArrowError::ComputeError(
+            "Null partition values are not supported".to_owned(),
+        ));
+    }
     match array.data_type() {
         DataType::Int32 => Ok(DistinctValues::Int(distinct_values_primitive::<
             i32,
@@ -137,6 +159,10 @@ fn distinct_values(array: ArrayRef) -> Result<DistinctValues, ArrowError> {
             i64,
             Int64Type,
         >(array)?)),
+        DataType::Timestamp(TimeUnit::Microsecond, timezone) => Ok(DistinctValues::Timestamp(
+            distinct_values_primitive::<i64, TimestampMicrosecondType>(array.clone())?,
+            timezone.clone(),
+        )),
         DataType::Utf8 => Ok(DistinctValues::String(distinct_values_string(array)?)),
         _ => Err(ArrowError::ComputeError(
             "Datatype not supported for transform.".to_string(),
@@ -233,9 +259,83 @@ fn distinct_values_string(array: ArrayRef) -> Result<HashSet<String>, ArrowError
 /// This enum stores unique values from different Arrow array types:
 /// * `Int` - Distinct 32-bit integer values
 /// * `Long` - Distinct 64-bit integer values  
+/// * `Timestamp` - Distinct microsecond timestamps and their optional timezone
 /// * `String` - Distinct string values
 enum DistinctValues {
     Int(HashSet<i32>),
     Long(HashSet<i64>),
+    Timestamp(HashSet<i64>, Option<std::sync::Arc<str>>),
     String(HashSet<String>),
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow::array::{ArrayRef, TimestampMicrosecondArray};
+    use iceberg_rust_spec::spec::{
+        partition::{PartitionField, Transform},
+        types::{PrimitiveType, StructField, Type},
+    };
+
+    use super::*;
+
+    #[test]
+    fn identity_partition_preserves_timestamp_kind() -> Result<(), ArrowError> {
+        for timezone in [None, Some("UTC")] {
+            let array: ArrayRef = Arc::new(
+                TimestampMicrosecondArray::from(vec![10_i64, 20_i64]).with_timezone_opt(timezone),
+            );
+            let batch = RecordBatch::try_from_iter(vec![("ts", array)])?;
+            let source_type = if timezone.is_some() {
+                PrimitiveType::Timestamptz
+            } else {
+                PrimitiveType::Timestamp
+            };
+            let source = StructField::new(1, "ts", true, Type::Primitive(source_type), None);
+            let partition = PartitionField::new(1, 1000, "ts", Transform::Identity);
+            let bound = BoundPartitionField::new(&partition, &source);
+            let mut values = partition_record_batch(&batch, &[bound])?
+                .map(|result| {
+                    result.map(|(values, rows)| {
+                        assert_eq!(rows.num_rows(), 1);
+                        values[0].clone()
+                    })
+                })
+                .collect::<Result<Vec<_>, ArrowError>>()?;
+            values.sort();
+            let expected = if timezone.is_some() {
+                vec![Value::TimestampTZ(10), Value::TimestampTZ(20)]
+            } else {
+                vec![Value::Timestamp(10), Value::Timestamp(20)]
+            };
+            assert_eq!(values, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn null_partition_values_fail_instead_of_dropping_rows() -> Result<(), ArrowError> {
+        for (array, source_type) in [
+            (
+                Arc::new(arrow::array::Int64Array::from(vec![Some(10), None])) as ArrayRef,
+                PrimitiveType::Long,
+            ),
+            (
+                Arc::new(TimestampMicrosecondArray::from(vec![Some(10), None]).with_timezone("UTC"))
+                    as ArrayRef,
+                PrimitiveType::Timestamptz,
+            ),
+        ] {
+            let batch = RecordBatch::try_from_iter(vec![("ts", array)])?;
+            let source = StructField::new(1, "ts", false, Type::Primitive(source_type), None);
+            let partition = PartitionField::new(1, 1000, "ts", Transform::Identity);
+            let bound = BoundPartitionField::new(&partition, &source);
+            let result = partition_record_batch(&batch, &[bound]);
+            assert!(
+                matches!(result, Err(ArrowError::ComputeError(message)) if message.contains("Null partition values"))
+            );
+        }
+        Ok(())
+    }
 }
