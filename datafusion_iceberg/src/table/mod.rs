@@ -2743,7 +2743,7 @@ mod tests {
             partition::PartitionSpec,
             view_metadata::{Version, ViewRepresentation},
         },
-        table::Table,
+        table::{manifest_list::snapshot_partition_bounds_with_nulls, Table},
         view::View,
     };
     use iceberg_sql_catalog::SqlCatalog;
@@ -4062,6 +4062,20 @@ mod tests {
         assert!(first_summary.contains_null);
         assert_eq!(first_summary.lower_bound, None);
         assert_eq!(first_summary.upper_bound, None);
+        let first_bounds = snapshot_partition_bounds_with_nulls(
+            first_commit
+                .metadata()
+                .current_snapshot(None)
+                .unwrap()
+                .unwrap(),
+            first_commit.metadata(),
+            first_commit.object_store().clone(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(first_bounds.contains_null, [true]);
+        assert!(first_bounds.bounds.min.is_empty());
 
         for sql in [
             "INSERT INTO nullable_partition VALUES (1, 20)",
@@ -4076,6 +4090,17 @@ mod tests {
             _ => panic!("expected table"),
         };
         let manifests = reloaded.manifests(None, None).await.unwrap();
+        let bounds = snapshot_partition_bounds_with_nulls(
+            reloaded.metadata().current_snapshot(None).unwrap().unwrap(),
+            reloaded.metadata(),
+            reloaded.object_store().clone(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(bounds.contains_null, [true]);
+        assert_eq!(bounds.bounds.min.as_slice(), [Value::LongInt(1)]);
+        assert_eq!(bounds.bounds.max.as_slice(), [Value::LongInt(2)]);
         assert!(manifests.iter().any(|manifest| {
             manifest
                 .partitions

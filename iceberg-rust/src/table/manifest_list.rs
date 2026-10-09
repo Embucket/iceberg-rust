@@ -338,6 +338,61 @@ pub async fn snapshot_partition_bounds(
     })
 }
 
+/// Partition bounds and NULL presence for each field in the current partition spec.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartitionBoundsWithNulls {
+    /// Bounds across the snapshot's manifest summaries.
+    pub bounds: Rectangle,
+    /// Whether each partition field contains NULL in any manifest.
+    pub contains_null: Vec<bool>,
+}
+
+/// Returns partition bounds together with NULL presence in one manifest-list read.
+///
+/// Returns `None` when a manifest has no summaries or uses a different partition
+/// spec; bounds in those cases cannot safely restrict a scan of this snapshot.
+pub async fn snapshot_partition_bounds_with_nulls(
+    snapshot: &Snapshot,
+    table_metadata: &TableMetadata,
+    object_store: Arc<dyn ObjectStore>,
+) -> Result<Option<PartitionBoundsWithNulls>, Error> {
+    let bytes = object_store
+        .get(&strip_prefix(snapshot.manifest_list()).into())
+        .await?
+        .bytes()
+        .await?;
+    let reader = ManifestListReader::new(Cursor::new(bytes), table_metadata)?;
+    let mut result: Option<PartitionBoundsWithNulls> = None;
+    for entry in reader {
+        let entry = entry?;
+        if entry.partition_spec_id != table_metadata.default_spec_id {
+            return Ok(None);
+        }
+        let Some(partitions) = entry.partitions else {
+            return Ok(None);
+        };
+        let bounds = summary_to_rectangle(&partitions)?;
+        if let Some(result) = result.as_mut() {
+            if result.contains_null.len() != partitions.len() {
+                return Ok(None);
+            }
+            result.bounds.expand(&bounds);
+            for (contains_null, summary) in result.contains_null.iter_mut().zip(&partitions) {
+                *contains_null |= summary.contains_null;
+            }
+        } else {
+            result = Some(PartitionBoundsWithNulls {
+                bounds,
+                contains_null: partitions
+                    .iter()
+                    .map(|summary| summary.contains_null)
+                    .collect(),
+            });
+        }
+    }
+    Ok(result)
+}
+
 /// Computes the column bounds (minimum and maximum values) for all primitive fields
 /// across all data files in a snapshot.
 ///
