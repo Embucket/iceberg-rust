@@ -840,7 +840,12 @@ fn update_partitions(
     partition_columns: &[PartitionField],
 ) -> Result<(), Error> {
     for (field, summary) in partition_columns.iter().zip(partitions.iter_mut()) {
-        let value = partition_values.get(field.name()).and_then(|x| x.as_ref());
+        let value = partition_values
+            .get(field.name())
+            .ok_or_else(|| Error::InvalidFormat("Partition field is missing".to_owned()))?;
+        if value.is_none() {
+            summary.contains_null = true;
+        }
         if let Some(value) = value {
             if summary.lower_bound.is_none() {
                 summary.lower_bound = Some(value.clone());
@@ -931,7 +936,31 @@ fn update_partitions(
 
 #[cfg(test)]
 mod tests {
+    use super::{update_partitions, FieldSummary, PartitionField, Struct, Value};
+    use iceberg_rust_spec::partition::Transform;
     use rstest::rstest;
+
+    #[test]
+    fn manifest_partition_summary_tracks_null_and_non_null_values() {
+        let fields = [PartitionField::new(1, 1000, "id", Transform::Identity)];
+        let mut summaries = [FieldSummary {
+            contains_null: false,
+            contains_nan: None,
+            lower_bound: None,
+            upper_bound: None,
+        }];
+        let null_partition = Struct::from_iter([("id".to_owned(), None)]);
+        update_partitions(&mut summaries, &null_partition, &fields).unwrap();
+        assert!(summaries[0].contains_null);
+        assert_eq!(summaries[0].lower_bound, None);
+        assert_eq!(summaries[0].upper_bound, None);
+
+        let value_partition = Struct::from_iter([("id".to_owned(), Some(Value::Int(7)))]);
+        update_partitions(&mut summaries, &value_partition, &fields).unwrap();
+        assert!(summaries[0].contains_null);
+        assert_eq!(summaries[0].lower_bound, Some(Value::Int(7)));
+        assert_eq!(summaries[0].upper_bound, Some(Value::Int(7)));
+    }
 
     // -- TestManifestReader (15) --
     #[rstest]

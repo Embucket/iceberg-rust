@@ -100,7 +100,7 @@ pub fn parquet_to_datafile_with_partition(
     partition_fields: &[BoundPartitionField<'_>],
     equality_ids: Option<&[i32]>,
     table_properties: &HashMap<String, String>,
-    partition_values: &[Value],
+    partition_values: &[Option<Value>],
 ) -> Result<DataFile, Error> {
     parquet_to_datafile_impl(
         location,
@@ -123,11 +123,12 @@ fn parquet_to_datafile_impl(
     partition_fields: &[BoundPartitionField<'_>],
     equality_ids: Option<&[i32]>,
     table_properties: &HashMap<String, String>,
-    partition_values: Option<&[Value]>,
+    partition_values: Option<&[Option<Value>]>,
 ) -> Result<DataFile, Error> {
     let write_distinct_counts = table_properties
         .get(WRITE_METADATA_METRICS_DISTINCT_COUNTS_ENABLED)
         .is_some_and(|x| x == "true");
+    let infer_partition_from_stats = partition_values.is_none();
     let mut partition = if let Some(values) = partition_values {
         if values.len() != partition_fields.len() {
             return Err(Error::InvalidFormat("Partition value count".to_owned()));
@@ -135,7 +136,7 @@ fn parquet_to_datafile_impl(
         partition_fields
             .iter()
             .zip(values)
-            .map(|(field, value)| (field.name().to_owned(), Some(value.clone())))
+            .map(|(field, value)| (field.name().to_owned(), value.clone()))
             .collect::<Struct>()
     } else {
         partition_fields
@@ -451,33 +452,35 @@ fn parquet_to_datafile_impl(
                     }
                 }
 
-                if let Some(partition_field) = partition_fields.get(column_name) {
-                    if let Some(partition_value) = partition.get_mut(partition_field.name()) {
-                        if partition_value.is_none() {
-                            let partition_field = partition_fields
-                                .get(column_name)
-                                .ok_or_else(|| Error::InvalidFormat("transform".to_string()))?;
-                            if let (Some(min_bytes), Some(max_bytes)) =
-                                (statistics.min_bytes_opt(), statistics.max_bytes_opt())
-                            {
-                                let min = Value::try_from_bytes_with_hint(
-                                    min_bytes,
-                                    data_type,
-                                    physical_type_hint,
-                                )?
-                                .transform(partition_field.transform())?;
-                                let max = Value::try_from_bytes_with_hint(
-                                    max_bytes,
-                                    data_type,
-                                    physical_type_hint,
-                                )?
-                                .transform(partition_field.transform())?;
-                                if min == max {
-                                    *partition_value = Some(min)
-                                } else {
-                                    return Err(Error::InvalidFormat(
-                                        "Partition value of data file".to_owned(),
-                                    ));
+                if infer_partition_from_stats {
+                    if let Some(partition_field) = partition_fields.get(column_name) {
+                        if let Some(partition_value) = partition.get_mut(partition_field.name()) {
+                            if partition_value.is_none() {
+                                let partition_field = partition_fields
+                                    .get(column_name)
+                                    .ok_or_else(|| Error::InvalidFormat("transform".to_string()))?;
+                                if let (Some(min_bytes), Some(max_bytes)) =
+                                    (statistics.min_bytes_opt(), statistics.max_bytes_opt())
+                                {
+                                    let min = Value::try_from_bytes_with_hint(
+                                        min_bytes,
+                                        data_type,
+                                        physical_type_hint,
+                                    )?
+                                    .transform(partition_field.transform())?;
+                                    let max = Value::try_from_bytes_with_hint(
+                                        max_bytes,
+                                        data_type,
+                                        physical_type_hint,
+                                    )?
+                                    .transform(partition_field.transform())?;
+                                    if min == max {
+                                        *partition_value = Some(min)
+                                    } else {
+                                        return Err(Error::InvalidFormat(
+                                            "Partition value of data file".to_owned(),
+                                        ));
+                                    }
                                 }
                             }
                         }

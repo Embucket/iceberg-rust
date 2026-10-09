@@ -25,11 +25,20 @@ impl Rectangle {
         Self { min, max }
     }
 
+    pub(crate) fn unbounded() -> Self {
+        Self::new(Vec4::new(), Vec4::new())
+    }
+
     /// Expands the rectangle to include the given rectangle.
     ///
     /// This method updates the minimum and maximum values of the rectangle to include
     /// the values in the given `rect` rectangle.
     pub(crate) fn expand(&mut self, rect: &Rectangle) {
+        if self.min.is_empty() || rect.min.is_empty() {
+            self.min.clear();
+            self.max.clear();
+            return;
+        }
         for i in 0..self.min.len() {
             if rect.min[i] < self.min[i] {
                 self.min[i] = rect.min[i].clone();
@@ -59,6 +68,11 @@ impl Rectangle {
     ///
     ///Values the earlier columns more than the later.
     pub(crate) fn cmp_with_priority(&self, other: &Rectangle) -> Result<Ordering, Error> {
+        match (self.min.is_empty(), other.min.is_empty()) {
+            (true, false) => return Ok(Ordering::Greater),
+            (false, true) => return Ok(Ordering::Less),
+            _ => {}
+        }
         let self_iter = self
             .max
             .iter()
@@ -85,12 +99,17 @@ impl Rectangle {
 pub(crate) fn partition_struct_to_vec(
     partition_struct: &Struct,
     names: &[&str],
-) -> Result<Vec4<Value>, Error> {
-    names
+) -> Result<Option<Vec4<Value>>, Error> {
+    let fields = names
         .iter()
-        .map(|x| partition_struct.get(x).and_then(Clone::clone))
-        .collect::<Option<SmallVec<_>>>()
-        .ok_or(Error::InvalidFormat("Partition struct".to_owned()))
+        .map(|x| {
+            partition_struct
+                .get(x)
+                .cloned()
+                .ok_or_else(|| Error::InvalidFormat("Partition struct".to_owned()))
+        })
+        .collect::<Result<Vec4<Option<Value>>, Error>>()?;
+    Ok(fields.into_iter().collect())
 }
 
 pub(crate) fn summary_to_rectangle(summaries: &[FieldSummary]) -> Result<Rectangle, Error> {
@@ -98,18 +117,11 @@ pub(crate) fn summary_to_rectangle(summaries: &[FieldSummary]) -> Result<Rectang
     let mut min = SmallVec::with_capacity(summaries.len());
 
     for summary in summaries {
-        max.push(
-            summary
-                .upper_bound
-                .clone()
-                .ok_or(Error::NotFound("Upper bounds in summary".to_owned()))?,
-        );
-        min.push(
-            summary
-                .lower_bound
-                .clone()
-                .ok_or(Error::NotFound("Upper bounds in summary".to_owned()))?,
-        );
+        let (Some(lower), Some(upper)) = (&summary.lower_bound, &summary.upper_bound) else {
+            return Ok(Rectangle::unbounded());
+        };
+        max.push(upper.clone());
+        min.push(lower.clone());
     }
 
     Ok(Rectangle::new(min, max))
@@ -139,10 +151,33 @@ pub(crate) fn try_sub(left: &[Value], right: &[Value]) -> Result<Vec4<Value>, Er
 
 #[cfg(test)]
 mod tests {
-    use iceberg_rust_spec::values::Value;
+    use iceberg_rust_spec::values::{Struct, Value};
     use smallvec::smallvec;
 
     use super::*;
+
+    #[test]
+    fn null_partition_bounds_are_conservatively_unbounded() {
+        let null_tuple = Struct::from_iter([("id".to_owned(), None)]);
+        assert_eq!(partition_struct_to_vec(&null_tuple, &["id"]).unwrap(), None);
+        assert!(partition_struct_to_vec(&null_tuple, &["missing"]).is_err());
+
+        let summary = FieldSummary {
+            contains_null: true,
+            contains_nan: None,
+            lower_bound: None,
+            upper_bound: None,
+        };
+        let mut bounds = Rectangle::new(smallvec![Value::Int(1)], smallvec![Value::Int(2)]);
+        bounds.expand(&summary_to_rectangle(&[summary]).unwrap());
+        assert!(bounds.min.is_empty());
+        assert!(bounds.max.is_empty());
+        let bounded = Rectangle::new(smallvec![Value::Int(1)], smallvec![Value::Int(2)]);
+        assert_eq!(
+            bounds.cmp_with_priority(&bounded).unwrap(),
+            Ordering::Greater
+        );
+    }
 
     #[test]
     fn test_sub_valid() {

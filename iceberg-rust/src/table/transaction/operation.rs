@@ -1058,10 +1058,15 @@ pub fn bounding_partition_values<'a>(
     partition_column_names: &SmallVec<[&str; 4]>,
 ) -> Result<Rectangle, Error> {
     iter.try_fold(None, |acc, x| {
-        let node = partition_struct_to_vec(x.partition(), partition_column_names)?;
+        let Some(node) = partition_struct_to_vec(x.partition(), partition_column_names)? else {
+            return Ok::<_, Error>(Some(Rectangle::unbounded()));
+        };
         let Some(mut acc) = acc else {
             return Ok::<_, Error>(Some(Rectangle::new(node.clone(), node)));
         };
+        if acc.min.is_empty() {
+            return Ok(Some(acc));
+        }
         acc.expand_with_node(node);
         Ok(Some(acc))
     })?
