@@ -465,9 +465,7 @@ impl Catalog for FileCatalog {
             ));
         };
         if !check_table_requirements(&commit.requirements, &metadata) {
-            return Err(IcebergError::InvalidFormat(
-                "Table requirements not valid".to_owned(),
-            ));
+            return Err(IcebergError::CommitConflict(identifier.to_string()));
         }
         apply_table_updates(&mut metadata, commit.updates)?;
         let temp_metadata_location = new_metadata_location(&metadata);
@@ -487,7 +485,13 @@ impl Catalog for FileCatalog {
                 &strip_prefix(&temp_metadata_location).into(),
                 &strip_prefix(&metadata_location).into(),
             )
-            .await?;
+            .await
+            .map_err(|error| match error {
+                object_store::Error::AlreadyExists { .. } => {
+                    IcebergError::CommitConflict(identifier.to_string())
+                }
+                error => error.into(),
+            })?;
 
         object_store.put_version_hint(&metadata_location).await.ok();
 
@@ -951,7 +955,14 @@ pub mod tests {
     };
     use futures::StreamExt;
     use iceberg_rust::{
-        catalog::{create::CreateTableBuilder, namespace::Namespace, Catalog},
+        catalog::{
+            commit::{CommitTable, TableRequirement},
+            create::CreateTableBuilder,
+            namespace::Namespace,
+            tabular::Tabular,
+            Catalog,
+        },
+        error::Error as IcebergError,
         object_store::{Bucket, ObjectStoreBuilder},
         spec::{
             schema::Schema,
@@ -1010,6 +1021,79 @@ pub mod tests {
         );
         let tabular = catalog.clone().load_tabular(&destination).await.unwrap();
         assert_eq!(tabular.identifier(), &destination);
+    }
+
+    #[tokio::test]
+    async fn conflicting_table_commits_report_commit_conflict() {
+        let store = ObjectStoreBuilder::memory();
+        let first_catalog = Arc::new(
+            FileCatalog::new("/dev/embucket", store.clone())
+                .await
+                .unwrap(),
+        );
+        let second_catalog = Arc::new(FileCatalog::new("/dev/embucket", store).await.unwrap());
+        let namespace = Namespace::try_new(&["public".to_owned()]).unwrap();
+        let identifier =
+            iceberg_rust::catalog::identifier::Identifier::new(&namespace, "conflicting_table");
+        let schema = Schema::builder()
+            .with_struct_field(StructField {
+                id: 1,
+                name: "id".to_owned(),
+                required: true,
+                field_type: Type::Primitive(PrimitiveType::Long),
+                doc: None,
+                initial_default: None,
+                write_default: None,
+            })
+            .build()
+            .unwrap();
+        let mut builder = CreateTableBuilder::default();
+        let mut first = builder
+            .with_name(identifier.name())
+            .with_schema(schema)
+            .build(&namespace, first_catalog.clone())
+            .await
+            .unwrap();
+        let Tabular::Table(mut stale) = second_catalog
+            .clone()
+            .load_tabular(&identifier)
+            .await
+            .unwrap()
+        else {
+            panic!("expected table");
+        };
+
+        let rejected_requirement = first_catalog
+            .clone()
+            .update_table(CommitTable {
+                identifier: identifier.clone(),
+                requirements: vec![TableRequirement::AssertRefSnapshotId {
+                    r#ref: "main".to_owned(),
+                    snapshot_id: Some(123),
+                }],
+                updates: vec![],
+            })
+            .await;
+        assert!(matches!(
+            rejected_requirement,
+            Err(IcebergError::CommitConflict(_))
+        ));
+
+        first
+            .new_transaction(None)
+            .update_properties(vec![("writer".to_owned(), "first".to_owned())])
+            .commit()
+            .await
+            .unwrap();
+        let stale_version = stale
+            .new_transaction(None)
+            .update_properties(vec![("writer".to_owned(), "second".to_owned())])
+            .commit()
+            .await;
+        assert!(matches!(
+            stale_version,
+            Err(IcebergError::CommitConflict(_))
+        ));
     }
 
     #[tokio::test]
