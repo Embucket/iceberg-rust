@@ -17,7 +17,7 @@ use std::{any::Any, collections::HashSet, sync::Arc};
 use crate::error::Error as DatafusionIcebergError;
 use datafusion::{
     arrow::{
-        array::ArrayRef,
+        array::{ArrayRef, Int32Array, Int64Array},
         datatypes::{DataType, Schema as ArrowSchema, TimeUnit},
     },
     common::DataFusionError,
@@ -35,7 +35,7 @@ use iceberg_rust::{
     spec::{
         decimal::{decimal_mantissa, decimal_scale, Decimal},
         manifest::{Content, ManifestEntry},
-        manifest_list::ManifestListEntry,
+        manifest_list::{Content as ManifestContent, ManifestListEntry},
         partition::{BoundPartitionField, Transform},
         schema::Schema,
         types::{PrimitiveType, Type},
@@ -61,6 +61,11 @@ impl<'table, 'manifests> PruneManifests<'table, 'manifests> {
             partition_spec_id,
             files,
         }
+    }
+
+    fn compatible_data_manifest(&self, manifest: &ManifestListEntry) -> bool {
+        manifest.partition_spec_id == self.partition_spec_id
+            && manifest.content == ManifestContent::Data
     }
 }
 
@@ -115,15 +120,16 @@ impl PruningStatistics for PruneManifests<'_, '_> {
             .partition_fields
             .iter()
             .enumerate()
-            .find(|(_, field)| field.source_name() == column.name())?;
+            .find(|(_, field)| field.name() == column.name())?;
         let contains_null = self.files.iter().map(|manifest| {
-            (manifest.partition_spec_id == self.partition_spec_id)
+            self.compatible_data_manifest(manifest)
                 .then_some(manifest)
                 .and_then(|manifest| manifest.partitions.as_ref())
                 .and_then(|partitions| partitions.get(index))
                 .and_then(|partition| (!partition.contains_null).then_some(0))
         });
-        ScalarValue::iter_to_array(contains_null.map(ScalarValue::Int32)).ok()
+        let counts: ArrayRef = Arc::new(Int32Array::from_iter(contains_null));
+        Some(counts)
     }
     fn contained(
         &self,
@@ -135,12 +141,11 @@ impl PruningStatistics for PruneManifests<'_, '_> {
 
     fn row_counts(&self) -> Option<ArrayRef> {
         let row_counts = self.files.iter().map(|x| {
-            match (
-                x.added_rows_count,
-                x.existing_rows_count,
-                x.deleted_rows_count,
-            ) {
-                (Some(a), Some(e), Some(d)) => Some(a + e - d),
+            if !self.compatible_data_manifest(x) {
+                return None;
+            }
+            match (x.added_rows_count, x.existing_rows_count) {
+                (Some(a), Some(e)) => a.checked_add(e),
                 _ => None,
             }
         });
@@ -206,8 +211,25 @@ impl PruningStatistics for PrunePartitionedDataFiles<'_, '_> {
         self.files.len()
     }
 
-    fn null_counts(&self, _column: &Column) -> Option<ArrayRef> {
-        None
+    fn null_counts(&self, column: &Column) -> Option<ArrayRef> {
+        self.partition_fields
+            .iter()
+            .find(|field| field.name() == column.name())?;
+        let counts = self.files.iter().map(|(path, entry)| {
+            let file = entry.data_file();
+            if file.content() != &Content::Data
+                || !self.compatible_manifests.contains(path.as_str())
+            {
+                return None;
+            }
+            match file.partition().get(column.name()) {
+                Some(Some(_)) => Some(0),
+                Some(None) => Some(*file.record_count()),
+                None => None,
+            }
+        });
+        let counts: ArrayRef = Arc::new(Int64Array::from_iter(counts));
+        Some(counts)
     }
 
     fn contained(
@@ -423,6 +445,34 @@ pub(crate) fn transform_predicate(
         })
     }) {
         return Some(expr);
+    }
+
+    let null_check = match &expr {
+        Expr::IsNull(inner) => Some((inner.as_ref(), true)),
+        Expr::IsNotNull(inner) => Some((inner.as_ref(), false)),
+        _ => None,
+    };
+    if let Some((Expr::Column(column), is_null)) = null_check {
+        let field = partition_fields
+            .iter()
+            .find(|field| field.source_name() == column.name())?;
+        if !matches!(
+            field.transform(),
+            Transform::Identity
+                | Transform::Year
+                | Transform::Month
+                | Transform::Day
+                | Transform::Hour
+                | Transform::Truncate(_)
+        ) {
+            return None;
+        }
+        let partition_column = Expr::Column(Column::new(column.relation.clone(), field.name()));
+        return Some(if is_null {
+            Expr::IsNull(Box::new(partition_column))
+        } else {
+            Expr::IsNotNull(Box::new(partition_column))
+        });
     }
 
     let Expr::BinaryExpr(BinaryExpr { left, op, right }) = expr else {
@@ -810,8 +860,105 @@ mod tests {
     }
 
     #[test]
-    fn partitioned_file_pruning_preserves_unknown_specs_and_delete_files() {
+    fn manifest_null_counts_use_transformed_partition_name_and_spec() {
         use datafusion::arrow::array::Int32Array;
+
+        let source = StructField::new(
+            1,
+            "ts",
+            false,
+            Type::Primitive(PrimitiveType::Timestamp),
+            None,
+        );
+        let partition = PartitionField::new(1, 1000, "ts_year", Transform::Year);
+        let fields = [BoundPartitionField::new(&partition, &source)];
+        let entry = |spec_id, contains_null| ManifestListEntry {
+            format_version: FormatVersion::V2,
+            manifest_path: format!("/{spec_id}.avro"),
+            manifest_length: 1,
+            partition_spec_id: spec_id,
+            content: ManifestContent::Data,
+            sequence_number: 1,
+            min_sequence_number: 1,
+            added_snapshot_id: 1,
+            added_files_count: Some(1),
+            existing_files_count: Some(0),
+            deleted_files_count: Some(0),
+            added_rows_count: Some(1),
+            existing_rows_count: Some(0),
+            deleted_rows_count: Some(0),
+            partitions: Some(vec![FieldSummary {
+                contains_null,
+                contains_nan: None,
+                lower_bound: None,
+                upper_bound: None,
+            }]),
+            key_metadata: None,
+            first_row_id: None,
+        };
+        let mut delete_manifest = entry(1, false);
+        delete_manifest.content = ManifestContent::Deletes;
+        delete_manifest.added_rows_count = Some(0);
+        let mut mixed_manifest = entry(1, false);
+        mixed_manifest.deleted_rows_count = Some(1);
+        let manifests = vec![
+            entry(1, false),
+            entry(1, true),
+            entry(0, false),
+            delete_manifest,
+            mixed_manifest,
+        ];
+        let pruning = PruneManifests::new(&fields, 1, &manifests);
+        assert!(pruning.null_counts(&Column::from_name("ts")).is_none());
+        let counts = pruning.null_counts(&Column::from_name("ts_year")).unwrap();
+        let counts = counts.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(counts.value(0), 0);
+        assert!(counts.is_null(1));
+        assert!(counts.is_null(2));
+        assert!(counts.is_null(3));
+        assert_eq!(counts.value(4), 0);
+
+        let row_counts = pruning.row_counts().unwrap();
+        let row_counts = row_counts.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert!(row_counts.is_null(2));
+        assert!(row_counts.is_null(3));
+        assert_eq!(row_counts.value(4), 1);
+
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "ts_year",
+            DataType::Int32,
+            true,
+        )]));
+        let session = SessionContext::new();
+        let state = session.state();
+        for (expr, expected) in [
+            (
+                Expr::IsNull(Box::new(Expr::Column(Column::from_name("ts_year")))),
+                vec![false, true, true, true, false],
+            ),
+            (
+                Expr::IsNotNull(Box::new(Expr::Column(Column::from_name("ts_year")))),
+                vec![true, true, true, true, true],
+            ),
+        ] {
+            let physical = create_physical_expr(
+                &expr,
+                &schema.clone().try_into().unwrap(),
+                state.execution_props(),
+                &PhysicalPlanningContext::default(),
+            )
+            .unwrap();
+            let predicate = PruningPredicateBuilder::new()
+                .with_file_schema(schema.clone())
+                .try_build(physical)
+                .unwrap();
+            assert_eq!(predicate.prune(&pruning).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn partitioned_file_pruning_preserves_unknown_specs_and_delete_files() {
+        use datafusion::arrow::array::{Int32Array, Int64Array};
 
         let source = StructField::new(
             1,
@@ -867,6 +1014,13 @@ mod tests {
         assert!(values.is_null(3));
         assert!(values.is_null(4));
         assert_eq!(pruning.num_containers(), 5);
+        let null_counts = pruning.null_counts(&Column::from_name("ts_year")).unwrap();
+        let null_counts = null_counts.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(null_counts.value(0), 0);
+        assert_eq!(null_counts.value(1), 0);
+        assert!(null_counts.is_null(2));
+        assert_eq!(null_counts.value(3), 1);
+        assert!(null_counts.is_null(4));
 
         let schema = Arc::new(ArrowSchema::new(vec![Field::new(
             "ts_year",
@@ -887,13 +1041,87 @@ mod tests {
         )
         .unwrap();
         let predicate = PruningPredicateBuilder::new()
-            .with_file_schema(schema)
+            .with_file_schema(schema.clone())
             .try_build(physical)
             .unwrap();
         assert_eq!(
             predicate.prune(&pruning).unwrap(),
-            vec![false, true, true, true, true]
+            vec![false, true, true, false, true]
         );
+
+        for (expr, expected) in [
+            (
+                Expr::IsNull(Box::new(Expr::Column(Column::from_name("ts_year")))),
+                vec![false, false, true, true, true],
+            ),
+            (
+                Expr::IsNotNull(Box::new(Expr::Column(Column::from_name("ts_year")))),
+                vec![true, true, true, false, true],
+            ),
+        ] {
+            let physical = create_physical_expr(
+                &expr,
+                &schema.clone().try_into().unwrap(),
+                state.execution_props(),
+                &PhysicalPlanningContext::default(),
+            )
+            .unwrap();
+            let predicate = PruningPredicateBuilder::new()
+                .with_file_schema(schema.clone())
+                .try_build(physical)
+                .unwrap();
+            assert_eq!(predicate.prune(&pruning).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn transformed_null_projection_uses_partition_field_name() {
+        for (transform, source_type) in [
+            (Transform::Year, PrimitiveType::Timestamp),
+            (Transform::Month, PrimitiveType::Timestamp),
+            (Transform::Day, PrimitiveType::Timestamp),
+            (Transform::Hour, PrimitiveType::Timestamp),
+            (Transform::Truncate(10), PrimitiveType::Long),
+        ] {
+            let source = StructField::new(1, "value", false, Type::Primitive(source_type), None);
+            let partition = PartitionField::new(1, 1000, "part", transform);
+            let fields = [BoundPartitionField::new(&partition, &source)];
+            for is_null in [true, false] {
+                let input = Expr::Column(Column::from_name("value"));
+                let predicate = if is_null {
+                    Expr::IsNull(Box::new(input))
+                } else {
+                    Expr::IsNotNull(Box::new(input))
+                };
+                let projected = transform_predicate(predicate, &fields).unwrap();
+                let expected = Expr::Column(Column::from_name("part"));
+                assert_eq!(
+                    projected,
+                    if is_null {
+                        Expr::IsNull(Box::new(expected))
+                    } else {
+                        Expr::IsNotNull(Box::new(expected))
+                    }
+                );
+            }
+        }
+
+        let source = StructField::new(
+            1,
+            "value",
+            false,
+            Type::Primitive(PrimitiveType::Long),
+            None,
+        );
+        for transform in [Transform::Bucket(8), Transform::Void] {
+            let partition = PartitionField::new(1, 1000, "part", transform);
+            let fields = [BoundPartitionField::new(&partition, &source)];
+            assert!(transform_predicate(
+                Expr::IsNull(Box::new(Expr::Column(Column::from_name("value")))),
+                &fields,
+            )
+            .is_none());
+        }
     }
 
     #[test]
