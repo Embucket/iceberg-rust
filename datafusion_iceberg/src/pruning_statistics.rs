@@ -463,6 +463,7 @@ pub(crate) fn transform_predicate(
                 | Transform::Month
                 | Transform::Day
                 | Transform::Hour
+                | Transform::Bucket(_)
                 | Transform::Truncate(_)
         ) {
             return None;
@@ -1081,6 +1082,9 @@ mod tests {
             (Transform::Month, PrimitiveType::Timestamp),
             (Transform::Day, PrimitiveType::Timestamp),
             (Transform::Hour, PrimitiveType::Timestamp),
+            (Transform::Bucket(8), PrimitiveType::Int),
+            (Transform::Bucket(8), PrimitiveType::Long),
+            (Transform::Bucket(8), PrimitiveType::String),
             (Transform::Truncate(10), PrimitiveType::Long),
         ] {
             let source = StructField::new(1, "value", false, Type::Primitive(source_type), None);
@@ -1113,15 +1117,13 @@ mod tests {
             Type::Primitive(PrimitiveType::Long),
             None,
         );
-        for transform in [Transform::Bucket(8), Transform::Void] {
-            let partition = PartitionField::new(1, 1000, "part", transform);
-            let fields = [BoundPartitionField::new(&partition, &source)];
-            assert!(transform_predicate(
-                Expr::IsNull(Box::new(Expr::Column(Column::from_name("value")))),
-                &fields,
-            )
-            .is_none());
-        }
+        let partition = PartitionField::new(1, 1000, "part", Transform::Void);
+        let fields = [BoundPartitionField::new(&partition, &source)];
+        assert!(transform_predicate(
+            Expr::IsNull(Box::new(Expr::Column(Column::from_name("value")))),
+            &fields,
+        )
+        .is_none());
     }
 
     #[test]
