@@ -346,12 +346,7 @@ impl ManifestListEntry {
         format_version: FormatVersion,
         table_metadata: &TableMetadata,
     ) -> Result<ManifestListEntry, Error> {
-        Self::from_avro_value_with_schema(
-            value,
-            format_version,
-            table_metadata,
-            table_metadata.current_schema()?,
-        )
+        ManifestListEntryDecoder::new(table_metadata).decode(value, format_version)
     }
 
     /// Decodes an entry using the schema of the snapshot being scanned.

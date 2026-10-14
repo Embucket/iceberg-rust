@@ -119,13 +119,21 @@ impl<'metadata, R: Read> ManifestListReader<'_, 'metadata, R> {
     /// * The Avro reader cannot be created with the schema
     /// * The manifest list format is invalid
     pub(crate) fn new(reader: R, table_metadata: &'metadata TableMetadata) -> Result<Self, Error> {
-        Self::new_with_schema(reader, table_metadata, table_metadata.current_schema()?)
+        Self::new_with_decoder(reader, table_metadata, None)
     }
 
     fn new_with_schema(
         reader: R,
         table_metadata: &'metadata TableMetadata,
         schema: &'metadata Schema,
+    ) -> Result<Self, Error> {
+        Self::new_with_decoder(reader, table_metadata, Some(schema))
+    }
+
+    fn new_with_decoder(
+        reader: R,
+        table_metadata: &'metadata TableMetadata,
+        schema: Option<&'metadata Schema>,
     ) -> Result<Self, Error> {
         // We intentionally read without a reader schema so that the embedded writer schema is used.
         // Some query engines (e.g. AWS Athena) write legacy field names such as
@@ -144,7 +152,10 @@ impl<'metadata, R: Read> ManifestListReader<'_, 'metadata, R> {
 
         Ok(Self {
             reader,
-            decoder: ManifestListEntryDecoder::with_schema(table_metadata, schema),
+            decoder: schema.map_or_else(
+                || ManifestListEntryDecoder::new(table_metadata),
+                |schema| ManifestListEntryDecoder::with_schema(table_metadata, schema),
+            ),
             writer_format_version,
         })
     }
@@ -379,7 +390,11 @@ pub async fn snapshot_partition_bounds_with_nulls(
         .await?
         .bytes()
         .await?;
-    let reader = ManifestListReader::new(Cursor::new(bytes), table_metadata)?;
+    let reader = ManifestListReader::new_with_schema(
+        Cursor::new(bytes),
+        table_metadata,
+        table_metadata.schema(*snapshot.snapshot_id())?,
+    )?;
     let mut result: Option<PartitionBoundsWithNulls> = None;
     for entry in reader {
         let entry = entry?;
@@ -1789,11 +1804,14 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
 mod tests {
     use super::*;
     use iceberg_rust_spec::{
-        manifest_list::{manifest_list_schema_v1, manifest_list_schema_v3},
+        manifest_list::{manifest_list_schema_v1, manifest_list_schema_v3, FieldSummary},
         spec::{
+            partition::{PartitionField, PartitionSpec, Transform},
             schema::SchemaBuilder,
+            snapshot::{SnapshotBuilder, Summary},
             table_metadata::TableMetadataBuilder,
             types::{PrimitiveType, StructField, Type},
+            values::Value,
         },
     };
 
@@ -1888,6 +1906,176 @@ mod tests {
         assert_eq!(decoded.len(), 1);
         assert_eq!(decoded[0].format_version, FormatVersion::V2);
         assert_eq!(decoded[0].first_row_id, None);
+    }
+
+    #[tokio::test]
+    async fn historical_bounds_survive_copy_and_snapshot_pruning() {
+        for (current_id, current_type) in [(1, PrimitiveType::Long), (2, PrimitiveType::String)] {
+            let historical_schema = SchemaBuilder::default()
+                .with_schema_id(1)
+                .with_struct_field(StructField {
+                    id: 1,
+                    name: "partition_source".to_string(),
+                    required: true,
+                    field_type: Type::Primitive(PrimitiveType::Int),
+                    doc: None,
+                    initial_default: None,
+                    write_default: None,
+                })
+                .build()
+                .unwrap();
+            let current_schema = SchemaBuilder::default()
+                .with_schema_id(2)
+                .with_struct_field(StructField {
+                    id: current_id,
+                    name: "current_value".to_string(),
+                    required: true,
+                    field_type: Type::Primitive(current_type),
+                    doc: None,
+                    initial_default: None,
+                    write_default: None,
+                })
+                .build()
+                .unwrap();
+            let historical_snapshot = SnapshotBuilder::default()
+                .with_snapshot_id(7)
+                .with_sequence_number(1)
+                .with_timestamp_ms(1)
+                .with_manifest_list("historical-list.avro".to_string())
+                .with_summary(Summary::default())
+                .with_schema_id(1)
+                .build()
+                .unwrap();
+            let mut metadata = TableMetadataBuilder::default()
+                .format_version(FormatVersion::V3)
+                .location("s3://tests/table".to_string())
+                .current_schema_id(2)
+                .schemas(HashMap::from([(1, historical_schema), (2, current_schema)]))
+                .default_spec_id(i32::from(current_id != 1))
+                .partition_specs(HashMap::from([
+                    (
+                        0,
+                        PartitionSpec::builder()
+                            .with_spec_id(0)
+                            .with_partition_field(PartitionField::new(
+                                1,
+                                1000,
+                                "partition_source",
+                                Transform::Identity,
+                            ))
+                            .build()
+                            .unwrap(),
+                    ),
+                    (
+                        1,
+                        PartitionSpec::builder()
+                            .with_spec_id(1)
+                            .with_partition_field(PartitionField::new(
+                                2,
+                                1001,
+                                "current_value",
+                                Transform::Identity,
+                            ))
+                            .build()
+                            .unwrap(),
+                    ),
+                ]))
+                .snapshots(HashMap::from([(7, historical_snapshot)]))
+                .build()
+                .unwrap();
+            let historical_entry = ManifestListEntry {
+                format_version: FormatVersion::V3,
+                manifest_path: "historical-manifest.avro".to_string(),
+                manifest_length: 1,
+                partition_spec_id: 0,
+                content: Content::Data,
+                sequence_number: 1,
+                min_sequence_number: 1,
+                added_snapshot_id: 7,
+                added_files_count: Some(1),
+                existing_files_count: Some(0),
+                deleted_files_count: Some(0),
+                added_rows_count: Some(1),
+                existing_rows_count: Some(0),
+                deleted_rows_count: Some(0),
+                partitions: Some(vec![FieldSummary {
+                    contains_null: false,
+                    contains_nan: None,
+                    lower_bound: Some(Value::Int(42)),
+                    upper_bound: Some(Value::Int(42)),
+                }]),
+                key_metadata: None,
+                first_row_id: Some(0),
+            };
+            let mut writer = AvroWriter::new(manifest_list_schema_v3(), Vec::new());
+            writer.append_ser(historical_entry.clone()).unwrap();
+            let bytes = writer.into_inner().unwrap();
+
+            let (copied, overwritten) = ManifestListWriter::from_existing_for_deletion(
+                &bytes,
+                &HashSet::new(),
+                manifest_list_schema_v3(),
+                &metadata,
+            )
+            .unwrap();
+            assert!(overwritten.is_empty());
+            let copied_bytes = copied.writer.into_inner().unwrap();
+            let decoded = ManifestListReader::new(copied_bytes.as_slice(), &metadata)
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(decoded, vec![historical_entry.clone()]);
+
+            let avro_value = AvroReader::new(copied_bytes.as_slice())
+                .unwrap()
+                .next()
+                .unwrap();
+            let public_decoded =
+                ManifestListEntry::from_avro_value(avro_value, FormatVersion::V3, &metadata)
+                    .unwrap();
+            assert_eq!(public_decoded.partitions, historical_entry.partitions);
+
+            if current_id == 1 {
+                let current_snapshot = SnapshotBuilder::default()
+                    .with_snapshot_id(8)
+                    .with_sequence_number(2)
+                    .with_timestamp_ms(2)
+                    .with_manifest_list("s3://tests/table/metadata/mixed-list.avro".to_string())
+                    .with_summary(Summary::default())
+                    .with_schema_id(2)
+                    .build()
+                    .unwrap();
+                metadata.snapshots.insert(8, current_snapshot.clone());
+                let mut current_entry = historical_entry.clone();
+                current_entry.manifest_path = "current-manifest.avro".to_string();
+                current_entry.added_snapshot_id = 8;
+                current_entry.partitions = Some(vec![FieldSummary {
+                    contains_null: false,
+                    contains_nan: None,
+                    lower_bound: Some(Value::LongInt(-100)),
+                    upper_bound: Some(Value::LongInt(-100)),
+                }]);
+                let mut mixed_writer = AvroWriter::new(manifest_list_schema_v3(), Vec::new());
+                mixed_writer.append_ser(historical_entry).unwrap();
+                mixed_writer.append_ser(current_entry).unwrap();
+                let store = Arc::new(object_store::memory::InMemory::new());
+                store
+                    .put(
+                        &strip_prefix(current_snapshot.manifest_list()).into(),
+                        mixed_writer.into_inner().unwrap().into(),
+                    )
+                    .await
+                    .unwrap();
+                let bounds =
+                    snapshot_partition_bounds_with_nulls(&current_snapshot, &metadata, store)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                assert_eq!(bounds.bounds.min.as_slice(), &[Value::LongInt(-100)]);
+                assert_eq!(bounds.bounds.max.as_slice(), &[Value::LongInt(42)]);
+                assert_eq!(bounds.contains_null, vec![false]);
+            }
+        }
     }
 
     fn manifest(
