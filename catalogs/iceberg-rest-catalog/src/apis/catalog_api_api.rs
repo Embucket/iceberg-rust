@@ -881,7 +881,7 @@ pub async fn namespace_exists(
 
     let method = reqwest::Method::HEAD;
 
-    fetch::fetch(configuration, method, prefix, &uri_str, &(), None, None).await
+    fetch::fetch_unit(configuration, method, prefix, &uri_str, &(), None, None).await
 }
 
 /// Register a table using given metadata file location.
@@ -919,7 +919,7 @@ pub async fn rename_table(
     let uri_str = "tables/rename".to_string();
     let method = reqwest::Method::POST;
 
-    fetch::fetch(
+    fetch::fetch_unit(
         configuration,
         method,
         prefix,
@@ -940,7 +940,7 @@ pub async fn rename_view(
     let uri_str = "views/rename".to_string();
     let method = reqwest::Method::POST;
 
-    fetch::fetch(
+    fetch::fetch_unit(
         configuration,
         method,
         prefix,

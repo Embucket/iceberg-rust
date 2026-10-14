@@ -1,7 +1,6 @@
 use crate::{
     apis::{
-        self,
-        catalog_api_api::{self, NamespaceExistsError},
+        self, catalog_api_api,
         configuration::{self, Configuration},
     },
     models::{self, StorageCredential},
@@ -178,17 +177,12 @@ impl Catalog for RestCatalog {
         .await
         {
             Ok(()) => Ok(true),
-            Err(err) => {
-                if let apis::Error::ResponseError(err) = err {
-                    if let Some(NamespaceExistsError::Status404(_)) = err.entity {
-                        Ok(false)
-                    } else {
-                        Err(apis::Error::ResponseError(err).into())
-                    }
-                } else {
-                    Err(err.into())
-                }
+            Err(apis::Error::ResponseError(response))
+                if response.status == reqwest::StatusCode::NOT_FOUND =>
+            {
+                Ok(false)
             }
+            Err(error) => Err(error.into()),
         }
     }
     /// Lists all tables in the given namespace.
@@ -754,6 +748,62 @@ pub mod tests {
             aws_v4_key: None,
         }
     }
+
+    #[tokio::test]
+    async fn namespace_exists_uses_status_for_bodyless_head_response() {
+        for (response_status, expected) in [
+            ("200 OK", Some(true)),
+            ("404 Not Found", Some(false)),
+            ("403 Forbidden", None),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                use std::io::{Read, Write};
+
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                let (mut stream, _) = loop {
+                    match listener.accept() {
+                        Ok(connection) => break connection,
+                        Err(error)
+                            if error.kind() == std::io::ErrorKind::WouldBlock
+                                && std::time::Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => panic!("local REST test server did not accept: {error}"),
+                    }
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = [0_u8; 1024];
+                let size = stream.read(&mut request).unwrap();
+                assert!(String::from_utf8_lossy(&request[..size])
+                    .starts_with("HEAD /v1/catalog/namespaces/PUBLIC "));
+                write!(
+                    stream,
+                    "HTTP/1.1 {response_status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
+            });
+            let catalog = RestCatalog::new(
+                Some("catalog"),
+                configuration(&format!("http://{address}")),
+                None,
+                false,
+            );
+            let namespace = Namespace::try_new(&["PUBLIC".to_string()]).unwrap();
+            let result = catalog.namespace_exists(&namespace).await;
+            server.join().unwrap();
+            match expected {
+                Some(exists) => assert_eq!(result.unwrap(), exists),
+                None => assert!(result.is_err()),
+            }
+        }
+    }
+
     #[tokio::test]
     async fn test_create_update_drop_table() {
         let container_host = if is_podman() {

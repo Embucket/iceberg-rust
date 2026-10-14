@@ -159,6 +159,103 @@ fn write_deletion_vector_file(path: &str, data_file_path: &str, positions: &[u64
 }
 
 #[tokio::test]
+async fn transformed_is_not_null_keeps_position_delete_manifest() {
+    let temp_dir = TempDir::new().unwrap();
+    let table_dir = format!("{}/test/null_prune", temp_dir.path().display());
+    let object_store = ObjectStoreBuilder::Filesystem(Arc::new(LocalFileSystem::new()));
+    let catalog: Arc<dyn Catalog> = Arc::new(
+        SqlCatalog::new("sqlite://", "warehouse", object_store)
+            .await
+            .unwrap(),
+    );
+    catalog
+        .create_namespace(&Namespace::try_new(&["test".to_string()]).unwrap(), None)
+        .await
+        .unwrap();
+    let schema = Schema::builder()
+        .with_struct_field(StructField::new(
+            1,
+            "id",
+            false,
+            Type::Primitive(PrimitiveType::Long),
+            None,
+        ))
+        .build()
+        .unwrap();
+    let partition_spec = PartitionSpec::builder()
+        .with_partition_field(PartitionField::new(
+            1,
+            1000,
+            "id_trunc",
+            Transform::Truncate(10),
+        ))
+        .build()
+        .unwrap();
+    Table::builder()
+        .with_name("null_prune")
+        .with_location(&table_dir)
+        .with_schema(schema)
+        .with_partition_spec(partition_spec)
+        .build(&["test".to_owned()], catalog.clone())
+        .await
+        .unwrap();
+
+    let ctx = SessionContext::new();
+    ctx.register_catalog(
+        "warehouse",
+        Arc::new(IcebergCatalog::new(catalog.clone(), None).await.unwrap()),
+    );
+    run_query(
+        "INSERT INTO warehouse.test.null_prune VALUES (1), (2)",
+        &ctx,
+    )
+    .await;
+    let identifier = Identifier::new(&["test".to_string()], "null_prune");
+    let Tabular::Table(mut table) = catalog.clone().load_tabular(&identifier).await.unwrap() else {
+        panic!("expected Iceberg table");
+    };
+    let manifests = table.manifests(None, None).await.unwrap();
+    let files = table
+        .datafiles(&manifests, None, (None, None))
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    assert_eq!(files.len(), 1);
+    let data_file = files[0].1.data_file();
+    let delete_dir = format!("{table_dir}/data");
+    std::fs::create_dir_all(&delete_dir).unwrap();
+    let delete_file = write_position_delete_file(
+        &format!("{delete_dir}/position-delete.parquet"),
+        data_file.file_path(),
+        data_file.partition().clone(),
+        &[0],
+    );
+    table
+        .new_transaction(None)
+        .append_delete(vec![delete_file])
+        .commit()
+        .await
+        .unwrap();
+    let Tabular::Table(table) = catalog.load_tabular(&identifier).await.unwrap() else {
+        panic!("expected Iceberg table");
+    };
+    let manifests = table.manifests(None, None).await.unwrap();
+    assert!(manifests.iter().any(|manifest| {
+        manifest.content == iceberg_rust::spec::manifest_list::Content::Deletes
+            && manifest.added_rows_count == Some(0)
+    }));
+
+    let rows = run_query(
+        "SELECT id FROM warehouse.test.null_prune WHERE id IS NOT NULL ORDER BY id",
+        &ctx,
+    )
+    .await;
+    assert_batches_eq!(["+----+", "| id |", "+----+", "| 2  |", "+----+"], &rows);
+}
+
+#[tokio::test]
 async fn applies_v2_position_deletes() {
     let temp_dir = TempDir::new().unwrap();
     let table_dir = format!("{}/test/orders", temp_dir.path().display());
