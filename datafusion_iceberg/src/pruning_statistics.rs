@@ -863,7 +863,6 @@ mod tests {
     #[test]
     fn manifest_null_counts_use_transformed_partition_name_and_spec() {
         use datafusion::arrow::array::Int32Array;
-        use datafusion_expr::expr::Cast;
 
         let source = StructField::new(
             1,
@@ -1034,7 +1033,7 @@ mod tests {
         let source_predicate = partition_comparison(
             Expr::Column(Column::from_name("ts")),
             Operator::Eq,
-            Expr::Cast(Cast::new(
+            Expr::Cast(datafusion_expr::expr::Cast::new(
                 Box::new(Expr::Literal(
                     ScalarValue::Utf8(Some("2025-06-15".to_owned())),
                     None,
