@@ -109,6 +109,49 @@ where
     }
 }
 
+pub(crate) async fn fetch_unit<R, E>(
+    configuration: &configuration::Configuration,
+    method: reqwest::Method,
+    prefix: Option<&str>,
+    uri_str: &str,
+    request: &R,
+    headers: Option<HashMap<String, String>>,
+    query_params: Option<HashMap<String, String>>,
+) -> Result<(), Error<E>>
+where
+    R: serde::Serialize + ?Sized,
+    E: serde::de::DeserializeOwned,
+{
+    let response = fetch_inner(
+        configuration,
+        method,
+        prefix,
+        uri_str,
+        request,
+        headers,
+        query_params,
+    )
+    .await?;
+    let status = response.status();
+    let content = response.text().await?;
+    unit_response(status, content)
+}
+
+fn unit_response<E>(status: reqwest::StatusCode, content: String) -> Result<(), Error<E>>
+where
+    E: serde::de::DeserializeOwned,
+{
+    if status.is_success() {
+        return Ok(());
+    }
+    let entity = serde_json::from_str(&content).ok();
+    Err(Error::ResponseError(ResponseContent {
+        status,
+        content,
+        entity,
+    }))
+}
+
 pub(crate) async fn fetch_conditional<R, T, E>(
     configuration: &configuration::Configuration,
     method: reqwest::Method,
@@ -174,5 +217,36 @@ fn build_uri_base(configuration: &configuration::Configuration, prefix: Option<&
             )
         }
         None => format!("{}/v1/", configuration.base_path),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unit_response_accepts_empty_and_nonempty_success_bodies() {
+        for (status, body) in [
+            (reqwest::StatusCode::NO_CONTENT, ""),
+            (reqwest::StatusCode::OK, "null"),
+            (reqwest::StatusCode::OK, "\"NO_CONTENT\""),
+        ] {
+            assert!(unit_response::<serde_json::Value>(status, body.to_string()).is_ok());
+        }
+    }
+
+    #[test]
+    fn unit_response_keeps_error_status_and_body() {
+        let body = r#"{"error":"invalid rename"}"#;
+        let result =
+            unit_response::<serde_json::Value>(reqwest::StatusCode::BAD_REQUEST, body.to_string());
+        match result {
+            Err(Error::ResponseError(response)) => {
+                assert_eq!(response.status, reqwest::StatusCode::BAD_REQUEST);
+                assert_eq!(response.content, body);
+                assert_eq!(response.entity, serde_json::from_str(body).ok());
+            }
+            _ => panic!("expected REST response error"),
+        }
     }
 }

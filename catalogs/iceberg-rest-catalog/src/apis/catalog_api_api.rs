@@ -919,7 +919,7 @@ pub async fn rename_table(
     let uri_str = "tables/rename".to_string();
     let method = reqwest::Method::POST;
 
-    fetch::fetch(
+    fetch::fetch_unit(
         configuration,
         method,
         prefix,
@@ -940,7 +940,7 @@ pub async fn rename_view(
     let uri_str = "views/rename".to_string();
     let method = reqwest::Method::POST;
 
-    fetch::fetch(
+    fetch::fetch_unit(
         configuration,
         method,
         prefix,
