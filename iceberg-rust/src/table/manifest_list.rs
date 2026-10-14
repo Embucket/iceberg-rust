@@ -16,6 +16,7 @@ use iceberg_rust_spec::{
     manifest_list::{
         manifest_list_schema_v1, Content, ManifestListEntry, ManifestListEntryDecoder,
     },
+    schema::Schema,
     snapshot::Snapshot,
     table_metadata::{FormatVersion, TableMetadata},
     util::strip_prefix,
@@ -118,6 +119,14 @@ impl<'metadata, R: Read> ManifestListReader<'_, 'metadata, R> {
     /// * The Avro reader cannot be created with the schema
     /// * The manifest list format is invalid
     pub(crate) fn new(reader: R, table_metadata: &'metadata TableMetadata) -> Result<Self, Error> {
+        Self::new_with_schema(reader, table_metadata, table_metadata.current_schema()?)
+    }
+
+    fn new_with_schema(
+        reader: R,
+        table_metadata: &'metadata TableMetadata,
+        schema: &'metadata Schema,
+    ) -> Result<Self, Error> {
         // We intentionally read without a reader schema so that the embedded writer schema is used.
         // Some query engines (e.g. AWS Athena) write legacy field names such as
         // `added_data_files_count` instead of the spec-correct `added_files_count` (see
@@ -135,7 +144,7 @@ impl<'metadata, R: Read> ManifestListReader<'_, 'metadata, R> {
 
         Ok(Self {
             reader,
-            decoder: ManifestListEntryDecoder::new(table_metadata),
+            decoder: ManifestListEntryDecoder::with_schema(table_metadata, schema),
             writer_format_version,
         })
     }
@@ -266,7 +275,11 @@ pub(crate) async fn read_snapshot<'metadata>(
         }
     };
     let bytes: Cursor<Vec<u8>> = Cursor::new(data.into());
-    ManifestListReader::new(bytes, table_metadata)
+    ManifestListReader::new_with_schema(
+        bytes,
+        table_metadata,
+        table_metadata.schema(*snapshot.snapshot_id())?,
+    )
 }
 
 /// Computes the overall partition bounds for all data files in a snapshot.
@@ -323,7 +336,12 @@ pub async fn snapshot_partition_bounds(
             .into(),
     );
 
-    ManifestListReader::new(bytes, table_metadata)?.try_fold(None::<Rectangle>, |acc, x| {
+    ManifestListReader::new_with_schema(
+        bytes,
+        table_metadata,
+        table_metadata.schema(*snapshot.snapshot_id())?,
+    )?
+    .try_fold(None::<Rectangle>, |acc, x| {
         if let Some(partitions) = x?.partitions {
             let rect = summary_to_rectangle(&partitions)?;
             if let Some(mut acc) = acc {

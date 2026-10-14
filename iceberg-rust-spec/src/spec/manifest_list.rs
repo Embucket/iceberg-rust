@@ -26,6 +26,7 @@ use self::_serde::{
 };
 
 use super::{
+    schema::Schema,
     table_metadata::{FormatVersion, TableMetadata},
     types::Type,
     values::Value,
@@ -339,47 +340,28 @@ mod _serde {
 }
 
 impl ManifestListEntry {
-    fn preferred_schema_id(table_metadata: &TableMetadata, added_snapshot_id: i64) -> i32 {
-        table_metadata
-            .snapshots
-            .get(&added_snapshot_id)
-            .and_then(|snapshot| *snapshot.schema_id())
-            .unwrap_or(table_metadata.current_schema_id)
+    /// Decodes one manifest-list entry from its Avro value for a known writer format version.
+    pub fn from_avro_value(
+        value: Result<AvroValue, apache_avro::Error>,
+        format_version: FormatVersion,
+        table_metadata: &TableMetadata,
+    ) -> Result<ManifestListEntry, Error> {
+        Self::from_avro_value_with_schema(
+            value,
+            format_version,
+            table_metadata,
+            table_metadata.current_schema()?,
+        )
     }
 
-    fn partition_type_candidates(
+    /// Decodes an entry using the schema of the snapshot being scanned.
+    pub fn from_avro_value_with_schema(
+        value: Result<AvroValue, apache_avro::Error>,
+        format_version: FormatVersion,
         table_metadata: &TableMetadata,
-        partition_spec_id: i32,
-        preferred_schema_id: i32,
-    ) -> Result<Vec<Vec<Type>>, Error> {
-        let partition_spec = table_metadata
-            .partition_specs
-            .get(&partition_spec_id)
-            .ok_or_else(|| {
-                Error::NotFound(format!("Partition spec with id {partition_spec_id}"))
-            })?;
-        let mut schema_ids = table_metadata.schemas.keys().copied().collect::<Vec<_>>();
-        schema_ids.sort_unstable_by(|left, right| right.cmp(left));
-        schema_ids.retain(|schema_id| *schema_id != preferred_schema_id);
-        schema_ids.insert(0, preferred_schema_id);
-
-        let mut candidates: Option<Vec<Vec<Type>>> = None;
-        for schema_id in schema_ids {
-            let Some(schema) = table_metadata.schemas.get(&schema_id) else {
-                continue;
-            };
-            let Ok(types) = partition_spec.data_types(schema.fields()) else {
-                continue;
-            };
-            let candidates = candidates.get_or_insert_with(|| vec![Vec::new(); types.len()]);
-            for (field_candidates, data_type) in candidates.iter_mut().zip(types) {
-                if !field_candidates.contains(&data_type) {
-                    field_candidates.push(data_type);
-                }
-            }
-        }
-
-        Ok(candidates.unwrap_or_default())
+        schema: &Schema,
+    ) -> Result<ManifestListEntry, Error> {
+        ManifestListEntryDecoder::with_schema(table_metadata, schema).decode(value, format_version)
     }
 
     pub fn try_from_enum(
@@ -403,19 +385,26 @@ impl ManifestListEntry {
         entry: _serde::ManifestListEntryV3,
         table_metadata: &TableMetadata,
     ) -> Result<ManifestListEntry, Error> {
-        let preferred_schema_id =
-            Self::preferred_schema_id(table_metadata, entry.added_snapshot_id);
-        let partition_types = Self::partition_type_candidates(
+        let (schema, _) = historical_entry_schema(
             table_metadata,
             entry.partition_spec_id,
-            preferred_schema_id,
+            entry.added_snapshot_id,
         )?;
-        Self::try_from_v3_with_partition_types(entry, &partition_types)
+        Self::try_from_v3_with_schema(entry, table_metadata, schema)
     }
 
-    fn try_from_v3_with_partition_types(
+    fn try_from_v3_with_schema(
         entry: _serde::ManifestListEntryV3,
-        partition_types: &[Vec<Type>],
+        table_metadata: &TableMetadata,
+        schema: &Schema,
+    ) -> Result<ManifestListEntry, Error> {
+        let types = partition_field_types(table_metadata, entry.partition_spec_id, schema)?;
+        Self::try_from_v3_with_types(entry, &types)
+    }
+
+    fn try_from_v3_with_types(
+        entry: _serde::ManifestListEntryV3,
+        types: &[Option<Type>],
     ) -> Result<ManifestListEntry, Error> {
         Ok(ManifestListEntry {
             format_version: FormatVersion::V3,
@@ -432,16 +421,7 @@ impl ManifestListEntry {
             added_rows_count: Some(entry.added_rows_count),
             existing_rows_count: Some(entry.existing_rows_count),
             deleted_rows_count: Some(entry.deleted_rows_count),
-            partitions: entry
-                .partitions
-                .filter(|partitions| partitions.len() == partition_types.len())
-                .map(|v| {
-                    v.into_iter()
-                        .zip(partition_types.iter())
-                        .map(|(x, candidates)| FieldSummary::try_from(x, candidates))
-                        .collect::<Result<Vec<_>, Error>>()
-                })
-                .transpose()?,
+            partitions: decode_partition_summaries(entry.partitions, types)?,
             key_metadata: entry.key_metadata,
             first_row_id: entry.first_row_id,
         })
@@ -451,19 +431,26 @@ impl ManifestListEntry {
         entry: _serde::ManifestListEntryV2,
         table_metadata: &TableMetadata,
     ) -> Result<ManifestListEntry, Error> {
-        let preferred_schema_id =
-            Self::preferred_schema_id(table_metadata, entry.added_snapshot_id);
-        let partition_types = Self::partition_type_candidates(
+        let (schema, _) = historical_entry_schema(
             table_metadata,
             entry.partition_spec_id,
-            preferred_schema_id,
+            entry.added_snapshot_id,
         )?;
-        Self::try_from_v2_with_partition_types(entry, &partition_types)
+        Self::try_from_v2_with_schema(entry, table_metadata, schema)
     }
 
-    fn try_from_v2_with_partition_types(
+    fn try_from_v2_with_schema(
         entry: _serde::ManifestListEntryV2,
-        partition_types: &[Vec<Type>],
+        table_metadata: &TableMetadata,
+        schema: &Schema,
+    ) -> Result<ManifestListEntry, Error> {
+        let types = partition_field_types(table_metadata, entry.partition_spec_id, schema)?;
+        Self::try_from_v2_with_types(entry, &types)
+    }
+
+    fn try_from_v2_with_types(
+        entry: _serde::ManifestListEntryV2,
+        types: &[Option<Type>],
     ) -> Result<ManifestListEntry, Error> {
         Ok(ManifestListEntry {
             format_version: FormatVersion::V2,
@@ -480,16 +467,7 @@ impl ManifestListEntry {
             added_rows_count: Some(entry.added_rows_count),
             existing_rows_count: Some(entry.existing_rows_count),
             deleted_rows_count: Some(entry.deleted_rows_count),
-            partitions: entry
-                .partitions
-                .filter(|partitions| partitions.len() == partition_types.len())
-                .map(|v| {
-                    v.into_iter()
-                        .zip(partition_types.iter())
-                        .map(|(x, candidates)| FieldSummary::try_from(x, candidates))
-                        .collect::<Result<Vec<_>, Error>>()
-                })
-                .transpose()?,
+            partitions: decode_partition_summaries(entry.partitions, types)?,
             key_metadata: entry.key_metadata,
             first_row_id: None,
         })
@@ -499,19 +477,26 @@ impl ManifestListEntry {
         entry: _serde::ManifestListEntryV1,
         table_metadata: &TableMetadata,
     ) -> Result<ManifestListEntry, Error> {
-        let preferred_schema_id =
-            Self::preferred_schema_id(table_metadata, entry.added_snapshot_id);
-        let partition_types = Self::partition_type_candidates(
+        let (schema, _) = historical_entry_schema(
             table_metadata,
             entry.partition_spec_id,
-            preferred_schema_id,
+            entry.added_snapshot_id,
         )?;
-        Self::try_from_v1_with_partition_types(entry, &partition_types)
+        Self::try_from_v1_with_schema(entry, table_metadata, schema)
     }
 
-    fn try_from_v1_with_partition_types(
+    fn try_from_v1_with_schema(
         entry: _serde::ManifestListEntryV1,
-        partition_types: &[Vec<Type>],
+        table_metadata: &TableMetadata,
+        schema: &Schema,
+    ) -> Result<ManifestListEntry, Error> {
+        let types = partition_field_types(table_metadata, entry.partition_spec_id, schema)?;
+        Self::try_from_v1_with_types(entry, &types)
+    }
+
+    fn try_from_v1_with_types(
+        entry: _serde::ManifestListEntryV1,
+        types: &[Option<Type>],
     ) -> Result<ManifestListEntry, Error> {
         Ok(ManifestListEntry {
             format_version: FormatVersion::V1,
@@ -528,53 +513,89 @@ impl ManifestListEntry {
             added_rows_count: entry.added_rows_count,
             existing_rows_count: entry.existing_rows_count,
             deleted_rows_count: entry.deleted_rows_count,
-            partitions: entry
-                .partitions
-                .filter(|partitions| partitions.len() == partition_types.len())
-                .map(|v| {
-                    v.into_iter()
-                        .zip(partition_types.iter())
-                        .map(|(x, candidates)| FieldSummary::try_from(x, candidates))
-                        .collect::<Result<Vec<_>, Error>>()
-                })
-                .transpose()?,
+            partitions: decode_partition_summaries(entry.partitions, types)?,
             key_metadata: entry.key_metadata,
             first_row_id: None,
         })
     }
 }
 
-/// Stateful manifest-list decoder that reuses partition type candidates across entries.
+/// Resolves each partition field's result type against the scan schema. A field whose source
+/// column is absent (e.g. dropped, but still referenced by a historical spec) is left untyped so
+/// its bounds are skipped — you cannot prune on a column that no longer exists.
+fn partition_field_types(
+    table_metadata: &TableMetadata,
+    partition_spec_id: i32,
+    schema: &Schema,
+) -> Result<Vec<Option<Type>>, Error> {
+    let partition_spec = table_metadata
+        .partition_specs
+        .get(&partition_spec_id)
+        .ok_or_else(|| Error::NotFound(format!("Partition spec with id {partition_spec_id}")))?;
+    Ok(partition_spec.data_types_lenient(schema.fields()))
+}
+
+struct CachedPartitionTypes {
+    fields: Vec<Option<Type>>,
+    complete: bool,
+}
+
+/// Stateful decoder that reuses partition field types for all entries of a manifest list.
 pub struct ManifestListEntryDecoder<'a> {
     table_metadata: &'a TableMetadata,
-    partition_type_candidates: HashMap<(i32, i32), Vec<Vec<Type>>>,
+    schema: Option<&'a Schema>,
+    partition_types: HashMap<(i32, i32), CachedPartitionTypes>,
 }
 
 impl<'a> ManifestListEntryDecoder<'a> {
     pub fn new(table_metadata: &'a TableMetadata) -> Self {
         Self {
             table_metadata,
-            partition_type_candidates: HashMap::new(),
+            schema: None,
+            partition_types: HashMap::new(),
         }
     }
 
-    fn partition_type_candidates(
-        &mut self,
-        partition_spec_id: i32,
-        added_snapshot_id: i64,
-    ) -> Result<&[Vec<Type>], Error> {
-        let preferred_schema_id =
-            ManifestListEntry::preferred_schema_id(self.table_metadata, added_snapshot_id);
-        let key = (partition_spec_id, preferred_schema_id);
-        if !self.partition_type_candidates.contains_key(&key) {
-            let candidates = ManifestListEntry::partition_type_candidates(
-                self.table_metadata,
-                partition_spec_id,
-                preferred_schema_id,
-            )?;
-            self.partition_type_candidates.insert(key, candidates);
+    pub fn with_schema(table_metadata: &'a TableMetadata, schema: &'a Schema) -> Self {
+        Self {
+            table_metadata,
+            schema: Some(schema),
+            partition_types: HashMap::new(),
         }
-        Ok(self.partition_type_candidates.get(&key).unwrap())
+    }
+
+    fn partition_types(
+        &mut self,
+        spec_id: i32,
+        snapshot_id: i64,
+    ) -> Result<(&[Option<Type>], bool), Error> {
+        let preferred_schema_id = self.schema.map_or_else(
+            || {
+                self.table_metadata
+                    .snapshots
+                    .get(&snapshot_id)
+                    .and_then(|snapshot| *snapshot.schema_id())
+                    .unwrap_or(self.table_metadata.current_schema_id)
+            },
+            |schema| *schema.schema_id(),
+        );
+        let key = (spec_id, preferred_schema_id);
+        if !self.partition_types.contains_key(&key) {
+            let (schema, has_partition_types) = if let Some(schema) = self.schema {
+                (schema, true)
+            } else {
+                historical_entry_schema(self.table_metadata, spec_id, snapshot_id)?
+            };
+            self.partition_types.insert(
+                key,
+                CachedPartitionTypes {
+                    fields: partition_field_types(self.table_metadata, spec_id, schema)?,
+                    complete: has_partition_types,
+                },
+            );
+        }
+        let cached = &self.partition_types[&key];
+        Ok((&cached.fields, cached.complete))
     }
 
     pub fn decode(
@@ -585,62 +606,76 @@ impl<'a> ManifestListEntryDecoder<'a> {
         let entry = value?;
         match format_version {
             FormatVersion::V1 => {
-                let entry = apache_avro::from_value::<_serde::ManifestListEntryV1>(&entry)?;
-                let partition_types = self
-                    .partition_type_candidates(entry.partition_spec_id, entry.added_snapshot_id)?;
-                ManifestListEntry::try_from_v1_with_partition_types(entry, partition_types)
+                let entry = apache_avro::from_value::<ManifestListEntryV1>(&entry)?;
+                let (types, has_partition_types) =
+                    self.partition_types(entry.partition_spec_id, entry.added_snapshot_id)?;
+                let mut decoded = ManifestListEntry::try_from_v1_with_types(entry, types)?;
+                if !has_partition_types {
+                    decoded.partitions = None;
+                }
+                Ok(decoded)
             }
             FormatVersion::V2 => {
-                let entry = apache_avro::from_value::<_serde::ManifestListEntryV2>(&entry)?;
-                let partition_types = self
-                    .partition_type_candidates(entry.partition_spec_id, entry.added_snapshot_id)?;
-                ManifestListEntry::try_from_v2_with_partition_types(entry, partition_types)
+                let entry = apache_avro::from_value::<ManifestListEntryV2>(&entry)?;
+                let (types, has_partition_types) =
+                    self.partition_types(entry.partition_spec_id, entry.added_snapshot_id)?;
+                let mut decoded = ManifestListEntry::try_from_v2_with_types(entry, types)?;
+                if !has_partition_types {
+                    decoded.partitions = None;
+                }
+                Ok(decoded)
             }
             FormatVersion::V3 => {
-                let entry = apache_avro::from_value::<_serde::ManifestListEntryV3>(&entry)?;
-                let partition_types = self
-                    .partition_type_candidates(entry.partition_spec_id, entry.added_snapshot_id)?;
-                ManifestListEntry::try_from_v3_with_partition_types(entry, partition_types)
+                let entry = apache_avro::from_value::<ManifestListEntryV3>(&entry)?;
+                let (types, has_partition_types) =
+                    self.partition_types(entry.partition_spec_id, entry.added_snapshot_id)?;
+                let mut decoded = ManifestListEntry::try_from_v3_with_types(entry, types)?;
+                if !has_partition_types {
+                    decoded.partitions = None;
+                }
+                Ok(decoded)
             }
         }
     }
 }
 
+/// Decodes an entry's partition field summaries, resolving types from the entry's own
+/// `partition_spec_id` against the scan schema and decoding each bound with the spec's
+/// width-inference rule ([`super::manifest::decode_bound`]).
+fn decode_partition_summaries(
+    partitions: Option<Vec<FieldSummarySerde>>,
+    types: &[Option<Type>],
+) -> Result<Option<Vec<FieldSummary>>, Error> {
+    let Some(summaries) = partitions else {
+        return Ok(None);
+    };
+    if summaries.len() != types.len() {
+        return Ok(None);
+    }
+    summaries
+        .into_iter()
+        .zip(types.iter())
+        .map(|(summary, data_type)| FieldSummary::from_serde(summary, data_type.as_ref()))
+        .collect::<Result<Vec<_>, Error>>()
+        .map(Some)
+}
+
 impl FieldSummary {
-    fn try_from(
-        value: _serde::FieldSummarySerde,
-        data_type_candidates: &[Type],
-    ) -> Result<Self, Error> {
+    fn from_serde(value: FieldSummarySerde, data_type: Option<&Type>) -> Result<Self, Error> {
+        let decode = |bytes: Option<ByteBuf>| -> Result<Option<Value>, Error> {
+            match (bytes, data_type) {
+                (Some(bytes), Some(data_type)) => {
+                    super::manifest::decode_bound(&bytes, data_type).map(Some)
+                }
+                _ => Ok(None),
+            }
+        };
         Ok(FieldSummary {
             contains_null: value.contains_null,
             contains_nan: value.contains_nan,
-            lower_bound: value
-                .lower_bound
-                .map(|x| Self::decode_bound(&x, data_type_candidates))
-                .transpose()?,
-            upper_bound: value
-                .upper_bound
-                .map(|x| Self::decode_bound(&x, data_type_candidates))
-                .transpose()?,
+            lower_bound: decode(value.lower_bound)?,
+            upper_bound: decode(value.upper_bound)?,
         })
-    }
-
-    fn decode_bound(bytes: &[u8], data_type_candidates: &[Type]) -> Result<Value, Error> {
-        let target_type = data_type_candidates
-            .first()
-            .ok_or_else(|| Error::InvalidFormat("partition field type candidates".to_string()))?;
-        let mut last_error = None;
-        for data_type in data_type_candidates {
-            match super::manifest::decode_bound(bytes, data_type) {
-                Ok(value) if data_type == target_type => return Ok(value),
-                Ok(value) => match value.promote_iceberg(data_type, target_type) {
-                    Ok(value) => return Ok(value),
-                    Err(error) => last_error = Some(error),
-                },
-                Err(error) => last_error = Some(error),
-            }
-        }
-        Err(last_error.unwrap_or_else(|| Error::InvalidFormat("partition field bound".to_string())))
     }
 }
 
@@ -967,27 +1002,74 @@ pub fn avro_value_to_manifest_list_entry_for_format_version(
     table_metadata: &TableMetadata,
     format_version: FormatVersion,
 ) -> Result<ManifestListEntry, Error> {
-    let entry = value?;
-    match format_version {
-        FormatVersion::V1 => ManifestListEntry::try_from_v1(
-            apache_avro::from_value::<_serde::ManifestListEntryV1>(&entry)?,
-            table_metadata,
-        ),
-        FormatVersion::V2 => ManifestListEntry::try_from_v2(
-            apache_avro::from_value::<_serde::ManifestListEntryV2>(&entry)?,
-            table_metadata,
-        ),
-        FormatVersion::V3 => ManifestListEntry::try_from_v3(
-            apache_avro::from_value::<_serde::ManifestListEntryV3>(&entry)?,
-            table_metadata,
-        ),
+    let value = value?;
+    let entry = match format_version {
+        FormatVersion::V1 => ManifestListEntryEnum::V1(apache_avro::from_value(&value)?),
+        FormatVersion::V2 => ManifestListEntryEnum::V2(apache_avro::from_value(&value)?),
+        FormatVersion::V3 => ManifestListEntryEnum::V3(apache_avro::from_value(&value)?),
+    };
+    let (spec_id, snapshot_id) = match &entry {
+        ManifestListEntryEnum::V1(entry) => (entry.partition_spec_id, entry.added_snapshot_id),
+        ManifestListEntryEnum::V2(entry) => (entry.partition_spec_id, entry.added_snapshot_id),
+        ManifestListEntryEnum::V3(entry) => (entry.partition_spec_id, entry.added_snapshot_id),
+    };
+    let (schema, has_partition_types) =
+        historical_entry_schema(table_metadata, spec_id, snapshot_id)?;
+    let mut decoded = match entry {
+        ManifestListEntryEnum::V1(entry) => {
+            ManifestListEntry::try_from_v1_with_schema(entry, table_metadata, schema)?
+        }
+        ManifestListEntryEnum::V2(entry) => {
+            ManifestListEntry::try_from_v2_with_schema(entry, table_metadata, schema)?
+        }
+        ManifestListEntryEnum::V3(entry) => {
+            ManifestListEntry::try_from_v3_with_schema(entry, table_metadata, schema)?
+        }
+    };
+    if !has_partition_types {
+        decoded.partitions = None;
     }
+    Ok(decoded)
+}
+
+fn historical_entry_schema(
+    metadata: &TableMetadata,
+    spec_id: i32,
+    snapshot_id: i64,
+) -> Result<(&Schema, bool), Error> {
+    let spec = metadata
+        .partition_specs
+        .get(&spec_id)
+        .ok_or_else(|| Error::NotFound(format!("Partition spec with id {spec_id}")))?;
+    let snapshot_schema = metadata
+        .snapshots
+        .get(&snapshot_id)
+        .and_then(|snapshot| *snapshot.schema_id())
+        .and_then(|schema_id| metadata.schemas.get(&schema_id));
+    if let Some(schema) = snapshot_schema {
+        if spec.data_types(schema.fields()).is_ok() {
+            return Ok((schema, true));
+        }
+    }
+    let current = metadata.current_schema()?;
+    if spec.data_types(current.fields()).is_ok() {
+        return Ok((current, true));
+    }
+    let historical = metadata
+        .schemas
+        .iter()
+        .filter(|(_, schema)| spec.data_types(schema.fields()).is_ok())
+        .max_by_key(|(schema_id, _)| *schema_id)
+        .map(|(_, schema)| schema);
+    Ok(historical.map_or((current, false), |schema| (schema, true)))
 }
 
 #[cfg(test)]
 mod tests {
 
     use std::collections::HashMap;
+
+    use ordered_float::OrderedFloat;
 
     use super::*;
 
@@ -997,8 +1079,249 @@ mod tests {
         schema::Schema,
         snapshot::{SnapshotBuilder, Summary},
         table_metadata::TableMetadataBuilder,
-        types::{PrimitiveType, StructField},
+        types::{PrimitiveType, StructField, StructType},
     };
+
+    #[test]
+    fn partition_summaries_decode_pre_promotion_widths() {
+        let summary = _serde::FieldSummarySerde {
+            contains_null: false,
+            contains_nan: None,
+            lower_bound: Some(ByteBuf::from((-42_i32).to_le_bytes())),
+            upper_bound: Some(ByteBuf::from(7_i32.to_le_bytes())),
+        };
+        let decoded =
+            FieldSummary::from_serde(summary, Some(&Type::Primitive(PrimitiveType::Long))).unwrap();
+        assert_eq!(decoded.lower_bound, Some(Value::LongInt(-42)));
+        assert_eq!(decoded.upper_bound, Some(Value::LongInt(7)));
+    }
+
+    #[test]
+    fn partition_bound_promotes_float_to_double() {
+        // A bound written as a 4-byte float before a float->double promotion decodes against the
+        // current `double` type via the spec's width-inference rule.
+        let decoded = crate::spec::manifest::decode_bound(
+            &1.5_f32.to_le_bytes(),
+            &Type::Primitive(PrimitiveType::Double),
+        )
+        .unwrap();
+        assert_eq!(decoded, Value::Double(OrderedFloat(1.5_f64)));
+    }
+
+    #[test]
+    fn manifest_list_entry_uses_its_own_partition_spec() {
+        let mut metadata = TableMetadataBuilder::default()
+            .location("/")
+            .current_schema_id(1)
+            .schemas(HashMap::from([(
+                1,
+                Schema::from_struct_type(
+                    StructType::new(vec![
+                        StructField::new(1, "a", false, Type::Primitive(PrimitiveType::Int), None),
+                        StructField::new(2, "b", false, Type::Primitive(PrimitiveType::Long), None),
+                    ]),
+                    1,
+                    None,
+                ),
+            )]))
+            .default_spec_id(1)
+            .partition_specs(HashMap::from([
+                (
+                    0,
+                    PartitionSpec::builder()
+                        .with_partition_field(PartitionField::new(
+                            1,
+                            1000,
+                            "a",
+                            Transform::Identity,
+                        ))
+                        .build()
+                        .unwrap(),
+                ),
+                (
+                    1,
+                    PartitionSpec::builder()
+                        .with_partition_field(PartitionField::new(
+                            2,
+                            1001,
+                            "b",
+                            Transform::Identity,
+                        ))
+                        .build()
+                        .unwrap(),
+                ),
+            ]))
+            .build()
+            .unwrap();
+        let old_entry = _serde::ManifestListEntryV2 {
+            manifest_path: "/old.avro".into(),
+            manifest_length: 1,
+            partition_spec_id: 0,
+            content: Content::Data,
+            sequence_number: 1,
+            min_sequence_number: 1,
+            added_snapshot_id: 1,
+            added_files_count: 1,
+            existing_files_count: 0,
+            deleted_files_count: 0,
+            added_rows_count: 1,
+            existing_rows_count: 0,
+            deleted_rows_count: 0,
+            partitions: Some(vec![_serde::FieldSummarySerde {
+                contains_null: false,
+                contains_nan: None,
+                lower_bound: Some(ByteBuf::from(7_i32.to_le_bytes())),
+                upper_bound: None,
+            }]),
+            key_metadata: None,
+        };
+        let decoded = ManifestListEntry::try_from_v2(old_entry.clone(), &metadata).unwrap();
+        assert_eq!(
+            decoded.partitions.unwrap()[0].lower_bound,
+            Some(Value::Int(7))
+        );
+
+        let mut unknown_spec = old_entry.clone();
+        unknown_spec.partition_spec_id = 999;
+        unknown_spec.partitions = None;
+        assert!(matches!(
+            ManifestListEntry::try_from_v2(unknown_spec, &metadata),
+            Err(Error::NotFound(_))
+        ));
+
+        let mut mismatched = old_entry.clone();
+        let summaries = mismatched.partitions.as_mut().unwrap();
+        summaries.push(summaries[0].clone());
+        assert!(ManifestListEntry::try_from_v2(mismatched, &metadata)
+            .unwrap()
+            .partitions
+            .is_none());
+
+        metadata.schemas.insert(
+            1,
+            Schema::from_struct_type(
+                StructType::new(vec![StructField::new(
+                    2,
+                    "b",
+                    false,
+                    Type::Primitive(PrimitiveType::Long),
+                    None,
+                )]),
+                1,
+                None,
+            ),
+        );
+        let decoded = ManifestListEntry::try_from_v2(old_entry, &metadata).unwrap();
+        let summary = &decoded.partitions.unwrap()[0];
+        assert!(!summary.contains_null);
+        assert_eq!(summary.lower_bound, None);
+    }
+
+    #[test]
+    fn field_summary_without_resolvable_type_skips_bounds() {
+        // A partition field whose source column was dropped resolves to no type, so its bounds are
+        // skipped while the null/nan flags are preserved.
+        let serde = FieldSummarySerde {
+            contains_null: true,
+            contains_nan: Some(false),
+            lower_bound: Some(ByteBuf::from(1_i32.to_le_bytes().to_vec())),
+            upper_bound: Some(ByteBuf::from(9_i32.to_le_bytes().to_vec())),
+        };
+        let summary = FieldSummary::from_serde(serde, None).unwrap();
+        assert_eq!(
+            summary,
+            FieldSummary {
+                contains_null: true,
+                contains_nan: Some(false),
+                lower_bound: None,
+                upper_bound: None,
+            }
+        );
+    }
+
+    #[test]
+    #[ignore = "manual manifest-list decoder throughput comparison"]
+    fn benchmark_manifest_list_decoder_cache() {
+        use std::{hint::black_box, time::Instant};
+
+        let metadata = TableMetadataBuilder::default()
+            .location("/")
+            .current_schema_id(1)
+            .schemas(HashMap::from([(
+                1,
+                Schema::from_struct_type(
+                    StructType::new(vec![StructField::new(
+                        1,
+                        "id",
+                        false,
+                        Type::Primitive(PrimitiveType::Int),
+                        None,
+                    )]),
+                    1,
+                    None,
+                ),
+            )]))
+            .default_spec_id(0)
+            .partition_specs(HashMap::from([(
+                0,
+                PartitionSpec::builder()
+                    .with_partition_field(PartitionField::new(1, 1000, "id", Transform::Identity))
+                    .build()
+                    .unwrap(),
+            )]))
+            .build()
+            .unwrap();
+        let value = apache_avro::to_value(_serde::ManifestListEntryV1 {
+            manifest_path: "manifest.avro".into(),
+            manifest_length: 1,
+            partition_spec_id: 0,
+            added_snapshot_id: 1,
+            added_files_count: Some(1),
+            existing_files_count: Some(0),
+            deleted_files_count: Some(0),
+            added_rows_count: Some(1),
+            existing_rows_count: Some(0),
+            deleted_rows_count: Some(0),
+            partitions: Some(vec![FieldSummarySerde {
+                contains_null: false,
+                contains_nan: None,
+                lower_bound: Some(ByteBuf::from(1_i32.to_le_bytes())),
+                upper_bound: Some(ByteBuf::from(9_i32.to_le_bytes())),
+            }]),
+            key_metadata: None,
+        })
+        .unwrap();
+        let schema = metadata.current_schema().unwrap();
+        const ITERATIONS: usize = 20_000;
+
+        let mut decoder = ManifestListEntryDecoder::with_schema(&metadata, schema);
+        let cached_start = Instant::now();
+        for _ in 0..ITERATIONS {
+            black_box(
+                decoder
+                    .decode(Ok(value.clone()), FormatVersion::V1)
+                    .unwrap(),
+            );
+        }
+        let cached = cached_start.elapsed();
+
+        let uncached_start = Instant::now();
+        for _ in 0..ITERATIONS {
+            black_box(
+                ManifestListEntry::from_avro_value_with_schema(
+                    Ok(value.clone()),
+                    FormatVersion::V1,
+                    &metadata,
+                    schema,
+                )
+                .unwrap(),
+            );
+        }
+        let uncached = uncached_start.elapsed();
+        eprintln!(
+            "manifest-list decode {ITERATIONS} entries: cached={cached:?}, uncached={uncached:?}"
+        );
+    }
 
     #[test]
     pub fn test_manifest_list_v2() {
@@ -1352,10 +1675,37 @@ mod tests {
             table_metadata(HashMap::from([(7, historical_snapshot_without_schema)])),
             table_metadata(HashMap::new()),
         ] {
+            let mut decoder = ManifestListEntryDecoder::new(&metadata);
+            for _ in 0..2 {
+                let record = apache_avro::Reader::new(&bytes[..])
+                    .unwrap()
+                    .next()
+                    .unwrap();
+                assert_eq!(
+                    decoder
+                        .decode(record, FormatVersion::V1)
+                        .unwrap()
+                        .partitions
+                        .unwrap()[0]
+                        .lower_bound,
+                    Some(Value::Int(42))
+                );
+            }
+            assert_eq!(decoder.partition_types.len(), 1);
             let record = apache_avro::Reader::new(&bytes[..])
                 .unwrap()
                 .next()
                 .unwrap();
+            let direct_entry =
+                apache_avro::from_value::<ManifestListEntryV1>(record.as_ref().unwrap()).unwrap();
+            assert_eq!(
+                ManifestListEntry::try_from_v1(direct_entry, &metadata)
+                    .unwrap()
+                    .partitions
+                    .unwrap()[0]
+                    .lower_bound,
+                Some(Value::Int(42))
+            );
             let decoded = avro_value_to_manifest_list_entry_for_format_version(
                 record,
                 &metadata,
