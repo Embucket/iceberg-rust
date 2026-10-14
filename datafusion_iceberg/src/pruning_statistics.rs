@@ -863,6 +863,7 @@ mod tests {
     #[test]
     fn manifest_null_counts_use_transformed_partition_name_and_spec() {
         use datafusion::arrow::array::Int32Array;
+        use datafusion_expr::expr::Cast;
 
         let source = StructField::new(
             1,
@@ -1030,12 +1031,20 @@ mod tests {
         )]));
         let session = SessionContext::new();
         let state = session.state();
+        let source_predicate = partition_comparison(
+            Expr::Column(Column::from_name("ts")),
+            Operator::Eq,
+            Expr::Cast(Cast::new(
+                Box::new(Expr::Literal(
+                    ScalarValue::Utf8(Some("2025-06-15".to_owned())),
+                    None,
+                )),
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+            )),
+        );
+        let projected = transform_predicate(source_predicate, &fields).unwrap();
         let physical = create_physical_expr(
-            &partition_comparison(
-                Expr::Column(Column::from_name("ts_year")),
-                Operator::Eq,
-                Expr::Literal(ScalarValue::Int32(Some(55)), None),
-            ),
+            &projected,
             &schema.clone().try_into().unwrap(),
             state.execution_props(),
             &PhysicalPlanningContext::default(),
