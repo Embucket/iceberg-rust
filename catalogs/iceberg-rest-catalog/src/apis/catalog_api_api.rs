@@ -881,7 +881,7 @@ pub async fn namespace_exists(
 
     let method = reqwest::Method::HEAD;
 
-    fetch::fetch(configuration, method, prefix, &uri_str, &(), None, None).await
+    fetch::fetch_unit(configuration, method, prefix, &uri_str, &(), None, None).await
 }
 
 /// Register a table using given metadata file location.
