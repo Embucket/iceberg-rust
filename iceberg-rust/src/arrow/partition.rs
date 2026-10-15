@@ -8,24 +8,30 @@
 //! * Efficient handling of distinct partition values
 //! * Automatic management of partition streams and channels
 
-use std::{collections::HashSet, hash::Hash};
+use std::{
+    collections::{HashMap, HashSet},
+    hash::Hash,
+};
 
 use arrow::{
     array::{
         as_primitive_array, as_string_array, Array, ArrayRef, BooleanArray, BooleanBufferBuilder,
-        PrimitiveArray, Scalar, StringArray,
+        PrimitiveArray, Scalar, StringArray, UInt32Array,
     },
     compute::{
         and, filter, filter_record_batch, is_not_null, is_null,
         kernels::cmp::{distinct, eq},
+        take,
     },
     datatypes::{
         ArrowPrimitiveType, DataType, Int32Type, Int64Type, TimeUnit, TimestampMicrosecondType,
+        TimestampNanosecondType,
     },
     error::ArrowError,
     record_batch::RecordBatch,
+    row::{RowConverter, SortField},
 };
-use itertools::{iproduct, Itertools};
+use itertools::{iproduct, Either, Itertools};
 
 use iceberg_rust_spec::{partition::BoundPartitionField, spec::values::Value};
 
@@ -33,6 +39,8 @@ use super::transform::transform_arrow;
 
 /// A record batch and the partition values shared by all its rows.
 pub type PartitionedRecordBatch = (Vec<Option<Value>>, RecordBatch);
+
+const MAX_BITMAP_COMPARISONS: usize = 1_000_000;
 
 /// Partitions a record batch according to the given partition fields.
 ///
@@ -70,6 +78,20 @@ pub fn partition_record_batch<'a>(
         .iter()
         .map(|x| distinct_values(x.clone()))
         .collect::<Result<Vec<_>, ArrowError>>()?;
+    let candidate_groups = distinct_values.iter().zip(&partition_columns).fold(
+        1_usize,
+        |product, (distinct, array)| {
+            product.saturating_mul(distinct.len() + usize::from(array.null_count() > 0))
+        },
+    );
+    if candidate_groups > 16
+        && candidate_groups.saturating_mul(record_batch.num_rows()) > MAX_BITMAP_COMPARISONS
+    {
+        return Ok(Either::Left(partition_record_batch_indexed(
+            record_batch,
+            partition_columns,
+        )?));
+    }
     let mut true_buffer = BooleanBufferBuilder::new(record_batch.num_rows());
     true_buffer.append_n(record_batch.num_rows(), true);
     let predicates = distinct_values
@@ -111,6 +133,21 @@ pub fn partition_record_batch<'a>(
                             Ok((Some(partition_value), eq(&scalar, value)?))
                         })
                         .collect::<Result<Vec<_>, ArrowError>>(),
+                    DistinctValues::TimestampNano(set, timezone) => set
+                        .into_iter()
+                        .map(|x| {
+                            let scalar = Scalar::new(
+                                PrimitiveArray::<TimestampNanosecondType>::from(vec![x])
+                                    .with_timezone_opt(timezone.clone()),
+                            );
+                            let partition_value = if timezone.is_some() {
+                                Value::TimestampTZNano(x)
+                            } else {
+                                Value::TimestampNano(x)
+                            };
+                            Ok((Some(partition_value), eq(&scalar, value)?))
+                        })
+                        .collect::<Result<Vec<_>, ArrowError>>(),
                     DistinctValues::String(set) => set
                         .into_iter()
                         .map(|x| {
@@ -137,9 +174,85 @@ pub fn partition_record_batch<'a>(
                     .collect::<Result<Vec<(Vec<Option<Value>>, _)>, ArrowError>>()
             },
         )?;
-    Ok(predicates.into_iter().map(move |(values, predicate)| {
-        Ok((values, filter_record_batch(record_batch, &predicate)?))
+    Ok(Either::Right(predicates.into_iter().map(
+        move |(values, predicate)| Ok((values, filter_record_batch(record_batch, &predicate)?)),
+    )))
+}
+
+fn partition_record_batch_indexed<'a>(
+    record_batch: &'a RecordBatch,
+    partition_columns: Vec<ArrayRef>,
+) -> Result<impl Iterator<Item = Result<PartitionedRecordBatch, ArrowError>> + 'a, ArrowError> {
+    let converter = RowConverter::new(
+        partition_columns
+            .iter()
+            .map(|array| SortField::new(array.data_type().clone()))
+            .collect(),
+    )?;
+    let rows = converter.convert_columns(&partition_columns)?;
+    let mut groups: HashMap<_, (usize, Vec<u32>)> = HashMap::new();
+    for row in 0..record_batch.num_rows() {
+        let key = rows.row(row);
+        let index = u32::try_from(row).map_err(|_| {
+            ArrowError::ComputeError("Record batch exceeds u32 row-index range".into())
+        })?;
+        groups
+            .entry(key)
+            .or_insert_with(|| (row, Vec::new()))
+            .1
+            .push(index);
+    }
+
+    let groups: Vec<_> = groups.into_values().collect();
+    Ok(groups.into_iter().map(move |(first_row, indices)| {
+        let values = partition_columns
+            .iter()
+            .map(|array| partition_value_at(array, first_row))
+            .collect::<Result<Vec<_>, _>>()?;
+        let indices = UInt32Array::from(indices);
+        let columns = record_batch
+            .columns()
+            .iter()
+            .map(|array| take(array.as_ref(), &indices, None))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((
+            values,
+            RecordBatch::try_new(record_batch.schema(), columns)?,
+        ))
     }))
+}
+
+fn partition_value_at(array: &ArrayRef, row: usize) -> Result<Option<Value>, ArrowError> {
+    if array.is_null(row) {
+        return Ok(None);
+    }
+    let value = match array.data_type() {
+        DataType::Int32 => Value::Int(as_primitive_array::<Int32Type>(array).value(row)),
+        DataType::Int64 => Value::LongInt(as_primitive_array::<Int64Type>(array).value(row)),
+        DataType::Timestamp(TimeUnit::Microsecond, timezone) => {
+            let value = as_primitive_array::<TimestampMicrosecondType>(array).value(row);
+            if timezone.is_some() {
+                Value::TimestampTZ(value)
+            } else {
+                Value::Timestamp(value)
+            }
+        }
+        DataType::Timestamp(TimeUnit::Nanosecond, timezone) => {
+            let value = as_primitive_array::<TimestampNanosecondType>(array).value(row);
+            if timezone.is_some() {
+                Value::TimestampTZNano(value)
+            } else {
+                Value::TimestampNano(value)
+            }
+        }
+        DataType::Utf8 => Value::String(as_string_array(array).value(row).to_owned()),
+        _ => {
+            return Err(ArrowError::ComputeError(
+                "Datatype not supported for partitioning".into(),
+            ))
+        }
+    };
+    Ok(Some(value))
 }
 
 /// Extracts distinct values from an Arrow array into a DistinctValues enum
@@ -172,6 +285,10 @@ fn distinct_values(array: ArrayRef) -> Result<DistinctValues, ArrowError> {
         >(array)?)),
         DataType::Timestamp(TimeUnit::Microsecond, timezone) => Ok(DistinctValues::Timestamp(
             distinct_values_primitive::<i64, TimestampMicrosecondType>(array.clone())?,
+            timezone.clone(),
+        )),
+        DataType::Timestamp(TimeUnit::Nanosecond, timezone) => Ok(DistinctValues::TimestampNano(
+            distinct_values_primitive::<i64, TimestampNanosecondType>(array.clone())?,
             timezone.clone(),
         )),
         DataType::Utf8 => Ok(DistinctValues::String(distinct_values_string(array)?)),
@@ -279,19 +396,32 @@ fn distinct_values_string(array: ArrayRef) -> Result<HashSet<String>, ArrowError
 /// * `Int` - Distinct 32-bit integer values
 /// * `Long` - Distinct 64-bit integer values  
 /// * `Timestamp` - Distinct microsecond timestamps and their optional timezone
+/// * `TimestampNano` - Distinct nanosecond timestamps and their optional timezone
 /// * `String` - Distinct string values
 enum DistinctValues {
     Int(HashSet<i32>),
     Long(HashSet<i64>),
     Timestamp(HashSet<i64>, Option<std::sync::Arc<str>>),
+    TimestampNano(HashSet<i64>, Option<std::sync::Arc<str>>),
     String(HashSet<String>),
+}
+
+impl DistinctValues {
+    fn len(&self) -> usize {
+        match self {
+            Self::Int(values) => values.len(),
+            Self::Long(values) => values.len(),
+            Self::Timestamp(values, _) | Self::TimestampNano(values, _) => values.len(),
+            Self::String(values) => values.len(),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
-    use arrow::array::{ArrayRef, TimestampMicrosecondArray};
+    use arrow::array::{ArrayRef, TimestampMicrosecondArray, TimestampNanosecondArray};
     use iceberg_rust_spec::spec::{
         partition::{PartitionField, Transform},
         types::{PrimitiveType, StructField, Type},
@@ -330,6 +460,128 @@ mod tests {
             };
             assert_eq!(values, expected);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn identity_partition_preserves_nanosecond_precision() -> Result<(), ArrowError> {
+        for timezone in [None, Some("UTC")] {
+            let array: ArrayRef = Arc::new(
+                TimestampNanosecondArray::from(vec![Some(10_i64), Some(11_i64), None])
+                    .with_timezone_opt(timezone),
+            );
+            let batch = RecordBatch::try_from_iter(vec![("ts", array)])?;
+            let source_type = if timezone.is_some() {
+                PrimitiveType::TimestamptzNs
+            } else {
+                PrimitiveType::TimestampNs
+            };
+            let source = StructField::new(1, "ts", false, Type::Primitive(source_type), None);
+            let partition = PartitionField::new(1, 1000, "ts", Transform::Identity);
+            let bound = BoundPartitionField::new(&partition, &source);
+            let mut groups = partition_record_batch(&batch, &[bound])?
+                .map(|group| group.map(|(values, rows)| (values[0].clone(), rows.num_rows())))
+                .collect::<Result<Vec<_>, ArrowError>>()?;
+            groups.sort();
+            let expected = if timezone.is_some() {
+                vec![
+                    (None, 1),
+                    (Some(Value::TimestampTZNano(10)), 1),
+                    (Some(Value::TimestampTZNano(11)), 1),
+                ]
+            } else {
+                vec![
+                    (None, 1),
+                    (Some(Value::TimestampNano(10)), 1),
+                    (Some(Value::TimestampNano(11)), 1),
+                ]
+            };
+            assert_eq!(groups, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn high_cardinality_nanosecond_partitions_use_indexed_groups() -> Result<(), ArrowError> {
+        let size = 2_048;
+        for timezone in [None, Some("UTC")] {
+            let timestamps: Vec<_> = (0..size)
+                .map(|row| if row == 0 { None } else { Some(i64::from(row)) })
+                .collect();
+            let array: ArrayRef =
+                Arc::new(TimestampNanosecondArray::from(timestamps).with_timezone_opt(timezone));
+            let categories: ArrayRef = Arc::new(arrow::array::Int32Array::from_iter_values(
+                (0..size).map(|row| row % 2),
+            ));
+            let batch = RecordBatch::try_from_iter(vec![("ts", array), ("category", categories)])?;
+            let source_type = if timezone.is_some() {
+                PrimitiveType::TimestamptzNs
+            } else {
+                PrimitiveType::TimestampNs
+            };
+            let ts = StructField::new(1, "ts", false, Type::Primitive(source_type), None);
+            let category = StructField::new(
+                2,
+                "category",
+                true,
+                Type::Primitive(PrimitiveType::Int),
+                None,
+            );
+            let ts_partition = PartitionField::new(1, 1000, "ts_part", Transform::Identity);
+            let category_partition =
+                PartitionField::new(2, 1001, "category_part", Transform::Identity);
+            let fields = [
+                BoundPartitionField::new(&ts_partition, &ts),
+                BoundPartitionField::new(&category_partition, &category),
+            ];
+            let groups =
+                partition_record_batch(&batch, &fields)?.collect::<Result<Vec<_>, ArrowError>>()?;
+            assert_eq!(groups.len(), size as usize);
+            for (values, batch) in groups {
+                assert_eq!(batch.num_rows(), 1);
+                let timestamp = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<TimestampNanosecondArray>()
+                    .unwrap();
+                let category = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int32Array>()
+                    .unwrap()
+                    .value(0);
+                let expected = if timestamp.is_null(0) {
+                    None
+                } else if timezone.is_some() {
+                    Some(Value::TimestampTZNano(timestamp.value(0)))
+                } else {
+                    Some(Value::TimestampNano(timestamp.value(0)))
+                };
+                assert_eq!(values, vec![expected, Some(Value::Int(category))]);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn indexed_grouping_accepts_more_than_ten_thousand_partitions() -> Result<(), ArrowError> {
+        let size = 10_001_i64;
+        let timestamps: ArrayRef = Arc::new(TimestampNanosecondArray::from_iter_values(0..size));
+        let batch = RecordBatch::try_from_iter(vec![("ts", timestamps)])?;
+        let source = StructField::new(
+            1,
+            "ts",
+            true,
+            Type::Primitive(PrimitiveType::TimestampNs),
+            None,
+        );
+        let partition = PartitionField::new(1, 1000, "ts_part", Transform::Identity);
+        let rows =
+            partition_record_batch(&batch, &[BoundPartitionField::new(&partition, &source)])?
+                .try_fold(0, |total, group| {
+                    group.map(|(_, batch)| total + batch.num_rows())
+                })?;
+        assert_eq!(rows, size as usize);
         Ok(())
     }
 

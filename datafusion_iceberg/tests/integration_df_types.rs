@@ -5,7 +5,67 @@
 #[path = "df_common/mod.rs"]
 mod df_common;
 
+use datafusion::arrow::datatypes::{DataType, TimeUnit};
+use datafusion_iceberg::catalog::catalog::IcebergCatalog;
 use df_common::{boot_df_stack, execute_scalar_f64, execute_scalar_i64, execute_sql};
+use iceberg_rust::catalog::{identifier::Identifier, tabular::Tabular};
+use iceberg_rust::spec::table_metadata::FormatVersion;
+
+#[tokio::test]
+async fn integration_df_v3_create_table_infers_nanosecond_timestamp() {
+    let ctx = boot_df_stack().await;
+    execute_sql(&ctx, "CREATE SCHEMA warehouse.tp_ts_ns").await;
+    execute_sql(
+        &ctx,
+        "CREATE EXTERNAL TABLE warehouse.tp_ts_ns.v2 \
+         (id BIGINT NOT NULL, ts TIMESTAMP NOT NULL) STORED AS ICEBERG \
+         LOCATION '/warehouse/tp_ts_ns/v2'",
+    )
+    .await;
+    let v2 = ctx.table("warehouse.tp_ts_ns.v2").await.unwrap();
+    assert_eq!(
+        v2.schema()
+            .field_with_unqualified_name("ts")
+            .unwrap()
+            .data_type(),
+        &DataType::Timestamp(TimeUnit::Microsecond, None)
+    );
+    let provider = ctx.catalog("warehouse").unwrap();
+    let catalog = provider.downcast_ref::<IcebergCatalog>().unwrap().catalog();
+    let v2_id = Identifier::new(&["tp_ts_ns".to_owned()], "v2");
+    let Tabular::Table(v2_table) = catalog.clone().load_tabular(&v2_id).await.unwrap() else {
+        panic!("expected Iceberg table");
+    };
+    assert_eq!(v2_table.metadata().format_version, FormatVersion::V2);
+    for (name, version) in [("t", "3"), ("padded", "03")] {
+        execute_sql(
+            &ctx,
+            &format!(
+                "CREATE EXTERNAL TABLE warehouse.tp_ts_ns.{name} \
+                 (id BIGINT NOT NULL, ts TIMESTAMP NOT NULL) STORED AS ICEBERG \
+                 LOCATION '/warehouse/tp_ts_ns/{name}' OPTIONS ('format-version' '{version}')"
+            ),
+        )
+        .await;
+        let table = ctx
+            .table(format!("warehouse.tp_ts_ns.{name}"))
+            .await
+            .unwrap();
+        assert_eq!(
+            table
+                .schema()
+                .field_with_unqualified_name("ts")
+                .unwrap()
+                .data_type(),
+            &DataType::Timestamp(TimeUnit::Nanosecond, None)
+        );
+        let v3_id = Identifier::new(&["tp_ts_ns".to_owned()], name);
+        let Tabular::Table(v3_table) = catalog.clone().load_tabular(&v3_id).await.unwrap() else {
+            panic!("expected Iceberg table");
+        };
+        assert_eq!(v3_table.metadata().format_version, FormatVersion::V3);
+    }
+}
 
 #[tokio::test]
 async fn integration_df_date_equality_and_range() {

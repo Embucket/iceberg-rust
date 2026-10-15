@@ -207,6 +207,14 @@ impl TryFrom<&DataType> for Type {
             })),
             DataType::Date32 => Ok(Type::Primitive(PrimitiveType::Date)),
             DataType::Time64(_) => Ok(Type::Primitive(PrimitiveType::Time)),
+            DataType::Timestamp(TimeUnit::Nanosecond, None) => {
+                Ok(Type::Primitive(PrimitiveType::TimestampNs))
+            }
+            DataType::Timestamp(TimeUnit::Nanosecond, Some(tz))
+                if tz.as_ref() == "UTC" || tz.as_ref() == "+00:00" =>
+            {
+                Ok(Type::Primitive(PrimitiveType::TimestamptzNs))
+            }
             DataType::Timestamp(_, None) => Ok(Type::Primitive(PrimitiveType::Timestamp)),
             DataType::Timestamp(_, Some(tz)) if tz.as_ref() == "UTC" || tz.as_ref() == "+00:00" => {
                 Ok(Type::Primitive(PrimitiveType::Timestamptz))
@@ -1239,6 +1247,21 @@ mod tests {
         )]))]);
         let result: Result<StructType, Error> = (&arrow_schema).try_into();
         assert!(matches!(result.unwrap_err(), Error::NotSupported(_)));
+
+        for (arrow_type, iceberg_type) in [
+            (
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                PrimitiveType::TimestampNs,
+            ),
+            (
+                DataType::Timestamp(TimeUnit::Nanosecond, Some(Arc::from("UTC"))),
+                PrimitiveType::TimestamptzNs,
+            ),
+        ] {
+            let inferred = Type::try_from(&arrow_type).unwrap();
+            assert_eq!(inferred, Type::Primitive(iceberg_type));
+            assert_eq!(DataType::try_from(&inferred).unwrap(), arrow_type);
+        }
     }
 
     #[test]

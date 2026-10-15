@@ -10,10 +10,12 @@ use std::sync::Arc;
 use datafusion::arrow::array::{
     ArrayRef, Date32Array, Decimal128Array, Float32Array, Float64Array, Int32Array, Int64Array,
     RecordBatch, StringArray, Time64MicrosecondArray, TimestampMicrosecondArray,
+    TimestampNanosecondArray,
 };
 use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema, TimeUnit};
 use datafusion::dataframe::DataFrameWriteOptions;
-use datafusion::prelude::SessionContext;
+use datafusion::prelude::{col, lit, SessionContext};
+use datafusion::scalar::ScalarValue;
 use datafusion_iceberg::catalog::catalog::IcebergCatalog;
 use iceberg_rust::catalog::identifier::Identifier;
 use iceberg_rust::catalog::Catalog;
@@ -23,7 +25,9 @@ use iceberg_rust::object_store::ObjectStoreBuilder;
 use iceberg_rust::spec::decimal::decimal_from_i128_with_scale;
 use iceberg_rust::spec::manifest::DataFile;
 use iceberg_rust::spec::namespace::Namespace;
-use iceberg_rust::spec::partition::{BoundPartitionField, PartitionField, Transform};
+use iceberg_rust::spec::partition::{
+    BoundPartitionField, PartitionField, PartitionSpec, Transform,
+};
 use iceberg_rust::spec::schema::Schema;
 use iceberg_rust::spec::types::{PrimitiveType, StructField, Type};
 use iceberg_rust::spec::values::Value;
@@ -207,6 +211,16 @@ fn parquet_stats_and_partition_value_decode_correctly() {
             DataType::Timestamp(TimeUnit::Microsecond, Some(Arc::from("UTC"))),
             false,
         ),
+        Field::new(
+            "ts_ns_col",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            false,
+        ),
+        Field::new(
+            "tstz_ns_col",
+            DataType::Timestamp(TimeUnit::Nanosecond, Some(Arc::from("UTC"))),
+            false,
+        ),
         Field::new("uuid_col", DataType::Utf8, false),
     ]));
 
@@ -219,6 +233,8 @@ fn parquet_stats_and_partition_value_decode_correctly() {
     let time_val: i64 = 45_296_123_456; // 12:34:56.123456
     let ts_val: i64 = 1_700_000_000_123_456;
     let tstz_val: i64 = 1_700_000_012_345_678;
+    let ts_ns_val: i64 = 1_700_000_000_123_456_789;
+    let tstz_ns_val: i64 = 1_700_000_012_345_678_901;
     let uuid_str = "550e8400-e29b-41d4-a716-446655440000";
 
     let batch = RecordBatch::try_new(
@@ -237,6 +253,8 @@ fn parquet_stats_and_partition_value_decode_correctly() {
             Arc::new(Time64MicrosecondArray::from(vec![time_val])),
             Arc::new(TimestampMicrosecondArray::from(vec![ts_val])),
             Arc::new(TimestampMicrosecondArray::from(vec![tstz_val]).with_timezone("UTC")),
+            Arc::new(TimestampNanosecondArray::from(vec![ts_ns_val])),
+            Arc::new(TimestampNanosecondArray::from(vec![tstz_ns_val]).with_timezone("UTC")),
             Arc::new(StringArray::from(vec![uuid_str])),
         ],
     )
@@ -259,6 +277,8 @@ fn parquet_stats_and_partition_value_decode_correctly() {
         ("time_col", Type::Primitive(PrimitiveType::Time)),
         ("ts_col", Type::Primitive(PrimitiveType::Timestamp)),
         ("tstz_col", Type::Primitive(PrimitiveType::Timestamptz)),
+        ("ts_ns_col", Type::Primitive(PrimitiveType::TimestampNs)),
+        ("tstz_ns_col", Type::Primitive(PrimitiveType::TimestamptzNs)),
         ("uuid_col", Type::Primitive(PrimitiveType::Uuid)),
     ]
     .into_iter()
@@ -306,6 +326,154 @@ fn parquet_stats_and_partition_value_decode_correctly() {
         assert_eq!(bounds[&6], Value::Time(time_val));
         assert_eq!(bounds[&7], Value::Timestamp(ts_val));
         assert_eq!(bounds[&8], Value::TimestampTZ(tstz_val));
-        assert_eq!(bounds[&9], uuid_val);
+        assert_eq!(bounds[&9], Value::TimestampNano(ts_ns_val));
+        assert_eq!(bounds[&10], Value::TimestampTZNano(tstz_ns_val));
+        assert_eq!(bounds[&11], uuid_val);
     }
+}
+
+#[tokio::test]
+async fn v3_nanosecond_timestamps_round_trip_without_truncation() {
+    let object_store = ObjectStoreBuilder::memory();
+    let catalog: Arc<dyn Catalog> = Arc::new(
+        SqlCatalog::new("sqlite://", "test", object_store)
+            .await
+            .unwrap(),
+    );
+    catalog
+        .create_namespace(&Namespace::try_new(&["public".to_string()]).unwrap(), None)
+        .await
+        .unwrap();
+    let identifier = Identifier::new(&["public".to_string()], "ts_ns");
+    let mut schema_builder = Schema::builder();
+    for (id, (name, data_type)) in [
+        ("id", PrimitiveType::Int),
+        ("ts_ns", PrimitiveType::TimestampNs),
+        ("tstz_ns", PrimitiveType::TimestamptzNs),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        schema_builder.with_struct_field(StructField::new(
+            id as i32 + 1,
+            name,
+            true,
+            Type::Primitive(data_type),
+            None,
+        ));
+    }
+    Table::builder()
+        .with_name("ts_ns")
+        .with_location("/ts_ns")
+        .with_schema(schema_builder.build().unwrap())
+        .with_partition_spec(
+            PartitionSpec::builder()
+                .with_partition_field(PartitionField::new(
+                    2,
+                    1000,
+                    "ts_ns_part",
+                    Transform::Identity,
+                ))
+                .with_partition_field(PartitionField::new(
+                    3,
+                    1001,
+                    "tstz_ns_part",
+                    Transform::Identity,
+                ))
+                .build()
+                .unwrap(),
+        )
+        .with_property(("format-version".to_owned(), "3".to_owned()))
+        .build(identifier.namespace(), catalog.clone())
+        .await
+        .unwrap();
+
+    let ctx = SessionContext::new();
+    ctx.register_catalog(
+        "warehouse",
+        Arc::new(IcebergCatalog::new(catalog, None).await.unwrap()),
+    );
+    let values = [-1_i64, 0, 1_700_000_000_123_456_789];
+    let batch = RecordBatch::try_from_iter(vec![
+        ("id", Arc::new(Int32Array::from(vec![0, 1, 2])) as ArrayRef),
+        (
+            "ts_ns",
+            Arc::new(TimestampNanosecondArray::from(values.to_vec())) as ArrayRef,
+        ),
+        (
+            "tstz_ns",
+            Arc::new(TimestampNanosecondArray::from(values.to_vec()).with_timezone("UTC"))
+                as ArrayRef,
+        ),
+    ])
+    .unwrap();
+    ctx.read_batch(batch)
+        .unwrap()
+        .write_table("warehouse.public.ts_ns", DataFrameWriteOptions::default())
+        .await
+        .unwrap();
+
+    let batches = ctx
+        .sql("SELECT ts_ns, tstz_ns FROM warehouse.public.ts_ns ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let batch = &batches[0];
+    assert_eq!(batch.num_rows(), values.len());
+    for column in batch.columns() {
+        let timestamps = column
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .expect("Iceberg v3 timestamp must keep nanosecond Arrow type");
+        for (row, expected) in values.iter().enumerate() {
+            assert_eq!(timestamps.value(row), *expected);
+        }
+    }
+
+    let filtered = ctx
+        .table("warehouse.public.ts_ns")
+        .await
+        .unwrap()
+        .filter(col("ts_ns").eq(lit(ScalarValue::TimestampNanosecond(Some(-1), None))))
+        .unwrap();
+    let matching = filtered
+        .select_columns(&["id"])
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(matching.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+    let ids = matching[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    assert_eq!(ids.value(0), 0);
+
+    let matching_tz = ctx
+        .table("warehouse.public.ts_ns")
+        .await
+        .unwrap()
+        .filter(col("tstz_ns").eq(lit(ScalarValue::TimestampNanosecond(
+            Some(-1),
+            Some("UTC".into()),
+        ))))
+        .unwrap()
+        .select_columns(&["id"])
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        matching_tz.iter().map(RecordBatch::num_rows).sum::<usize>(),
+        1
+    );
+    let ids = matching_tz[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    assert_eq!(ids.value(0), 0);
 }

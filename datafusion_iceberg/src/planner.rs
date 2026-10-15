@@ -36,7 +36,8 @@ use iceberg_rust::{
         namespace::Namespace,
         partition::{PartitionField, PartitionSpec, Transform},
         schema::{Schema, DEFAULT_SCHEMA_ID},
-        types::StructType,
+        table_metadata::FormatVersion,
+        types::{PrimitiveType, StructType, Type},
         view_metadata::{Version, ViewRepresentation},
     },
     table::Table,
@@ -170,8 +171,35 @@ async fn plan_create_table(
 
     let fields_with_ids = new_fields_with_ids(node.0.schema.as_arrow().fields(), &mut 0)
         .map_err(|err| DataFusionError::External(Box::new(err)))?;
-    let schema = StructType::try_from(&fields_with_ids)
+    let mut schema = StructType::try_from(&fields_with_ids)
         .map_err(|err| DataFusionError::External(Box::new(err)))?;
+    let mut properties = node.0.options.clone();
+    if let Some(version) = properties.remove("format.format-version") {
+        properties.insert("format-version".to_owned(), version);
+    }
+    let format_version = properties
+        .get("format-version")
+        .map(|version| {
+            let number = version
+                .parse::<u8>()
+                .map_err(|error| DataFusionError::External(Box::new(error)))?;
+            FormatVersion::try_from(number)
+                .map_err(|error| DataFusionError::External(Box::new(error)))
+        })
+        .transpose()?
+        .unwrap_or_default();
+    if format_version != FormatVersion::V3 {
+        schema = StructType::new(
+            schema
+                .iter()
+                .cloned()
+                .map(|mut field| {
+                    v2_compatible_timestamp_type(&mut field.field_type);
+                    field
+                })
+                .collect(),
+        );
+    }
 
     let pacrtition_spec = node
         .0
@@ -214,7 +242,7 @@ async fn plan_create_table(
         .with_location(location)
         .with_schema(Schema::from_struct_type(schema, DEFAULT_SCHEMA_ID, None))
         .with_partition_spec(partition_spec)
-        .with_properties(node.0.options.clone())
+        .with_properties(properties)
         .build(&[namespace_name.as_ref().to_owned()], catalog)
         .await
         .map_err(|err| DataFusionError::External(Box::new(err)))?;
@@ -222,6 +250,35 @@ async fn plan_create_table(
     Ok(Some(Arc::new(EmptyExec::new(Arc::new(
         ArrowSchema::empty(),
     )))))
+}
+
+fn v2_compatible_timestamp_type(data_type: &mut Type) {
+    match data_type {
+        Type::Primitive(PrimitiveType::TimestampNs) => {
+            *data_type = Type::Primitive(PrimitiveType::Timestamp);
+        }
+        Type::Primitive(PrimitiveType::TimestamptzNs) => {
+            *data_type = Type::Primitive(PrimitiveType::Timestamptz);
+        }
+        Type::Struct(fields) => {
+            *fields = StructType::new(
+                fields
+                    .iter()
+                    .cloned()
+                    .map(|mut field| {
+                        v2_compatible_timestamp_type(&mut field.field_type);
+                        field
+                    })
+                    .collect(),
+            );
+        }
+        Type::List(list) => v2_compatible_timestamp_type(&mut list.element),
+        Type::Map(map) => {
+            v2_compatible_timestamp_type(&mut map.key);
+            v2_compatible_timestamp_type(&mut map.value);
+        }
+        Type::Primitive(_) => {}
+    }
 }
 
 async fn plan_create_view(

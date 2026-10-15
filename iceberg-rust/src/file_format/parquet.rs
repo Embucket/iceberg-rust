@@ -378,6 +378,14 @@ fn parquet_to_datafile_impl(
                                     {
                                         *entry = new
                                     }
+                                    (
+                                        Value::TimestampNano(current),
+                                        Value::TimestampNano(new_val),
+                                    ) if *current > *new_val => *entry = new,
+                                    (
+                                        Value::TimestampTZNano(current),
+                                        Value::TimestampTZNano(new_val),
+                                    ) if *current > *new_val => *entry = new,
                                     _ => (),
                                 }
                             }
@@ -442,6 +450,14 @@ fn parquet_to_datafile_impl(
                                     {
                                         *entry = new
                                     }
+                                    (
+                                        Value::TimestampNano(current),
+                                        Value::TimestampNano(new_val),
+                                    ) if *current < *new_val => *entry = new,
+                                    (
+                                        Value::TimestampTZNano(current),
+                                        Value::TimestampTZNano(new_val),
+                                    ) if *current < *new_val => *entry = new,
                                     _ => (),
                                 }
                             }
