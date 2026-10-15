@@ -262,6 +262,18 @@ impl<'table, 'manifests> PruneDataFiles<'table, 'manifests> {
             files,
         }
     }
+
+    fn can_prune_column(entry: &ManifestEntry, column_id: i32) -> bool {
+        match entry.data_file().content() {
+            Content::Data => true,
+            Content::EqualityDeletes => entry
+                .data_file()
+                .equality_ids()
+                .as_ref()
+                .is_some_and(|ids| ids.contains(&column_id)),
+            Content::PositionDeletes => false,
+        }
+    }
 }
 
 impl PruningStatistics for PruneDataFiles<'_, '_> {
@@ -273,19 +285,21 @@ impl PruningStatistics for PruneDataFiles<'_, '_> {
             .field_with_name(&column.name)
             .ok()?
             .data_type();
-        let min_values =
-            self.files
-                .iter()
-                .map(|manifest| match &manifest.1.data_file().lower_bounds() {
-                    Some(map) => map.get(&column_id).and_then(|value| {
-                        value
-                            .clone()
-                            .cast(&field.field_type)
-                            .ok()
-                            .map(Value::into_any)
-                    }),
-                    None => None,
-                });
+        let min_values = self.files.iter().map(|manifest| {
+            if !Self::can_prune_column(&manifest.1, column_id) {
+                return None;
+            }
+            match &manifest.1.data_file().lower_bounds() {
+                Some(map) => map.get(&column_id).and_then(|value| {
+                    value
+                        .clone()
+                        .cast(&field.field_type)
+                        .ok()
+                        .map(Value::into_any)
+                }),
+                None => None,
+            }
+        });
         any_iter_to_array(min_values, datatype).ok()
     }
     fn max_values(&self, column: &Column) -> Option<ArrayRef> {
@@ -296,19 +310,21 @@ impl PruningStatistics for PruneDataFiles<'_, '_> {
             .field_with_name(&column.name)
             .ok()?
             .data_type();
-        let max_values =
-            self.files
-                .iter()
-                .map(|manifest| match &manifest.1.data_file().upper_bounds() {
-                    Some(map) => map.get(&column_id).and_then(|value| {
-                        value
-                            .clone()
-                            .cast(&field.field_type)
-                            .ok()
-                            .map(Value::into_any)
-                    }),
-                    None => None,
-                });
+        let max_values = self.files.iter().map(|manifest| {
+            if !Self::can_prune_column(&manifest.1, column_id) {
+                return None;
+            }
+            match &manifest.1.data_file().upper_bounds() {
+                Some(map) => map.get(&column_id).and_then(|value| {
+                    value
+                        .clone()
+                        .cast(&field.field_type)
+                        .ok()
+                        .map(Value::into_any)
+                }),
+                None => None,
+            }
+        });
         any_iter_to_array(max_values, datatype).ok()
     }
     fn num_containers(&self) -> usize {
@@ -316,13 +332,15 @@ impl PruningStatistics for PruneDataFiles<'_, '_> {
     }
     fn null_counts(&self, column: &Column) -> Option<ArrayRef> {
         let column_id = self.schema.fields().get_name(&column.name)?.id;
-        let null_counts =
-            self.files.iter().map(
-                |manifest| match &manifest.1.data_file().null_value_counts() {
-                    Some(map) => map.get(&{ column_id }).copied(),
-                    None => None,
-                },
-            );
+        let null_counts = self.files.iter().map(|manifest| {
+            if !Self::can_prune_column(&manifest.1, column_id) {
+                return None;
+            }
+            match &manifest.1.data_file().null_value_counts() {
+                Some(map) => map.get(&{ column_id }).copied(),
+                None => None,
+            }
+        });
         ScalarValue::iter_to_array(null_counts.map(ScalarValue::Int64)).ok()
     }
     fn contained(

@@ -21,6 +21,7 @@ use iceberg_rust::{
         partition::{PartitionField, PartitionSpec, Transform},
         schema::Schema,
         types::{PrimitiveType, StructField, Type},
+        values::Value,
     },
     table::Table,
 };
@@ -174,6 +175,43 @@ pub async fn test_equality_delete() {
     .await
     .unwrap();
 
+    // A delete writer may report metrics for non-key columns. They cannot be
+    // used to prune an equality delete: the row matched by its key can have a
+    // different value in the data file.
+    let files = files
+        .into_iter()
+        .map(|file| {
+            let mut lower = file.lower_bounds().clone().unwrap_or_default();
+            lower.insert(5, Value::Int(999));
+            let mut upper = file.upper_bounds().clone().unwrap_or_default();
+            upper.insert(5, Value::Int(999));
+            iceberg_rust::spec::manifest::DataFile::builder()
+                .with_content(file.content().clone())
+                .with_file_path(file.file_path().clone())
+                .with_file_format(file.file_format().clone())
+                .with_partition(file.partition().clone())
+                .with_record_count(*file.record_count())
+                .with_file_size_in_bytes(*file.file_size_in_bytes())
+                .with_column_sizes(file.column_sizes().clone())
+                .with_value_counts(file.value_counts().clone())
+                .with_null_value_counts(file.null_value_counts().clone())
+                .with_nan_value_counts(file.nan_value_counts().clone())
+                .with_distinct_counts(file.distinct_counts().clone())
+                .with_lower_bounds(Some(lower))
+                .with_upper_bounds(Some(upper))
+                .with_key_metadata(file.key_metadata().clone())
+                .with_split_offsets(file.split_offsets().clone())
+                .with_equality_ids(file.equality_ids().clone())
+                .with_sort_order_id(*file.sort_order_id())
+                .with_first_row_id(*file.first_row_id())
+                .with_referenced_data_file(file.referenced_data_file().clone())
+                .with_content_offset(*file.content_offset())
+                .with_content_size_in_bytes(*file.content_size_in_bytes())
+                .build()
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+
     // Load the latest table version, which includes the inserted rows
     let Tabular::Table(mut table) = catalog
         .clone()
@@ -203,6 +241,13 @@ pub async fn test_equality_delete() {
         "+----+-------------+------------+------------+--------+",
     ];
     assert_batches_eq!(expected, &batches);
+
+    let batches = run_query(
+        "select id from warehouse.test.orders where amount = 1 order by id",
+        &ctx,
+    )
+    .await;
+    assert_batches_eq!(["+----+", "| id |", "+----+", "| 2  |", "+----+"], &batches);
 
     // Test that projecting a column that is not included in equality deletes works
     run_query(
