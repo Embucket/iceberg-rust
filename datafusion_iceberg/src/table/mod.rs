@@ -20,6 +20,7 @@ use iceberg_rust::file_format::parquet::{
 };
 use iceberg_rust::object_store::Bucket;
 use iceberg_rust::spec::partition::BoundPartitionField;
+use iceberg_rust::spec::schema::Schema as IcebergSchema;
 use iceberg_rust::spec::table_metadata::{
     self, TableMetadata, WRITE_METADATA_METRICS_DISTINCT_COUNTS_ENABLED,
     WRITE_OBJECT_STORAGE_ENABLED,
@@ -309,6 +310,10 @@ pub struct DataFusionTableConfig {
     /// Intended for session-local overlays that replace uncommitted files.
     #[builder(default)]
     excluded_data_file_paths: Arc<HashSet<String>>,
+    /// Read a historical snapshot using this Iceberg schema, matching nested
+    /// fields by ID across schema evolution rather than casting by name.
+    #[builder(default)]
+    read_schema: Option<IcebergSchema>,
 }
 
 impl DataFusionTable {
@@ -329,9 +334,13 @@ impl DataFusionTable {
     ) -> Self {
         let schema = match &tabular {
             Tabular::Table(table) => {
-                let schema = end
-                    .and_then(|snapshot_id| table.metadata().schema(snapshot_id).ok().cloned())
-                    .unwrap_or_else(|| table.current_schema().unwrap().clone());
+                let schema = config
+                    .as_ref()
+                    .and_then(|config| config.read_schema.as_ref())
+                    .or_else(|| {
+                        end.and_then(|snapshot_id| table.metadata().schema(snapshot_id).ok())
+                    })
+                    .unwrap_or_else(|| table.current_schema().unwrap());
                 let mut builder =
                     SchemaBuilder::from(TryInto::<ArrowSchema>::try_into(schema.fields()).unwrap());
                 if config
@@ -640,10 +649,14 @@ async fn table_scan(
     filters: &[Expr],
     limit: Option<usize>,
 ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
-    let schema = snapshot_range
-        .1
-        .and_then(|snapshot_id| table.metadata().schema(snapshot_id).ok().cloned())
-        .unwrap_or_else(|| table.current_schema().unwrap().clone());
+    let schema = config
+        .and_then(|config| config.read_schema.as_ref())
+        .or_else(|| {
+            snapshot_range
+                .1
+                .and_then(|snapshot_id| table.metadata().schema(snapshot_id).ok())
+        })
+        .unwrap_or_else(|| table.current_schema().unwrap());
 
     // Create a unique URI for this particular object store
     let object_store_url = fake_object_store_url(&table.metadata().location);
