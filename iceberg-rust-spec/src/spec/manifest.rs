@@ -707,6 +707,22 @@ pub(crate) fn decode_bound(bytes: &[u8], data_type: &Type) -> Result<Value, Erro
     }
 }
 
+/// Decodes the bound at its original width when copying an existing manifest-list entry.
+pub(crate) fn decode_bound_for_copy(bytes: &[u8], data_type: &Type) -> Result<Value, Error> {
+    match (data_type, bytes.len()) {
+        (Type::Primitive(PrimitiveType::Long), 4) => {
+            Value::try_from_bytes(bytes, &Type::Primitive(PrimitiveType::Int))
+        }
+        (Type::Primitive(PrimitiveType::Double), 4) => {
+            Value::try_from_bytes(bytes, &Type::Primitive(PrimitiveType::Float))
+        }
+        (Type::Primitive(PrimitiveType::Timestamp), 4) => {
+            Value::try_from_bytes(bytes, &Type::Primitive(PrimitiveType::Date))
+        }
+        _ => Value::try_from_bytes(bytes, data_type),
+    }
+}
+
 impl From<HashMap<i32, Value>> for AvroMap<ByteBuf> {
     fn from(value: HashMap<i32, Value>) -> Self {
         AvroMap(HashMap::from_iter(
@@ -774,6 +790,37 @@ pub struct DataFile {
 impl DataFile {
     pub fn builder() -> DataFileBuilder {
         DataFileBuilder::default()
+    }
+
+    /// Promotes partition values when moving a file entry into a manifest written with a newer schema.
+    pub fn promote_partition_to_types(
+        &mut self,
+        partition_spec: &PartitionSpec,
+        target_types: &[Type],
+    ) -> Result<(), Error> {
+        if partition_spec.fields().len() != target_types.len() {
+            return Err(Error::InvalidFormat(
+                "Partition type count mismatch".to_owned(),
+            ));
+        }
+        for (field, target_type) in partition_spec.fields().iter().zip(target_types.iter()) {
+            let Some(value) = self.partition.get_mut(field.name()) else {
+                return Err(Error::NotFound(format!("Partition field {}", field.name())));
+            };
+            let Some(value) = value else {
+                continue;
+            };
+            let source_type = value.datatype();
+            let decimal_unchanged = matches!(
+                (&*value, target_type),
+                (Value::Decimal(decimal), Type::Primitive(PrimitiveType::Decimal { scale, .. }))
+                    if decimal_scale(decimal) == *scale
+            );
+            if source_type != *target_type && !decimal_unchanged {
+                *value = value.clone().promote_iceberg(&source_type, target_type)?;
+            }
+        }
+        Ok(())
     }
 
     /// Promote numeric bounds to the current schema before rewriting this file

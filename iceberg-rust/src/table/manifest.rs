@@ -488,6 +488,11 @@ impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
         schema: &'schema AvroSchema,
         table_metadata: &'metadata TableMetadata,
     ) -> Result<(Self, FilteredManifestStats), Error> {
+        if manifest.partition_spec_id != table_metadata.default_spec_id {
+            return Err(Error::NotSupported(
+                "COW rewrite across partition-spec evolution".to_owned(),
+            ));
+        }
         let inherited_snapshot_id = manifest.added_snapshot_id;
         let manifest_reader = ManifestReader::new(bytes)?;
         let mut next_inherited_row_id = manifest.first_row_id;
@@ -496,6 +501,22 @@ impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
         let mut filtered_stats = FilteredManifestStats::default();
         let mut existing_files = 0;
         let mut existing_rows = 0;
+        let current_spec = table_metadata.default_partition_spec()?;
+        let current_partition_types =
+            current_spec.data_types(table_metadata.current_schema()?.fields())?;
+        manifest.partitions = Some(
+            current_spec
+                .fields()
+                .iter()
+                .map(|_| FieldSummary {
+                    contains_null: false,
+                    contains_nan: None,
+                    lower_bound: None,
+                    upper_bound: None,
+                })
+                .collect(),
+        );
+        manifest.partition_spec_id = table_metadata.default_spec_id;
 
         writer.add_user_metadata(
             "format-version".to_string(),
@@ -578,6 +599,16 @@ impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
                 existing_files += 1;
                 existing_rows += entry.data_file().record_count();
                 *entry.status_mut() = Status::Existing;
+                entry
+                    .data_file_mut()
+                    .promote_partition_to_types(current_spec, &current_partition_types)?;
+                update_partitions(
+                    manifest.partitions.as_mut().ok_or_else(|| {
+                        Error::InvalidFormat("Missing partition summaries".to_owned())
+                    })?,
+                    entry.data_file().partition(),
+                    current_spec.fields(),
+                )?;
                 writer.append_ser(entry)?;
             }
         }
