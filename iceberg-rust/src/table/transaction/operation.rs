@@ -1910,6 +1910,152 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn v2_unpartitioned_spec_does_not_reuse_old_partitioned_manifest() {
+        let mut metadata = sample_metadata(&[], None, &[]);
+        metadata.schemas.insert(
+            0,
+            SchemaBuilder::default()
+                .with_schema_id(0)
+                .with_struct_field(StructField {
+                    id: 1,
+                    name: "partition_source".to_string(),
+                    required: true,
+                    field_type: Type::Primitive(PrimitiveType::Int),
+                    doc: None,
+                    initial_default: None,
+                    write_default: None,
+                })
+                .build()
+                .unwrap(),
+        );
+        metadata.partition_specs.insert(
+            0,
+            PartitionSpec::builder()
+                .with_spec_id(0)
+                .with_partition_field(PartitionField::new(
+                    1,
+                    1000,
+                    "partition_source",
+                    Transform::Identity,
+                ))
+                .build()
+                .unwrap(),
+        );
+        let store = Arc::new(InMemory::new());
+        let (_, updates) = Operation::Append {
+            branch: None,
+            data_files: vec![
+                partitioned_data_file("old.parquet", Value::Int(42)),
+                partitioned_data_file("survivor.parquet", Value::Int(43)),
+            ],
+            delete_files: Vec::new(),
+            additional_summary: None,
+        }
+        .execute(&metadata, store.clone())
+        .await
+        .unwrap();
+        crate::catalog::commit::apply_table_updates(&mut metadata, updates).unwrap();
+        let old_snapshot = metadata.current_snapshot(None).unwrap().unwrap();
+        let old_bytes = store
+            .get(&strip_prefix(old_snapshot.manifest_list()).into())
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let old_manifest = ManifestListReader::new(&old_bytes[..], &metadata)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+
+        metadata.partition_specs.insert(
+            1,
+            PartitionSpec::builder()
+                .with_spec_id(1)
+                .with_fields(Vec::new())
+                .build()
+                .unwrap(),
+        );
+        metadata.default_spec_id = 1;
+        let (_, updates) = Operation::Append {
+            branch: None,
+            data_files: (0..8)
+                .map(|index| data_file(&format!("new-{index}.parquet"), 1))
+                .collect(),
+            delete_files: Vec::new(),
+            additional_summary: None,
+        }
+        .execute(&metadata, store.clone())
+        .await
+        .unwrap();
+        crate::catalog::commit::apply_table_updates(&mut metadata, updates).unwrap();
+        let snapshot = metadata.current_snapshot(None).unwrap().unwrap();
+        let bytes = store
+            .get(&strip_prefix(snapshot.manifest_list()).into())
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let manifests = ManifestListReader::new(&bytes[..], &metadata)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(manifests.len() > 2, "append must use the split path");
+        assert!(manifests.iter().any(|entry| {
+            entry.manifest_path == old_manifest.manifest_path && entry.partition_spec_id == 0
+        }));
+        assert!(manifests.iter().any(|entry| entry.partition_spec_id == 1));
+        let mut file_paths = crate::table::datafiles(store.clone(), &manifests, None, (None, None))
+            .await
+            .unwrap()
+            .map_ok(|(_, entry)| entry.data_file().file_path().clone())
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        file_paths.sort();
+        let mut expected = (0..8)
+            .map(|index| format!("new-{index}.parquet"))
+            .chain(["old.parquet".to_string(), "survivor.parquet".to_string()])
+            .collect::<Vec<_>>();
+        expected.sort();
+        assert_eq!(file_paths, expected);
+        let replacement = data_file("replacement.parquet", 1);
+        let (selector, affected) = ManifestListWriter::from_existing_without_overwrites(
+            &bytes,
+            std::iter::once(&replacement),
+            &HashSet::from([old_manifest.manifest_path.clone()]),
+            manifest_list_schema_v2(),
+            &metadata,
+        )
+        .unwrap();
+        assert_eq!(
+            selector
+                .selected_data_manifest()
+                .map(|entry| entry.partition_spec_id),
+            Some(1)
+        );
+        assert_eq!(affected, vec![old_manifest.clone()]);
+
+        let error = Operation::Overwrite {
+            branch: None,
+            data_files: vec![replacement],
+            files_to_overwrite: HashMap::from([(
+                old_manifest.manifest_path,
+                vec!["old.parquet".to_string()],
+            )]),
+            additional_summary: None,
+        }
+        .execute(&metadata, store)
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, Error::NotSupported(message) if message == "COW rewrite across partition-spec evolution")
+        );
+    }
+
     async fn clear_current_v1_manifest_list_counts(
         metadata: &TableMetadata,
         store: &Arc<InMemory>,
