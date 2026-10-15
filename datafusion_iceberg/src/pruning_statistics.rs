@@ -505,14 +505,14 @@ pub(crate) fn transform_predicate(
     let field = partition_fields
         .iter()
         .find(|field| field.source_name() == column.name())?;
-    let legacy_negative_day_hour = if field.transform() != &Transform::Identity {
+    let legacy_negative_day = if field.transform() != &Transform::Identity {
         let Expr::Literal(value, _) = &literal else {
             return None;
         };
         if !literal_matches_source(value, field) {
             return None;
         }
-        matches!(field.transform(), Transform::Day | Transform::Hour)
+        field.transform() == &Transform::Day
             && matches!(value, ScalarValue::TimestampMicrosecond(Some(value), _) if *value < 0)
     } else {
         false
@@ -529,17 +529,11 @@ pub(crate) fn transform_predicate(
             _ => return None,
         }
     };
-    if legacy_negative_day_hour && field.transform() == &Transform::Hour {
-        // Hour IDs wrap outside i32. Equality remains safe with both encodings, but a
-        // monotone range can drop matching rows whose partition ID has wrapped.
-        if op != Operator::Eq {
-            return None;
-        }
+    if field.transform() == &Transform::Hour {
         let Expr::Literal(ScalarValue::TimestampMicrosecond(Some(micros), _), _) = &literal else {
             return None;
         };
-        let hour = i32::try_from(micros.div_euclid(3_600_000_000)).ok()?;
-        hour.checked_add(1)?;
+        return project_hour_predicate(column, field.name(), op, *micros);
     }
     let op = match field.transform() {
         Transform::Identity => op,
@@ -561,8 +555,8 @@ pub(crate) fn transform_predicate(
     };
     let literal = transform_literal(literal, field.transform())?;
     let column = Expr::Column(Column::new(column.relation, field.name().to_owned()));
-    // Legacy pre-epoch day/hour IDs may be truncated toward zero instead of floored.
-    if field.transform() == &Transform::Month || legacy_negative_day_hour {
+    // Legacy pre-epoch day IDs may be truncated toward zero instead of floored.
+    if field.transform() == &Transform::Month || legacy_negative_day {
         let legacy = Expr::BinaryExpr(BinaryExpr::new(
             Box::new(literal.clone()),
             Operator::Plus,
@@ -609,6 +603,57 @@ fn fold_cast_literal(expr: Expr) -> Option<Expr> {
 
 fn partition_comparison(column: Expr, op: Operator, literal: Expr) -> Expr {
     Expr::BinaryExpr(BinaryExpr::new(Box::new(column), op, Box::new(literal)))
+}
+
+fn project_hour_predicate(
+    source_column: Column,
+    partition_name: &str,
+    op: Operator,
+    micros: i64,
+) -> Option<Expr> {
+    const MICROS_PER_HOUR: i64 = 3_600_000_000;
+    const HOUR_ID_MODULUS: i64 = 1_i64 << 32;
+
+    let hour = micros.div_euclid(MICROS_PER_HOUR);
+    let (lower, upper) = match op {
+        Operator::Eq => (hour, hour.checked_add(i64::from(micros < 0))?),
+        Operator::Lt | Operator::LtEq => (
+            i64::MIN.div_euclid(MICROS_PER_HOUR),
+            hour.checked_add(i64::from(micros < 0))?,
+        ),
+        Operator::Gt | Operator::GtEq => (hour, i64::MAX.div_euclid(MICROS_PER_HOUR)),
+        _ => return None,
+    };
+    if upper.checked_sub(lower)? >= HOUR_ID_MODULUS - 1 {
+        return None;
+    }
+
+    let wrapped_id = |hour: i64| {
+        let signed = (hour - i64::from(i32::MIN)).rem_euclid(HOUR_ID_MODULUS) + i64::from(i32::MIN);
+        i32::try_from(signed).ok()
+    };
+    let lower = wrapped_id(lower)?;
+    let upper = wrapped_id(upper)?;
+    let column = Expr::Column(Column::new(
+        source_column.relation,
+        partition_name.to_owned(),
+    ));
+    let literal = |value| Expr::Literal(ScalarValue::Int32(Some(value)), None);
+
+    if lower == upper {
+        return Some(partition_comparison(column, Operator::Eq, literal(lower)));
+    }
+    let lower_check = partition_comparison(column.clone(), Operator::GtEq, literal(lower));
+    let upper_check = partition_comparison(column, Operator::LtEq, literal(upper));
+    Some(Expr::BinaryExpr(BinaryExpr::new(
+        Box::new(lower_check),
+        if lower < upper {
+            Operator::And
+        } else {
+            Operator::Or
+        },
+        Box::new(upper_check),
+    )))
 }
 
 fn literal_matches_source(value: &ScalarValue, field: &BoundPartitionField<'_>) -> bool {
@@ -1766,16 +1811,13 @@ mod tests {
             );
             let partition = PartitionField::new(1, 1000, "partition_id", transform.clone());
             let fields = [BoundPartitionField::new(&partition, &source)];
-            let cases = if transform == Transform::Hour {
-                vec![(Operator::Eq, [false, true, true, false])]
-            } else {
-                vec![
-                    (Operator::Eq, [false, true, true, false]),
-                    (Operator::Lt, [true, true, true, false]),
-                    (Operator::Gt, [false, true, true, true]),
-                ]
-            };
-            for (op, expected) in cases {
+            for (op, expected) in [
+                (Operator::Eq, [false, true, true, false]),
+                (Operator::Lt, [true, true, true, false]),
+                (Operator::LtEq, [true, true, true, false]),
+                (Operator::Gt, [false, true, true, true]),
+                (Operator::GtEq, [false, true, true, true]),
+            ] {
                 let expr = project_id_predicate(
                     transform.clone(),
                     PrimitiveType::Timestamp,
@@ -1800,30 +1842,6 @@ mod tests {
                         .unwrap(),
                     expected,
                     "{transform:?} {op:?} must retain floor and legacy IDs"
-                );
-            }
-            if transform == Transform::Hour {
-                for op in [Operator::Lt, Operator::LtEq, Operator::Gt, Operator::GtEq] {
-                    assert!(
-                        project_id_predicate(
-                            Transform::Hour,
-                            PrimitiveType::Timestamp,
-                            op,
-                            ScalarValue::TimestampMicrosecond(Some(-1), None),
-                        )
-                        .is_none(),
-                        "negative hour ranges cannot safely prune wrapped partition IDs"
-                    );
-                }
-                assert!(
-                    project_id_predicate(
-                        Transform::Hour,
-                        PrimitiveType::Timestamp,
-                        Operator::Eq,
-                        ScalarValue::TimestampMicrosecond(Some(-7_730_941_136_400_000_000), None),
-                    )
-                    .is_none(),
-                    "out-of-range hour ID must not overflow its adjacent candidate"
                 );
             }
         }
@@ -1868,6 +1886,142 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn hour_ranges_keep_wrapped_extremes_and_prune_other_manifests() {
+        const MICROS_PER_HOUR: i64 = 3_600_000_000;
+        const MODULUS: i64 = 1_i64 << 32;
+        let wrapped = |hour: i64| {
+            i32::try_from((hour - i64::from(i32::MIN)).rem_euclid(MODULUS) + i64::from(i32::MIN))
+                .unwrap()
+        };
+        let min_hour = i64::MIN.div_euclid(MICROS_PER_HOUR);
+        let max_hour = i64::MAX.div_euclid(MICROS_PER_HOUR);
+        let ids = [wrapped(min_hour), -1, 0, 1, wrapped(max_hour)];
+        let manifests = ids
+            .into_iter()
+            .map(|id| ManifestListEntry {
+                format_version: FormatVersion::V2,
+                manifest_path: format!("/{id}.avro"),
+                manifest_length: 1,
+                partition_spec_id: 1,
+                content: ManifestContent::Data,
+                sequence_number: 1,
+                min_sequence_number: 1,
+                added_snapshot_id: 1,
+                added_files_count: Some(1),
+                existing_files_count: Some(0),
+                deleted_files_count: Some(0),
+                added_rows_count: Some(1),
+                existing_rows_count: Some(0),
+                deleted_rows_count: Some(0),
+                partitions: Some(vec![FieldSummary {
+                    contains_null: false,
+                    contains_nan: None,
+                    lower_bound: Some(Value::Int(id)),
+                    upper_bound: Some(Value::Int(id)),
+                }]),
+                key_metadata: None,
+                first_row_id: None,
+            })
+            .collect::<Vec<_>>();
+        let source = StructField::new(
+            1,
+            "id",
+            false,
+            Type::Primitive(PrimitiveType::Timestamp),
+            None,
+        );
+        let partition = PartitionField::new(1, 1000, "partition_id", Transform::Hour);
+        let fields = [BoundPartitionField::new(&partition, &source)];
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "partition_id",
+            DataType::Int32,
+            true,
+        )]));
+        let state = SessionContext::new().state();
+        for (op, micros, expected) in [
+            (Operator::Gt, 0, [true, false, true, true, true]),
+            (Operator::Lt, 0, [true, true, true, false, true]),
+        ] {
+            let expr = project_id_predicate(
+                Transform::Hour,
+                PrimitiveType::Timestamp,
+                op,
+                ScalarValue::TimestampMicrosecond(Some(micros), None),
+            )
+            .expect("wrapped hour range should remain selective");
+            let physical = create_physical_expr(
+                &expr,
+                &schema.clone().try_into().unwrap(),
+                state.execution_props(),
+                &PhysicalPlanningContext::default(),
+            )
+            .unwrap();
+            let predicate = PruningPredicateBuilder::new()
+                .with_file_schema(schema.clone())
+                .try_build(physical)
+                .unwrap();
+            assert_eq!(
+                predicate
+                    .prune(&PruneManifests::new(&fields, 1, &manifests))
+                    .unwrap(),
+                expected,
+                "wrapped hour range {op:?} must preserve extreme timestamps"
+            );
+        }
+        assert!(project_id_predicate(
+            Transform::Hour,
+            PrimitiveType::Timestamp,
+            Operator::Eq,
+            ScalarValue::TimestampMicrosecond(Some(i64::MIN), None),
+        )
+        .is_some());
+        let wrapped_boundary = (i64::from(i32::MIN) - 1) * MICROS_PER_HOUR;
+        let projected = project_id_predicate(
+            Transform::Hour,
+            PrimitiveType::Timestamp,
+            Operator::Eq,
+            ScalarValue::TimestampMicrosecond(Some(wrapped_boundary), None),
+        )
+        .expect("legacy negative hour equality should cross the signed ID boundary");
+        let Expr::BinaryExpr(BinaryExpr {
+            left,
+            op: Operator::Or,
+            right,
+        }) = projected
+        else {
+            panic!("expected two wrapped hour intervals");
+        };
+        assert_eq!(
+            *left,
+            partition_comparison(
+                Expr::Column(Column::from_name("partition_id")),
+                Operator::GtEq,
+                Expr::Literal(ScalarValue::Int32(Some(i32::MAX)), None),
+            )
+        );
+        assert_eq!(
+            *right,
+            partition_comparison(
+                Expr::Column(Column::from_name("partition_id")),
+                Operator::LtEq,
+                Expr::Literal(ScalarValue::Int32(Some(i32::MIN)), None),
+            )
+        );
+        for (op, micros) in [(Operator::Gt, i64::MIN), (Operator::Lt, i64::MAX)] {
+            assert!(
+                project_id_predicate(
+                    Transform::Hour,
+                    PrimitiveType::Timestamp,
+                    op,
+                    ScalarValue::TimestampMicrosecond(Some(micros), None),
+                )
+                .is_none(),
+                "a range spanning every hour ID cannot prune"
+            );
+        }
     }
 
     #[test]
