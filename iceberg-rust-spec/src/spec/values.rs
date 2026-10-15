@@ -92,6 +92,10 @@ pub enum Value {
     Timestamp(i64),
     /// Stores microseconds from 1970-01-01 00:00:00.000000 in an 8-byte little-endian long
     TimestampTZ(i64),
+    /// Stores nanoseconds from 1970-01-01 00:00:00.000000000 in an 8-byte little-endian long
+    TimestampNano(i64),
+    /// Stores nanoseconds from 1970-01-01 00:00:00.000000000 UTC in an 8-byte little-endian long
+    TimestampTZNano(i64),
     /// UTF-8 bytes (without length)
     String(String),
     /// 16-byte big-endian value
@@ -135,6 +139,8 @@ impl From<Value> for ByteBuf {
             Value::Time(val) => ByteBuf::from(val.to_le_bytes()),
             Value::Timestamp(val) => ByteBuf::from(val.to_le_bytes()),
             Value::TimestampTZ(val) => ByteBuf::from(val.to_le_bytes()),
+            Value::TimestampNano(val) => ByteBuf::from(val.to_le_bytes()),
+            Value::TimestampTZNano(val) => ByteBuf::from(val.to_le_bytes()),
             Value::String(val) => ByteBuf::from(val.as_bytes()),
             Value::UUID(val) => ByteBuf::from(val.as_u128().to_be_bytes()),
             Value::Fixed(_, val) => ByteBuf::from(val),
@@ -157,6 +163,8 @@ impl fmt::Display for Value {
             Value::Time(t) => write!(f, "{t}"),
             Value::Timestamp(ts) => write!(f, "{ts}"),
             Value::TimestampTZ(ts) => write!(f, "{ts}"),
+            Value::TimestampNano(ts) => write!(f, "{ts}"),
+            Value::TimestampTZNano(ts) => write!(f, "{ts}"),
             Value::String(s) => write!(f, "{s}"),
             Value::UUID(u) => write!(f, "{u}"),
             Value::Fixed(size, data) => write!(f, "{data:?} ({size} bytes)"),
@@ -276,17 +284,38 @@ impl Struct {
                     // Int -> Date retain the existing value-cast behavior.
                     let value = field
                         .map(|value| {
-                            let source_type = value.datatype();
-                            match (&source_type, datatype) {
+                            match (value, datatype) {
+                                // Avro stores timestamps as long, but untagged Value can decode
+                                // small long values as Int. The partition schema disambiguates.
+                                (Value::Int(value), Type::Primitive(PrimitiveType::Timestamp)) => {
+                                    Ok(Value::Timestamp(i64::from(value)))
+                                }
                                 (
-                                    Type::Primitive(PrimitiveType::Int),
-                                    Type::Primitive(PrimitiveType::Long),
-                                )
-                                | (
-                                    Type::Primitive(PrimitiveType::Float),
-                                    Type::Primitive(PrimitiveType::Double),
-                                ) => value.promote_iceberg(&source_type, datatype),
-                                _ => value.cast(datatype),
+                                    Value::Int(value),
+                                    Type::Primitive(PrimitiveType::Timestamptz),
+                                ) => Ok(Value::TimestampTZ(i64::from(value))),
+                                (
+                                    Value::Int(value),
+                                    Type::Primitive(PrimitiveType::TimestampNs),
+                                ) => Ok(Value::TimestampNano(i64::from(value))),
+                                (
+                                    Value::Int(value),
+                                    Type::Primitive(PrimitiveType::TimestamptzNs),
+                                ) => Ok(Value::TimestampTZNano(i64::from(value))),
+                                (value, datatype) => {
+                                    let source_type = value.datatype();
+                                    match (&source_type, datatype) {
+                                        (
+                                            Type::Primitive(PrimitiveType::Int),
+                                            Type::Primitive(PrimitiveType::Long),
+                                        )
+                                        | (
+                                            Type::Primitive(PrimitiveType::Float),
+                                            Type::Primitive(PrimitiveType::Double),
+                                        ) => value.promote_iceberg(&source_type, datatype),
+                                        _ => value.cast(datatype),
+                                    }
+                                }
                             }
                         })
                         .transpose()?;
@@ -404,6 +433,9 @@ impl Value {
                     Value::Int(value) => ByteBuf::from((*value as i64).to_le_bytes()),
                     // Apache Iceberg Java also hashes date as long, despite Appendix B.
                     Value::Date(value) => ByteBuf::from((*value as i64).to_le_bytes()),
+                    Value::TimestampNano(value) | Value::TimestampTZNano(value) => {
+                        ByteBuf::from(value.div_euclid(1_000).to_le_bytes())
+                    }
                     _ => <Value as Into<ByteBuf>>::into(self.clone()),
                 };
                 let hash = murmur3::murmur3_32(&mut Cursor::new(bytes), 0)?;
@@ -429,6 +461,9 @@ impl Value {
                 Value::TimestampTZ(time) => Ok(Value::Int(
                     micros_to_datetime(*time).year() - YEARS_BEFORE_UNIX_EPOCH,
                 )),
+                Value::TimestampNano(time) | Value::TimestampTZNano(time) => Ok(Value::Int(
+                    chrono::DateTime::from_timestamp_nanos(*time).year() - YEARS_BEFORE_UNIX_EPOCH,
+                )),
                 _ => Err(Error::NotSupported(
                     "Datatype for year partition transform.".to_string(),
                 )),
@@ -441,6 +476,9 @@ impl Value {
                 Value::TimestampTZ(time) => {
                     Ok(Value::Int(datetime_to_months(&micros_to_datetime(*time))))
                 }
+                Value::TimestampNano(time) | Value::TimestampTZNano(time) => Ok(Value::Int(
+                    datetime_to_months(&chrono::DateTime::from_timestamp_nanos(*time).naive_utc()),
+                )),
                 _ => Err(Error::NotSupported(
                     "Datatype for month partition transform.".to_string(),
                 )),
@@ -453,6 +491,9 @@ impl Value {
                 Value::TimestampTZ(time) => Ok(Value::Int(datetime_to_days(&micros_to_datetime(
                     *time,
                 )) as i32)),
+                Value::TimestampNano(time) | Value::TimestampTZNano(time) => {
+                    Ok(Value::Int(time.div_euclid(86_400_000_000_000) as i32))
+                }
                 _ => Err(Error::NotSupported(
                     "Datatype for day partition transform.".to_string(),
                 )),
@@ -464,6 +505,9 @@ impl Value {
                 Value::TimestampTZ(time) => Ok(Value::Int(datetime_to_hours(&micros_to_datetime(
                     *time,
                 )) as i32)),
+                Value::TimestampNano(time) | Value::TimestampTZNano(time) => {
+                    Ok(Value::Int(time.div_euclid(3_600_000_000_000) as i32))
+                }
                 _ => Err(Error::NotSupported(
                     "Datatype for hour partition transform.".to_string(),
                 )),
@@ -531,6 +575,12 @@ impl Value {
                 PrimitiveType::Timestamptz => {
                     Ok(Value::TimestampTZ(i64::from_le_bytes(bytes.try_into()?)))
                 }
+                PrimitiveType::TimestampNs => {
+                    Ok(Value::TimestampNano(i64::from_le_bytes(bytes.try_into()?)))
+                }
+                PrimitiveType::TimestamptzNs => Ok(Value::TimestampTZNano(i64::from_le_bytes(
+                    bytes.try_into()?,
+                ))),
                 PrimitiveType::String => Ok(Value::String(std::str::from_utf8(bytes)?.to_string())),
                 // ByteArray-hinted Uuid bytes are its UTF-8 string form, not a big-endian integer.
                 PrimitiveType::Uuid if physical_type_hint == Some(PhysicalTypeHint::ByteArray) => {
@@ -556,9 +606,7 @@ impl Value {
                     };
                     Ok(Value::Decimal(decimal_from_i128_with_scale(val, *scale)?))
                 }
-                PrimitiveType::TimestampNs
-                | PrimitiveType::TimestamptzNs
-                | PrimitiveType::Unknown
+                PrimitiveType::Unknown
                 | PrimitiveType::Variant
                 | PrimitiveType::Geometry(_)
                 | PrimitiveType::Geography(_, _) => Err(Error::NotSupported(format!(
@@ -628,6 +676,24 @@ impl Value {
                         &NaiveDateTime::parse_from_str(&s, "%Y-%m-%dT%H:%M:%S%.f+00:00")?,
                     )),
                 ))),
+                (PrimitiveType::TimestampNs, JsonValue::String(s)) => {
+                    let time = NaiveDateTime::parse_from_str(&s, "%Y-%m-%dT%H:%M:%S%.f")?;
+                    Ok(Some(Value::TimestampNano(
+                        time.and_utc().timestamp_nanos_opt().ok_or_else(|| {
+                            Error::InvalidFormat("timestamp_ns exceeds i64 nanosecond range".into())
+                        })?,
+                    )))
+                }
+                (PrimitiveType::TimestamptzNs, JsonValue::String(s)) if s.ends_with("+00:00") => {
+                    let time = chrono::DateTime::parse_from_rfc3339(&s)?;
+                    Ok(Some(Value::TimestampTZNano(
+                        time.timestamp_nanos_opt().ok_or_else(|| {
+                            Error::InvalidFormat(
+                                "timestamptz_ns exceeds i64 nanosecond range".into(),
+                            )
+                        })?,
+                    )))
+                }
                 (PrimitiveType::String, JsonValue::String(s)) => Ok(Some(Value::String(s))),
                 (PrimitiveType::Uuid, JsonValue::String(s)) => {
                     Ok(Some(Value::UUID(Uuid::parse_str(&s)?)))
@@ -739,6 +805,8 @@ impl Value {
             Value::Time(_) => Type::Primitive(PrimitiveType::Time),
             Value::Timestamp(_) => Type::Primitive(PrimitiveType::Timestamp),
             Value::TimestampTZ(_) => Type::Primitive(PrimitiveType::Timestamptz),
+            Value::TimestampNano(_) => Type::Primitive(PrimitiveType::TimestampNs),
+            Value::TimestampTZNano(_) => Type::Primitive(PrimitiveType::TimestamptzNs),
             Value::Fixed(len, _) => Type::Primitive(PrimitiveType::Fixed(*len as u64)),
             Value::Binary(_) => Type::Primitive(PrimitiveType::Binary),
             Value::String(_) => Type::Primitive(PrimitiveType::String),
@@ -770,6 +838,8 @@ impl Value {
             Value::Time(any) => Box::new(any),
             Value::Timestamp(any) => Box::new(any),
             Value::TimestampTZ(any) => Box::new(any),
+            Value::TimestampNano(any) => Box::new(any),
+            Value::TimestampTZNano(any) => Box::new(any),
             Value::Fixed(_, any) => Box::new(any),
             Value::Binary(any) => Box::new(any),
             Value::String(any) => Box::new(any),
@@ -819,6 +889,36 @@ impl Value {
                     .checked_mul(86_400_000_000)
                     .map(Value::Timestamp)
                     .ok_or_else(|| Error::InvalidFormat("date exceeds timestamp range".into())),
+                (Value::Date(input), Type::Primitive(PrimitiveType::TimestampNs)) => {
+                    i64::from(input)
+                        .checked_mul(86_400_000_000_000)
+                        .map(Value::TimestampNano)
+                        .ok_or_else(|| {
+                            Error::InvalidFormat("date exceeds timestamp_ns range".into())
+                        })
+                }
+                (Value::Timestamp(input), Type::Primitive(PrimitiveType::TimestampNs)) => input
+                    .checked_mul(1_000)
+                    .map(Value::TimestampNano)
+                    .ok_or_else(|| {
+                        Error::InvalidFormat("timestamp exceeds timestamp_ns range".into())
+                    }),
+                (Value::TimestampTZ(input), Type::Primitive(PrimitiveType::TimestamptzNs)) => input
+                    .checked_mul(1_000)
+                    .map(Value::TimestampTZNano)
+                    .ok_or_else(|| {
+                        Error::InvalidFormat("timestamptz exceeds timestamptz_ns range".into())
+                    }),
+                (Value::TimestampNano(input), Type::Primitive(PrimitiveType::Timestamp)) => {
+                    Ok(Value::Timestamp(input.div_euclid(1_000)))
+                }
+                (Value::TimestampTZNano(input), Type::Primitive(PrimitiveType::Timestamptz)) => {
+                    Ok(Value::TimestampTZ(input.div_euclid(1_000)))
+                }
+                (
+                    Value::TimestampNano(input) | Value::TimestampTZNano(input),
+                    Type::Primitive(PrimitiveType::Date),
+                ) => Ok(Value::Date(input.div_euclid(86_400_000_000_000) as i32)),
                 (Value::Int(input), Type::Primitive(PrimitiveType::Date)) => Ok(Value::Date(input)),
                 (Value::LongInt(input), Type::Primitive(PrimitiveType::Time)) => {
                     Ok(Value::Time(input))
@@ -828,6 +928,12 @@ impl Value {
                 }
                 (Value::LongInt(input), Type::Primitive(PrimitiveType::Timestamptz)) => {
                     Ok(Value::TimestampTZ(input))
+                }
+                (Value::LongInt(input), Type::Primitive(PrimitiveType::TimestampNs)) => {
+                    Ok(Value::TimestampNano(input))
+                }
+                (Value::LongInt(input), Type::Primitive(PrimitiveType::TimestamptzNs)) => {
+                    Ok(Value::TimestampTZNano(input))
                 }
                 _ => Err(Error::NotSupported("cast".to_string())),
             }
@@ -855,6 +961,11 @@ impl Value {
                 Value::Date(input),
                 Type::Primitive(PrimitiveType::Date),
                 Type::Primitive(PrimitiveType::Timestamp),
+            ) => Value::Date(input).cast(target_type),
+            (
+                Value::Date(input),
+                Type::Primitive(PrimitiveType::Date),
+                Type::Primitive(PrimitiveType::TimestampNs),
             ) => Value::Date(input).cast(target_type),
             (
                 value @ Value::Decimal(_),
@@ -911,6 +1022,16 @@ impl From<&Value> for JsonValue {
             Value::TimestampTZ(val) => JsonValue::String(
                 datetime::micros_to_datetimetz(*val)
                     .format("%Y-%m-%dT%H:%M:%S%.f+00:00")
+                    .to_string(),
+            ),
+            Value::TimestampNano(val) => JsonValue::String(
+                chrono::DateTime::from_timestamp_nanos(*val)
+                    .format("%Y-%m-%dT%H:%M:%S%.9f")
+                    .to_string(),
+            ),
+            Value::TimestampTZNano(val) => JsonValue::String(
+                chrono::DateTime::from_timestamp_nanos(*val)
+                    .format("%Y-%m-%dT%H:%M:%S%.9f+00:00")
                     .to_string(),
             ),
             Value::String(val) => JsonValue::String(val.clone()),
@@ -1097,6 +1218,12 @@ impl TrySub for Value {
             (Value::TimestampTZ(own), Value::TimestampTZ(other)) => {
                 Ok(Value::TimestampTZ(own - other))
             }
+            (Value::TimestampNano(own), Value::TimestampNano(other)) => Ok(Value::Decimal(
+                decimal_from_i128_with_scale(i128::from(*own) - i128::from(*other), 0)?,
+            )),
+            (Value::TimestampTZNano(own), Value::TimestampTZNano(other)) => Ok(Value::Decimal(
+                decimal_from_i128_with_scale(i128::from(*own) - i128::from(*other), 0)?,
+            )),
             (Value::String(own), Value::String(other)) => {
                 Ok(Value::LongInt(sub_string(own, other) as i64))
             }
@@ -1687,6 +1814,30 @@ mod tests {
     }
 
     #[test]
+    fn timestamp_ns_bucket_hashes_floor_microseconds() {
+        let micros = 1_510_871_468_000_001_i64;
+        let nanos = micros * 1_000 + 1;
+        let hash = murmur3::murmur3_32(&mut Cursor::new(micros.to_le_bytes()), 0).unwrap();
+        assert_eq!(hash as i32, -1_207_196_810);
+        let expected = Value::Int(((hash & i32::MAX as u32) % 16) as i32);
+        for value in [
+            Value::Timestamp(micros),
+            Value::TimestampNano(nanos),
+            Value::TimestampTZNano(nanos),
+        ] {
+            assert_eq!(value.transform(&Transform::Bucket(16)).unwrap(), expected);
+        }
+        for value in [Value::TimestampNano(-1), Value::TimestampTZNano(-1)] {
+            assert_eq!(
+                value.transform(&Transform::Bucket(16)).unwrap(),
+                Value::Timestamp(-1)
+                    .transform(&Transform::Bucket(16))
+                    .unwrap()
+            );
+        }
+    }
+
+    #[test]
     fn test_transform_month_unsupported() {
         let value = Value::Boolean(true);
         let result = value.transform(&Transform::Month);
@@ -1818,10 +1969,16 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    #[ignore = "no Value::TimestampNano variant; Value::cast Timestamp->TimestampNano unimplemented"]
     fn test_timestamp_micros_promotes_to_timestamp_nanos_by_multiplying_by_one_thousand() {
-        // Value::Timestamp(micros).cast(TimestampNs) yields Value::TimestampNano(micros * 1000).
-        unimplemented!("Timestamp->TimestampNano cast");
+        assert_eq!(
+            Value::Timestamp(-1)
+                .cast(&Type::Primitive(PrimitiveType::TimestampNs))
+                .unwrap(),
+            Value::TimestampNano(-1_000)
+        );
+        assert!(Value::Timestamp(i64::MAX)
+            .cast(&Type::Primitive(PrimitiveType::TimestampNs))
+            .is_err());
     }
 
     #[test]
@@ -1840,25 +1997,36 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "no Value::TimestampNano variant; Value::cast TimestampNano->Timestamp unimplemented"]
     fn test_timestamp_nanos_narrows_to_timestamp_micros_by_floor_division_by_one_thousand() {
-        // Value::TimestampNano(nanos).cast(Timestamp) yields Value::Timestamp(nanos.div_euclid(1000)).
-        unimplemented!("TimestampNano->Timestamp cast");
+        assert_eq!(
+            Value::TimestampNano(-1)
+                .cast(&Type::Primitive(PrimitiveType::Timestamp))
+                .unwrap(),
+            Value::Timestamp(-1)
+        );
     }
 
     #[test]
-    #[ignore = "no Value::TimestampNano variant; Value::cast TimestampNano->Date unimplemented"]
     fn test_timestamp_nanos_casts_to_date_using_floor_division() {
-        // Value::TimestampNano(nanos).cast(Date) returns days-since-epoch with floor semantics.
-        unimplemented!("TimestampNano->Date cast");
+        assert_eq!(
+            Value::TimestampNano(-1)
+                .cast(&Type::Primitive(PrimitiveType::Date))
+                .unwrap(),
+            Value::Date(-1)
+        );
     }
 
     #[test]
-    #[ignore = "no Value::TimestampNano variant; offset-bearing string rejected for without-zone"]
     fn test_timestamp_nanos_with_zone_strings_rejected_for_without_zone_targets() {
-        // `try_from_json` of `"2024-11-07T12:33:54.123456789+00:00"` is accepted for
-        // TimestampTzNs but rejected for TimestampNs (and similarly for TimestampTz/Timestamp).
-        unimplemented!("TimestampNano zone parsing");
+        let value = JsonValue::String("2024-11-07T12:33:54.123456789+00:00".into());
+        assert!(
+            Value::try_from_json(value.clone(), &Type::Primitive(PrimitiveType::TimestampNs))
+                .is_err()
+        );
+        assert!(matches!(
+            Value::try_from_json(value, &Type::Primitive(PrimitiveType::TimestamptzNs)),
+            Ok(Some(Value::TimestampTZNano(_)))
+        ));
     }
 
     #[test]
@@ -1870,11 +2038,15 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Timestamptz parser hardcodes +00:00; offset-less string rejected for with-zone"]
     fn test_timestamp_nanos_without_zone_strings_rejected_for_with_zone_targets() {
-        // `try_from_json` of `"2024-11-07T12:33:54.123456789"` accepted for TimestampNs but
-        // rejected for TimestampTzNs.
-        unimplemented!("TimestampNano no-zone parsing");
+        let value = JsonValue::String("2024-11-07T12:33:54.123456789".into());
+        assert!(matches!(
+            Value::try_from_json(value.clone(), &Type::Primitive(PrimitiveType::TimestampNs)),
+            Ok(Some(Value::TimestampNano(_)))
+        ));
+        assert!(
+            Value::try_from_json(value, &Type::Primitive(PrimitiveType::TimestamptzNs)).is_err()
+        );
     }
 
     #[test]
@@ -2001,10 +2173,13 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "no Value::TimestampNano variant"]
     fn test_timestamp_with_nanoseconds_casts_to_date_via_floor_division() {
-        // TimestampNano(nanos).cast(Date) returns days-since-epoch with floor semantics.
-        unimplemented!("TimestampNano->Date cast");
+        assert_eq!(
+            Value::TimestampNano(-86_400_000_000_001)
+                .cast(&Type::Primitive(PrimitiveType::Date))
+                .unwrap(),
+            Value::Date(-2)
+        );
     }
 
     #[test]
@@ -2291,12 +2466,36 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "no Value::TimestampNano variant; try_from_json for timestamp_ns / timestamptz_ns absent"]
     fn test_literal_round_trips_via_json_for_timestamp_nano_variants() {
-        // Once Value::TimestampNano lands, two more cases extend the round-trip set:
-        //   ("2017-11-29T11:30:07.123456789", TimestampNs, no-offset string)
-        //   ("2017-11-29T11:30:07.123456789+00:00", TimestamptzNs, +00:00 offset)
-        unimplemented!("TimestampNano literal serde");
+        for (value, data_type, literal) in [
+            (
+                Value::TimestampNano(1_511_955_007_123_456_789),
+                PrimitiveType::TimestampNs,
+                "2017-11-29T11:30:07.123456789",
+            ),
+            (
+                Value::TimestampTZNano(1_511_955_007_123_456_789),
+                PrimitiveType::TimestamptzNs,
+                "2017-11-29T11:30:07.123456789+00:00",
+            ),
+        ] {
+            let json = JsonValue::from(&value);
+            assert_eq!(json, JsonValue::String(literal.into()));
+            assert_eq!(
+                Value::try_from_json(json, &Type::Primitive(data_type)).unwrap(),
+                Some(value.clone())
+            );
+            let bytes: ByteBuf = value.clone().into();
+            assert_eq!(
+                Value::try_from_bytes(&bytes, &value.datatype()).unwrap(),
+                value
+            );
+        }
+        assert!(Value::try_from_json(
+            JsonValue::String("2024-11-07T12:33:54.123456789Z".into()),
+            &Type::Primitive(PrimitiveType::TimestamptzNs)
+        )
+        .is_err());
     }
 
     // -----------------------------------------------------------------------

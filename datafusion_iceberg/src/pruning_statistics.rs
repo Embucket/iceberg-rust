@@ -391,6 +391,14 @@ fn any_iter_to_array(
                 opt.and_then(|value| Some(*value.downcast::<i64>().ok()?)),
             )
         })),
+        DataType::Timestamp(TimeUnit::Nanosecond, tz) => {
+            ScalarValue::iter_to_array(iter.map(move |opt| {
+                ScalarValue::TimestampNanosecond(
+                    opt.and_then(|value| Some(*value.downcast::<i64>().ok()?)),
+                    tz.clone(),
+                )
+            }))
+        }
         DataType::Timestamp(_, tz) => {
             // Make sure to preserve the column's timezone for the sake of comparisons.
             ScalarValue::iter_to_array(iter.map(move |opt| {
@@ -498,13 +506,14 @@ pub(crate) fn transform_predicate(
         return None;
     };
     let (column, literal, column_on_left) = match (*left, *right) {
-        (Expr::Column(column), literal) => (column, fold_cast_literal(literal)?, true),
-        (literal, Expr::Column(column)) => (column, fold_cast_literal(literal)?, false),
+        (Expr::Column(column), literal) => (column, literal, true),
+        (literal, Expr::Column(column)) => (column, literal, false),
         _ => return None,
     };
     let field = partition_fields
         .iter()
         .find(|field| field.source_name() == column.name())?;
+    let literal = fold_cast_literal(literal, field.field_type())?;
     let legacy_negative_day = if field.transform() != &Transform::Identity {
         let Expr::Literal(value, _) = &literal else {
             return None;
@@ -530,10 +539,16 @@ pub(crate) fn transform_predicate(
         }
     };
     if field.transform() == &Transform::Hour {
-        let Expr::Literal(ScalarValue::TimestampMicrosecond(Some(micros), _), _) = &literal else {
-            return None;
+        let (timestamp, units_per_hour) = match &literal {
+            Expr::Literal(ScalarValue::TimestampMicrosecond(Some(value), _), _) => {
+                (*value, 3_600_000_000)
+            }
+            Expr::Literal(ScalarValue::TimestampNanosecond(Some(value), _), _) => {
+                (*value, 3_600_000_000_000)
+            }
+            _ => return None,
         };
-        return project_hour_predicate(column, field.name(), op, *micros);
+        return project_hour_predicate(column, field.name(), op, timestamp, units_per_hour);
     }
     let op = match field.transform() {
         Transform::Identity => op,
@@ -580,7 +595,7 @@ pub(crate) fn transform_predicate(
     Some(partition_comparison(column, op, literal))
 }
 
-fn fold_cast_literal(expr: Expr) -> Option<Expr> {
+fn fold_cast_literal(expr: Expr, source_type: &Type) -> Option<Expr> {
     match expr {
         literal @ Expr::Literal(..) => Some(literal),
         Expr::Cast(cast) => {
@@ -589,10 +604,18 @@ fn fold_cast_literal(expr: Expr) -> Option<Expr> {
             };
             let value = value.cast_to(cast.field.data_type()).ok()?;
             let value = match value {
-                ScalarValue::TimestampNanosecond(Some(nanos), None) if nanos % 1_000 == 0 => {
+                ScalarValue::TimestampNanosecond(Some(nanos), None)
+                    if source_type == &Type::Primitive(PrimitiveType::Timestamp)
+                        && nanos % 1_000 == 0 =>
+                {
                     ScalarValue::TimestampMicrosecond(Some(nanos / 1_000), None)
                 }
-                ScalarValue::TimestampNanosecond(..) => return None,
+                ScalarValue::TimestampNanosecond(..)
+                    if source_type != &Type::Primitive(PrimitiveType::TimestampNs)
+                        && source_type != &Type::Primitive(PrimitiveType::TimestamptzNs) =>
+                {
+                    return None;
+                }
                 value => value,
             };
             Some(Expr::Literal(value, None))
@@ -609,19 +632,19 @@ fn project_hour_predicate(
     source_column: Column,
     partition_name: &str,
     op: Operator,
-    micros: i64,
+    timestamp: i64,
+    units_per_hour: i64,
 ) -> Option<Expr> {
-    const MICROS_PER_HOUR: i64 = 3_600_000_000;
     const HOUR_ID_MODULUS: i64 = 1_i64 << 32;
 
-    let hour = micros.div_euclid(MICROS_PER_HOUR);
+    let hour = timestamp.div_euclid(units_per_hour);
     let (lower, upper) = match op {
-        Operator::Eq => (hour, hour.checked_add(i64::from(micros < 0))?),
+        Operator::Eq => (hour, hour.checked_add(i64::from(timestamp < 0))?),
         Operator::Lt | Operator::LtEq => (
-            i64::MIN.div_euclid(MICROS_PER_HOUR),
-            hour.checked_add(i64::from(micros < 0))?,
+            i64::MIN.div_euclid(units_per_hour),
+            hour.checked_add(i64::from(timestamp < 0))?,
         ),
-        Operator::Gt | Operator::GtEq => (hour, i64::MAX.div_euclid(MICROS_PER_HOUR)),
+        Operator::Gt | Operator::GtEq => (hour, i64::MAX.div_euclid(units_per_hour)),
         _ => return None,
     };
     if upper.checked_sub(lower)? >= HOUR_ID_MODULUS - 1 {
@@ -677,12 +700,18 @@ fn literal_matches_source(value: &ScalarValue, field: &BoundPartitionField<'_>) 
         ) | (
             Type::Primitive(PrimitiveType::Timestamp),
             ScalarValue::TimestampMicrosecond(Some(_), None)
+        ) | (
+            Type::Primitive(PrimitiveType::TimestampNs),
+            ScalarValue::TimestampNanosecond(Some(_), None)
         )
     ) || matches!(
         (field.field_type(), value),
         (
             Type::Primitive(PrimitiveType::Timestamptz),
             ScalarValue::TimestampMicrosecond(Some(_), Some(tz))
+        ) | (
+            Type::Primitive(PrimitiveType::TimestamptzNs),
+            ScalarValue::TimestampNanosecond(Some(_), Some(tz))
         ) if tz.as_ref() == "UTC"
     )
 }
@@ -707,6 +736,21 @@ fn transform_literal(expr: Expr, transform: &Transform) -> Option<Expr> {
             };
             Some(Expr::Literal(
                 ScalarValue::Int32(Some(i32::try_from(micros.div_euclid(unit)).ok()?)),
+                None,
+            ))
+        }
+        Transform::Day | Transform::Hour if matches!(value, ScalarValue::TimestampNanosecond(Some(nanos), _) if *nanos < 0) =>
+        {
+            let ScalarValue::TimestampNanosecond(Some(nanos), _) = value else {
+                return None;
+            };
+            let unit = if transform == &Transform::Day {
+                86_400_000_000_000
+            } else {
+                3_600_000_000_000
+            };
+            Some(Expr::Literal(
+                ScalarValue::Int32(Some(i32::try_from(nanos.div_euclid(unit)).ok()?)),
                 None,
             ))
         }
@@ -768,6 +812,14 @@ impl DateTransform {
                 TypeSignature::Exact(vec![
                     DataType::Utf8,
                     DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                ]),
+                TypeSignature::Exact(vec![
+                    DataType::Utf8,
+                    DataType::Timestamp(TimeUnit::Nanosecond, None),
+                ]),
+                TypeSignature::Exact(vec![
+                    DataType::Utf8,
+                    DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
                 ]),
             ]),
             volatility: Volatility::Immutable,
@@ -854,6 +906,14 @@ fn scalarvalue_to_value(scalar: &ScalarValue) -> Result<Value, Error> {
         ScalarValue::TimestampMicrosecond(x, None) => Ok(Value::Timestamp(x.ok_or(
             Error::InvalidFormat("Value can't be null when converting to iceberg value".to_owned()),
         )?)),
+        ScalarValue::TimestampNanosecond(x, Some(tz)) if tz == &Arc::from("UTC") => {
+            Ok(Value::TimestampTZNano(x.ok_or(Error::InvalidFormat(
+                "Value can't be null when converting to iceberg value".to_owned(),
+            ))?))
+        }
+        ScalarValue::TimestampNanosecond(x, None) => Ok(Value::TimestampNano(x.ok_or(
+            Error::InvalidFormat("Value can't be null when converting to iceberg value".to_owned()),
+        )?)),
         x => Err(Error::NotSupported(format!(
             "Transforming {x} to iceberg value"
         ))),
@@ -872,6 +932,11 @@ fn value_to_scalarvalue(value: Value) -> Result<ScalarValue, Error> {
             Some(x),
             Some("UTC".into()),
         )),
+        Value::TimestampNano(x) => Ok(ScalarValue::TimestampNanosecond(Some(x), None)),
+        Value::TimestampTZNano(x) => Ok(ScalarValue::TimestampNanosecond(
+            Some(x),
+            Some("UTC".into()),
+        )),
         x => Err(Error::NotSupported(format!(
             "Transforming {x} to iceberg value"
         ))),
@@ -883,6 +948,7 @@ mod tests {
     use super::*;
     use datafusion::arrow::array::{
         Array, Date32Array, Decimal128Array, Int64Array, TimestampMicrosecondArray,
+        TimestampNanosecondArray,
     };
     use datafusion::arrow::datatypes::Field;
     use datafusion::common::config::ConfigOptions;
@@ -1590,7 +1656,10 @@ mod tests {
             DataType::Timestamp(TimeUnit::Nanosecond, None),
         ));
         assert!(matches!(
-            fold_cast_literal(timestamp.clone()),
+            fold_cast_literal(
+                timestamp.clone(),
+                &Type::Primitive(PrimitiveType::Timestamp)
+            ),
             Some(Expr::Literal(
                 ScalarValue::TimestampMicrosecond(Some(_), None),
                 _
@@ -1613,7 +1682,11 @@ mod tests {
             )),
             DataType::Timestamp(TimeUnit::Nanosecond, None),
         ));
-        assert!(fold_cast_literal(sub_microsecond.clone()).is_none());
+        assert!(fold_cast_literal(
+            sub_microsecond.clone(),
+            &Type::Primitive(PrimitiveType::Timestamp)
+        )
+        .is_none());
         assert!(transform_predicate(
             partition_comparison(
                 Expr::Column(Column::from_name("ts")),
@@ -1623,6 +1696,51 @@ mod tests {
             &fields,
         )
         .is_none());
+    }
+
+    #[test]
+    fn nanosecond_partition_projection_keeps_sub_microsecond_precision() {
+        use datafusion_expr::expr::Cast;
+
+        let source = StructField::new(
+            1,
+            "ts",
+            false,
+            Type::Primitive(PrimitiveType::TimestampNs),
+            None,
+        );
+        let literal = Expr::Cast(Cast::new(
+            Box::new(Expr::Literal(
+                ScalarValue::TimestampNanosecond(Some(-1), None),
+                None,
+            )),
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+        ));
+        assert_eq!(
+            fold_cast_literal(literal.clone(), &source.field_type),
+            Some(Expr::Literal(
+                ScalarValue::TimestampNanosecond(Some(-1), None),
+                None
+            ))
+        );
+        for transform in [
+            Transform::Year,
+            Transform::Month,
+            Transform::Day,
+            Transform::Hour,
+        ] {
+            let partition = PartitionField::new(1, 1000, "ts_part", transform);
+            let fields = [BoundPartitionField::new(&partition, &source)];
+            assert!(transform_predicate(
+                partition_comparison(
+                    Expr::Column(Column::from_name("ts")),
+                    Operator::Eq,
+                    literal.clone(),
+                ),
+                &fields,
+            )
+            .is_some());
+        }
     }
 
     fn project_id_predicate(
@@ -2101,6 +2219,23 @@ mod tests {
                 .unwrap();
             assert_eq!(ts.value(0), TS_MICROS);
             assert!(ts.is_null(1));
+        }
+    }
+
+    #[test]
+    fn any_iter_to_array_preserves_nanosecond_precision() {
+        for timezone in [None, Some("UTC".into())] {
+            let dt = DataType::Timestamp(TimeUnit::Nanosecond, timezone);
+            let iter = vec![Some(Value::TimestampNano(-1).into_any()), None].into_iter();
+            let array = any_iter_to_array(iter, &dt).unwrap();
+
+            assert_eq!(array.data_type(), &dt);
+            let timestamps = array
+                .as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+                .unwrap();
+            assert_eq!(timestamps.value(0), -1);
+            assert!(timestamps.is_null(1));
         }
     }
 

@@ -2286,6 +2286,11 @@ fn value_to_scalarvalue(value: &Value) -> Result<ScalarValue, DataFusionError> {
             Some(*ts),
             Some("UTC".into()),
         )),
+        Value::TimestampNano(ts) => Ok(ScalarValue::TimestampNanosecond(Some(*ts), None)),
+        Value::TimestampTZNano(ts) => Ok(ScalarValue::TimestampNanosecond(
+            Some(*ts),
+            Some("UTC".into()),
+        )),
         Value::String(s) => Ok(ScalarValue::Utf8(Some(s.clone()))),
         Value::UUID(u) => Ok(ScalarValue::FixedSizeBinary(
             16,

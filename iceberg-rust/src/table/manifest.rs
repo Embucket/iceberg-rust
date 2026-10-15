@@ -959,6 +959,16 @@ fn update_partitions(
                     (Value::TimestampTZ(val), Value::TimestampTZ(current)) if *current > *val => {
                         *current = *val
                     }
+                    (Value::TimestampNano(val), Value::TimestampNano(current))
+                        if *current > *val =>
+                    {
+                        *current = *val
+                    }
+                    (Value::TimestampTZNano(val), Value::TimestampTZNano(current))
+                        if *current > *val =>
+                    {
+                        *current = *val
+                    }
                     (Value::String(val), Value::String(current)) if *current > *val => {
                         *current = val.clone()
                     }
@@ -998,6 +1008,16 @@ fn update_partitions(
                         *current = *val
                     }
                     (Value::TimestampTZ(val), Value::TimestampTZ(current)) if *current < *val => {
+                        *current = *val
+                    }
+                    (Value::TimestampNano(val), Value::TimestampNano(current))
+                        if *current < *val =>
+                    {
+                        *current = *val
+                    }
+                    (Value::TimestampTZNano(val), Value::TimestampTZNano(current))
+                        if *current < *val =>
+                    {
                         *current = *val
                     }
                     (Value::String(val), Value::String(current)) if *current < *val => {

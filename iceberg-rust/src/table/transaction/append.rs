@@ -367,14 +367,15 @@ mod split_tests {
 
     /// Build a manifest entry sitting at partition `day = value`.
     fn entry_at(day: i32) -> ManifestEntry {
+        entry_at_partition(Value::Int(day), "day", FormatVersion::V2)
+    }
+
+    fn entry_at_partition(value: Value, name: &str, version: FormatVersion) -> ManifestEntry {
         let data_file = DataFile::builder()
             .with_content(Content::Data)
-            .with_file_path(format!("s3://bucket/day={day}/data.parquet"))
+            .with_file_path(format!("s3://bucket/{name}={value}/data.parquet"))
             .with_file_format(FileFormat::Parquet)
-            .with_partition(Struct::from_iter(vec![(
-                "day".to_owned(),
-                Some(Value::Int(day)),
-            )]))
+            .with_partition(Struct::from_iter(vec![(name.to_owned(), Some(value))]))
             .with_record_count(1)
             .with_file_size_in_bytes(1024)
             .with_column_sizes(None)
@@ -388,7 +389,7 @@ mod split_tests {
             .expect("data file builds");
 
         ManifestEntry::builder()
-            .with_format_version(FormatVersion::V2)
+            .with_format_version(version)
             .with_status(Status::Added)
             .with_data_file(data_file)
             .with_sequence_number(1)
@@ -441,6 +442,27 @@ mod split_tests {
             groups.iter().all(|g| !g.is_empty()),
             "no empty group survives"
         );
+    }
+
+    #[test]
+    fn nanosecond_timestamp_split_handles_distances_beyond_i64() {
+        let min = -5_000_000_000_000_000_000_i64;
+        let max = 5_000_000_000_000_000_000_i64;
+        let files = [min, 0, max].into_iter().map(|value| {
+            Ok(entry_at_partition(
+                Value::TimestampNano(value),
+                "ts_ns",
+                FormatVersion::V3,
+            ))
+        });
+        let bounds = Rectangle::new(
+            smallvec![Value::TimestampNano(min)],
+            smallvec![Value::TimestampNano(max)],
+        );
+        let [(lower, _), (upper, _)] = split_datafiles_once(files, bounds, &["ts_ns"]).unwrap();
+        assert_eq!(lower.len() + upper.len(), 3);
+        assert!(!lower.is_empty());
+        assert!(!upper.is_empty());
     }
 
     #[test]

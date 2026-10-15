@@ -19,7 +19,7 @@ use arrow::{
     compute::{binary, cast, date_part, unary, DatePart},
     datatypes::{
         DataType, Date32Type, Int16Type, Int32Type, Int64Type, Time64MicrosecondType, TimeUnit,
-        TimestampMicrosecondType,
+        TimestampMicrosecondType, TimestampNanosecondType,
     },
     error::ArrowError,
 };
@@ -28,6 +28,8 @@ use iceberg_rust_spec::{spec::partition::Transform, values::YEARS_BEFORE_UNIX_EP
 
 static MICROS_IN_HOUR: i64 = 3_600_000_000;
 static MICROS_IN_DAY: i64 = 86_400_000_000;
+static NANOS_IN_HOUR: i64 = 3_600_000_000_000;
+static NANOS_IN_DAY: i64 = 86_400_000_000_000;
 
 /// Applies an Iceberg partition transform to an Arrow array
 ///
@@ -112,6 +114,65 @@ pub fn transform_arrow(array: ArrayRef, transform: &Transform) -> Result<ArrayRe
                     DatePart::Year,
                 )?),
                 datepart_to_years,
+            )))
+        }
+        (DataType::Timestamp(TimeUnit::Nanosecond, _), Transform::Hour) => {
+            Ok(Arc::new(unary::<_, _, Int32Type>(
+                as_primitive_array::<TimestampNanosecondType>(&array),
+                |value| value.div_euclid(NANOS_IN_HOUR) as i32,
+            )))
+        }
+        (DataType::Timestamp(TimeUnit::Nanosecond, _), Transform::Day) => {
+            Ok(Arc::new(unary::<_, _, Int32Type>(
+                as_primitive_array::<TimestampNanosecondType>(&array),
+                |value| value.div_euclid(NANOS_IN_DAY) as i32,
+            )))
+        }
+        (DataType::Timestamp(TimeUnit::Nanosecond, _), Transform::Month) => {
+            let values = as_primitive_array::<TimestampNanosecondType>(&array);
+            // Iceberg timestamp partitions use UTC; Arrow needs chrono-tz for named timezones.
+            let utc_values = match array.data_type() {
+                DataType::Timestamp(_, Some(_)) => {
+                    Some(values.clone().with_timezone_opt(None::<Arc<str>>))
+                }
+                _ => None,
+            };
+            let values = utc_values.as_ref().unwrap_or(values);
+            let year = date_part(values, DatePart::Year)?;
+            let month = date_part(values, DatePart::Month)?;
+            Ok(Arc::new(binary::<_, _, _, Int32Type>(
+                as_primitive_array::<Int32Type>(&year),
+                as_primitive_array::<Int32Type>(&month),
+                datepart_to_months,
+            )?))
+        }
+        (DataType::Timestamp(TimeUnit::Nanosecond, _), Transform::Year) => {
+            let values = as_primitive_array::<TimestampNanosecondType>(&array);
+            // Keep the epoch values unchanged while removing only the UTC display timezone.
+            let utc_values = match array.data_type() {
+                DataType::Timestamp(_, Some(_)) => {
+                    Some(values.clone().with_timezone_opt(None::<Arc<str>>))
+                }
+                _ => None,
+            };
+            Ok(Arc::new(unary::<_, _, Int32Type>(
+                as_primitive_array::<Int32Type>(&date_part(
+                    utc_values.as_ref().unwrap_or(values),
+                    DatePart::Year,
+                )?),
+                datepart_to_years,
+            )))
+        }
+        (DataType::Timestamp(TimeUnit::Nanosecond, _), Transform::Bucket(m)) => {
+            Ok(Arc::new(unary::<_, _, Int32Type>(
+                as_primitive_array::<TimestampNanosecondType>(&array),
+                |value| bucket(&value.div_euclid(1_000).to_le_bytes(), *m),
+            )))
+        }
+        (DataType::Timestamp(TimeUnit::Microsecond, _), Transform::Bucket(m)) => {
+            Ok(Arc::new(unary::<_, _, Int32Type>(
+                as_primitive_array::<TimestampMicrosecondType>(&array),
+                |value| bucket(&value.to_le_bytes(), *m),
             )))
         }
         (DataType::Int16, Transform::Truncate(m)) => Ok(Arc::<PrimitiveArray<Int16Type>>::new(
@@ -213,7 +274,9 @@ fn bucket(bytes: &[u8], width: u32) -> i32 {
 mod tests {
 
     use super::*;
-    use arrow::array::{ArrayRef, Date32Array, TimestampMicrosecondArray};
+    use arrow::array::{
+        ArrayRef, Date32Array, TimestampMicrosecondArray, TimestampNanosecondArray,
+    };
 
     fn create_date32_array() -> ArrayRef {
         Arc::new(Date32Array::from(vec![
@@ -243,6 +306,34 @@ mod tests {
             ])
             .with_timezone_utc(),
         ) as ArrayRef
+    }
+
+    #[test]
+    fn test_timestamp_ns_transforms_preserve_sub_microsecond_values() {
+        for timezone in [None, Some("UTC")] {
+            let array: ArrayRef = Arc::new(
+                TimestampNanosecondArray::from(vec![Some(-1), Some(0), Some(NANOS_IN_DAY), None])
+                    .with_timezone_opt(timezone),
+            );
+            for (transform, expected) in [
+                (Transform::Year, vec![Some(-1), Some(0), Some(0), None]),
+                (Transform::Month, vec![Some(-1), Some(0), Some(0), None]),
+                (Transform::Day, vec![Some(-1), Some(0), Some(1), None]),
+                (Transform::Hour, vec![Some(-1), Some(0), Some(24), None]),
+            ] {
+                let result = transform_arrow(array.clone(), &transform).unwrap();
+                let expected: ArrayRef = Arc::new(arrow::array::Int32Array::from(expected));
+                assert_eq!(&result, &expected, "{transform:?}");
+            }
+            let result = transform_arrow(array, &Transform::Bucket(17)).unwrap();
+            let expected: ArrayRef = Arc::new(arrow::array::Int32Array::from(vec![
+                Some(bucket(&(-1_i64).to_le_bytes(), 17)),
+                Some(bucket(&0_i64.to_le_bytes(), 17)),
+                Some(bucket(&(NANOS_IN_DAY / 1_000).to_le_bytes(), 17)),
+                None,
+            ]));
+            assert_eq!(&result, &expected);
+        }
     }
 
     #[test]

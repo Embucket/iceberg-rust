@@ -605,6 +605,8 @@ fn avro_schema_datatype(data_type: &Type) -> Type {
             PrimitiveType::Time => Type::Primitive(PrimitiveType::Long),
             PrimitiveType::Timestamp => Type::Primitive(PrimitiveType::Long),
             PrimitiveType::Timestamptz => Type::Primitive(PrimitiveType::Long),
+            PrimitiveType::TimestampNs => Type::Primitive(PrimitiveType::Long),
+            PrimitiveType::TimestamptzNs => Type::Primitive(PrimitiveType::Long),
             p => Type::Primitive(p.clone()),
         },
         t => t.clone(),
@@ -693,8 +695,9 @@ impl AvroMap<ByteBuf> {
 ///
 /// Type promotion does not rewrite existing bounds, so a bound may be encoded at a narrower
 /// write-time type than the current schema reports. Per the Iceberg spec, the write-time type is
-/// inferred from the byte length: a 4-byte bound for a current `long`/`double`/`timestamp` was
-/// written as `int`/`float`/`date` and is promoted here. All other cases (including decimals, which
+/// inferred from the byte length: a 4-byte bound for a current
+/// `long`/`double`/`timestamp`/`timestamp_ns` was written as `int`/`float`/`date` and is
+/// promoted here. All other cases (including decimals, which
 /// decode at any width from the scale in `data_type`) fall through to the plain single-value
 /// decoding.
 pub(crate) fn decode_bound(bytes: &[u8], data_type: &Type) -> Result<Value, Error> {
@@ -705,7 +708,7 @@ pub(crate) fn decode_bound(bytes: &[u8], data_type: &Type) -> Result<Value, Erro
         (Type::Primitive(PrimitiveType::Double), 4) => Ok(Value::Double(
             ordered_float::OrderedFloat(f64::from(f32::from_le_bytes(bytes.try_into()?))),
         )),
-        (Type::Primitive(PrimitiveType::Timestamp), 4) => {
+        (Type::Primitive(PrimitiveType::Timestamp | PrimitiveType::TimestampNs), 4) => {
             Value::Date(i32::from_le_bytes(bytes.try_into()?)).cast(data_type)
         }
         _ => Value::try_from_bytes(bytes, data_type),
@@ -721,7 +724,7 @@ pub(crate) fn decode_bound_for_copy(bytes: &[u8], data_type: &Type) -> Result<Va
         (Type::Primitive(PrimitiveType::Double), 4) => {
             Value::try_from_bytes(bytes, &Type::Primitive(PrimitiveType::Float))
         }
-        (Type::Primitive(PrimitiveType::Timestamp), 4) => {
+        (Type::Primitive(PrimitiveType::Timestamp | PrimitiveType::TimestampNs), 4) => {
             Value::try_from_bytes(bytes, &Type::Primitive(PrimitiveType::Date))
         }
         _ => Value::try_from_bytes(bytes, data_type),
@@ -2266,6 +2269,7 @@ mod tests {
     const LONG: Type = Type::Primitive(PrimitiveType::Long);
     const DOUBLE: Type = Type::Primitive(PrimitiveType::Double);
     const TIMESTAMP: Type = Type::Primitive(PrimitiveType::Timestamp);
+    const TIMESTAMP_NS: Type = Type::Primitive(PrimitiveType::TimestampNs);
 
     #[test]
     fn decode_bound_widens_int_written_before_long_promotion() {
@@ -2297,6 +2301,24 @@ mod tests {
         // 4-byte date is upscaled to microseconds: 3 days * 86_400_000_000 us/day.
         let decoded = decode_bound(&3_i32.to_le_bytes(), &TIMESTAMP).unwrap();
         assert_eq!(decoded, Value::Timestamp(259_200_000_000));
+    }
+
+    #[test]
+    fn decode_bound_promotes_date_written_before_timestamp_ns_promotion() {
+        let bytes = (-1_i32).to_le_bytes();
+        assert_eq!(
+            decode_bound(&bytes, &TIMESTAMP_NS).unwrap(),
+            Value::TimestampNano(-86_400_000_000_000)
+        );
+        assert_eq!(
+            decode_bound_for_copy(&bytes, &TIMESTAMP_NS).unwrap(),
+            Value::Date(-1)
+        );
+        let nanos = 1_511_955_007_123_456_789_i64;
+        assert_eq!(
+            decode_bound(&nanos.to_le_bytes(), &TIMESTAMP_NS).unwrap(),
+            Value::TimestampNano(nanos)
+        );
     }
 
     #[test]
