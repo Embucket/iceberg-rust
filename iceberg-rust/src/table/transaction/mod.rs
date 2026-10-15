@@ -48,8 +48,9 @@ pub(crate) static UPDATE_PROPERTIES_INDEX: usize = 6;
 pub(crate) static SET_SNAPSHOT_REF_INDEX: usize = 7;
 pub(crate) static EXPIRE_SNAPSHOTS_INDEX: usize = 8;
 pub(crate) static REPLACE_SORT_ORDER_INDEX: usize = 9;
+pub(crate) static TRUNCATE_INDEX: usize = 10;
 
-pub(crate) static NUM_OPERATIONS: usize = 10;
+pub(crate) static NUM_OPERATIONS: usize = 11;
 
 fn reject_spec_change_with_file_write(
     operations: &[Option<Operation>],
@@ -342,6 +343,16 @@ impl<'table> TableTransaction<'table> {
         }
         self
     }
+
+    /// Replace the current table contents with an empty snapshot. The parent
+    /// snapshot and V3 row ID high-water mark are retained for change tracking.
+    #[must_use]
+    pub fn truncate(mut self) -> Self {
+        self.operations[TRUNCATE_INDEX] = Some(Operation::Truncate {
+            branch: self.branch.clone(),
+        });
+        self
+    }
     /// Replaces all data files in the table with new ones
     ///
     /// This operation removes all existing data files and replaces them with the provided
@@ -551,6 +562,21 @@ impl<'table> TableTransaction<'table> {
             &self.operations,
             self.table.metadata().default_spec_id,
         )?;
+        if self.operations[TRUNCATE_INDEX].is_some()
+            && [
+                APPEND_INDEX,
+                APPEND_SEQUENCE_GROUPS_INDEX,
+                REPLACE_INDEX,
+                OVERWRITE_INDEX,
+            ]
+            .iter()
+            .any(|&index| self.operations[index].is_some())
+        {
+            return Err(Error::NotSupported(
+                "TRUNCATE cannot be combined with another data write in one Iceberg transaction"
+                    .to_owned(),
+            ));
+        }
         let catalog = self.table.catalog();
         let identifier = self.table.identifier.clone();
         let base_metadata = self.table.metadata();
@@ -567,6 +593,16 @@ impl<'table> TableTransaction<'table> {
             }],
             Vec::new(),
         );
+        if self.operations[TRUNCATE_INDEX].is_some() {
+            // Snapshot sequence numbers are table-global, even when the target
+            // ref is not. Reject commits based on another ref's stale state.
+            requirements.extend(base_metadata.refs.iter().map(|(name, reference)| {
+                TableRequirement::AssertRefSnapshotId {
+                    r#ref: name.clone(),
+                    snapshot_id: Some(reference.snapshot_id),
+                }
+            }));
+        }
         for operation in self.operations.into_iter().flatten() {
             let metadata = staged_metadata.as_ref().unwrap_or(base_metadata);
             let (requirement, update) = operation

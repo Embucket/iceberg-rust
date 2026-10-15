@@ -491,6 +491,11 @@ pub fn apply_table_updates(
                 }
             }
             TableUpdate::AddSnapshot { snapshot } => {
+                if metadata.format_version != FormatVersion::V1
+                    && *snapshot.sequence_number() <= metadata.last_sequence_number
+                {
+                    return Err(Error::CommitConflict(metadata.table_uuid.to_string()));
+                }
                 if metadata.format_version == FormatVersion::V3 {
                     let first_row_id = (*snapshot.first_row_id()).ok_or_else(|| {
                         Error::InvalidFormat("v3 snapshot first-row-id".to_string())

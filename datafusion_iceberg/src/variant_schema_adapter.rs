@@ -3,17 +3,20 @@ use std::fmt::{self, Display};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use datafusion::arrow::array::{Array, ArrayRef, StructArray};
+use datafusion::arrow::array::{
+    new_null_array, Array, ArrayRef, FixedSizeListArray, LargeListArray, ListArray, MapArray,
+    StructArray,
+};
 use datafusion::arrow::compute::cast;
-use datafusion::arrow::datatypes::{DataType, FieldRef, Schema, SchemaRef};
+use datafusion::arrow::datatypes::{DataType, FieldRef, Fields, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
-use datafusion::common::{internal_err, Result};
+use datafusion::common::{exec_err, internal_err, Result, ScalarValue};
 use datafusion::physical_expr::utils::collect_columns;
 use datafusion::physical_expr_adapter::{
     DefaultPhysicalExprAdapter, PhysicalExprAdapter, PhysicalExprAdapterFactory,
 };
-use datafusion::physical_plan::expressions::{CastExpr, Column};
+use datafusion::physical_plan::expressions::{CastExpr, Column, Literal};
 use datafusion::physical_plan::PhysicalExpr;
 use datafusion_expr::ColumnarValue;
 use iceberg_rust::spec::arrow::schema::PARQUET_FIELD_ID_META_KEY;
@@ -87,6 +90,16 @@ impl IcebergPhysicalExprAdapter {
         Some((Arc::new(logical.clone()), physical_index, physical))
     }
 
+    fn reused_name_with_different_id(&self, name: &str) -> Option<FieldRef> {
+        let logical = self.logical_file_schema.field_with_name(name).ok()?;
+        let logical_id = field_id(logical)?;
+        if self.physical_field_by_id(logical_id).is_some() {
+            return None;
+        }
+        let physical = self.physical_file_schema.field_with_name(name).ok()?;
+        (field_id(physical).is_some_and(|id| id != logical_id)).then(|| Arc::new(logical.clone()))
+    }
+
     fn is_logical_variant_column(&self, name: &str) -> bool {
         self.logical_file_schema
             .field_with_name(name)
@@ -124,18 +137,27 @@ impl IcebergPhysicalExprAdapter {
         )))
     }
 
-    fn rewrite_renamed_column(&self, column: &Column) -> Result<Option<Arc<dyn PhysicalExpr>>> {
+    fn rewrite_field_id_column(&self, column: &Column) -> Result<Option<Arc<dyn PhysicalExpr>>> {
         let Some((logical_field, physical_index, physical_field)) =
             self.field_id_mapping(column.name())
         else {
             return Ok(None);
         };
-        if logical_field.name() == physical_field.name() {
+        let nested_change =
+            needs_nested_projection(physical_field.data_type(), logical_field.data_type());
+        if logical_field.name() == physical_field.name() && !nested_change {
             return Ok(None);
         }
 
         let physical_column: Arc<dyn PhysicalExpr> =
             Arc::new(Column::new(physical_field.name(), physical_index));
+        if nested_change {
+            return Ok(Some(Arc::new(FieldIdColumnExpr::with_nested_projection(
+                physical_column,
+                logical_field,
+                physical_field.data_type(),
+            )?)));
+        }
         let input = if logical_field.data_type() == physical_field.data_type() {
             physical_column
         } else {
@@ -195,15 +217,31 @@ fn field_id(field: &datafusion::arrow::datatypes::Field) -> Option<i32> {
         .and_then(|id| id.parse().ok())
 }
 
+fn needs_nested_projection(source: &DataType, target: &DataType) -> bool {
+    source != target
+        && matches!(
+            (source, target),
+            (DataType::Struct(_), DataType::Struct(_))
+                | (DataType::List(_), DataType::List(_))
+                | (DataType::LargeList(_), DataType::LargeList(_))
+                | (DataType::FixedSizeList(_, _), DataType::FixedSizeList(_, _))
+                | (DataType::Map(_, _), DataType::Map(_, _))
+        )
+}
+
 impl PhysicalExprAdapter for IcebergPhysicalExprAdapter {
     fn rewrite(&self, expr: Arc<dyn PhysicalExpr>) -> Result<Arc<dyn PhysicalExpr>> {
         let columns = collect_columns(&expr);
         let requires_iceberg_rewrite = columns.iter().any(|column| {
             self.is_logical_variant_column(column.name())
                 || Self::row_lineage_field_id(column.name()).is_some()
+                || self.reused_name_with_different_id(column.name()).is_some()
                 || self
                     .field_id_mapping(column.name())
-                    .is_some_and(|(logical, _, physical)| logical.name() != physical.name())
+                    .is_some_and(|(logical, _, physical)| {
+                        logical.name() != physical.name()
+                            || needs_nested_projection(physical.data_type(), logical.data_type())
+                    })
         });
         if !requires_iceberg_rewrite {
             return self.default.rewrite(expr);
@@ -221,11 +259,27 @@ impl PhysicalExprAdapter for IcebergPhysicalExprAdapter {
                 return self.default.rewrite(expr).map(Transformed::yes);
             }
 
+            if let Some(field) = self.reused_name_with_different_id(column.name()) {
+                if !field.is_nullable() {
+                    return exec_err!(
+                        "Required Iceberg field '{}' is absent from the data file",
+                        field.name()
+                    );
+                }
+                let value = ScalarValue::Null.cast_to(field.data_type())?;
+                return Ok(Transformed::yes(Arc::new(Literal::new_with_metadata(
+                    value,
+                    Some(datafusion::common::metadata::FieldMetadata::from(
+                        field.as_ref(),
+                    )),
+                ))));
+            }
+
             if self.is_logical_variant_column(column.name()) {
                 return self.rewrite_variant_column(column).map(Transformed::yes);
             }
 
-            if let Some(physical) = self.rewrite_renamed_column(column)? {
+            if let Some(physical) = self.rewrite_field_id_column(column)? {
                 return Ok(Transformed::yes(physical));
             }
 
@@ -239,6 +293,7 @@ impl PhysicalExprAdapter for IcebergPhysicalExprAdapter {
 struct FieldIdColumnExpr {
     input: Arc<dyn PhysicalExpr>,
     target_field: FieldRef,
+    nested_projection: Option<NestedProjection>,
 }
 
 impl FieldIdColumnExpr {
@@ -246,13 +301,33 @@ impl FieldIdColumnExpr {
         Self {
             input,
             target_field,
+            nested_projection: None,
         }
+    }
+
+    fn with_nested_projection(
+        input: Arc<dyn PhysicalExpr>,
+        target_field: FieldRef,
+        physical_type: &DataType,
+    ) -> Result<Self> {
+        let Some(nested_projection) =
+            NestedProjection::new(physical_type, target_field.data_type())?
+        else {
+            return internal_err!("Iceberg nested field projection requires container types");
+        };
+        Ok(Self {
+            input,
+            target_field,
+            nested_projection: Some(nested_projection),
+        })
     }
 }
 
 impl PartialEq for FieldIdColumnExpr {
     fn eq(&self, other: &Self) -> bool {
-        self.input.eq(&other.input) && self.target_field == other.target_field
+        self.input.eq(&other.input)
+            && self.target_field == other.target_field
+            && self.nested_projection == other.nested_projection
     }
 }
 
@@ -260,6 +335,7 @@ impl Hash for FieldIdColumnExpr {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.input.hash(state);
         self.target_field.hash(state);
+        self.nested_projection.hash(state);
     }
 }
 
@@ -279,7 +355,14 @@ impl PhysicalExpr for FieldIdColumnExpr {
     }
 
     fn evaluate(&self, batch: &RecordBatch) -> Result<ColumnarValue> {
-        self.input.evaluate(batch)
+        let value = self.input.evaluate(batch)?;
+        let Some(projection) = &self.nested_projection else {
+            return Ok(value);
+        };
+        let ColumnarValue::Array(value) = value else {
+            return internal_err!("Iceberg nested column unexpectedly evaluated to a scalar");
+        };
+        Ok(ColumnarValue::Array(projection.apply(&value)?))
     }
 
     fn return_field(&self, _input_schema: &Schema) -> Result<FieldRef> {
@@ -297,14 +380,260 @@ impl PhysicalExpr for FieldIdColumnExpr {
         if children.len() != 1 {
             return internal_err!("FieldIdColumnExpr requires exactly one child");
         }
-        Ok(Arc::new(Self::new(
-            Arc::clone(&children[0]),
-            Arc::clone(&self.target_field),
-        )))
+        Ok(Arc::new(Self {
+            input: Arc::clone(&children[0]),
+            target_field: Arc::clone(&self.target_field),
+            nested_projection: self.nested_projection.clone(),
+        }))
     }
 
     fn fmt_sql(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         Display::fmt(self, f)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum NestedProjection {
+    Struct(StructProjection),
+    List {
+        field: FieldRef,
+        values: Option<Box<Self>>,
+    },
+    LargeList {
+        field: FieldRef,
+        values: Option<Box<Self>>,
+    },
+    FixedSizeList {
+        field: FieldRef,
+        size: i32,
+        values: Option<Box<Self>>,
+    },
+    Map {
+        field: FieldRef,
+        ordered: bool,
+        entries: Option<Box<Self>>,
+    },
+}
+
+impl NestedProjection {
+    fn new(source: &DataType, target: &DataType) -> Result<Option<Self>> {
+        if source == target {
+            return Ok(None);
+        }
+        let projection = match (source, target) {
+            (DataType::Struct(source), DataType::Struct(target)) => {
+                Self::Struct(StructProjection::new(source, target)?)
+            }
+            (DataType::List(source), DataType::List(target)) => {
+                verify_container_child_id(source, target)?;
+                Self::List {
+                    field: Arc::clone(target),
+                    values: Self::new(source.data_type(), target.data_type())?.map(Box::new),
+                }
+            }
+            (DataType::LargeList(source), DataType::LargeList(target)) => {
+                verify_container_child_id(source, target)?;
+                Self::LargeList {
+                    field: Arc::clone(target),
+                    values: Self::new(source.data_type(), target.data_type())?.map(Box::new),
+                }
+            }
+            (
+                DataType::FixedSizeList(source, source_size),
+                DataType::FixedSizeList(target, size),
+            ) => {
+                if source_size != size {
+                    return exec_err!("Iceberg fixed-size list width changed across schemas");
+                }
+                verify_container_child_id(source, target)?;
+                Self::FixedSizeList {
+                    field: Arc::clone(target),
+                    size: *size,
+                    values: Self::new(source.data_type(), target.data_type())?.map(Box::new),
+                }
+            }
+            (DataType::Map(source, _), DataType::Map(target, ordered)) => {
+                verify_container_child_id(source, target)?;
+                Self::Map {
+                    field: Arc::clone(target),
+                    ordered: *ordered,
+                    entries: Self::new(source.data_type(), target.data_type())?.map(Box::new),
+                }
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(projection))
+    }
+
+    fn apply(&self, input: &ArrayRef) -> Result<ArrayRef> {
+        match self {
+            Self::Struct(projection) => projection.apply(input),
+            Self::List { field, values } => {
+                let Some(input) = input.as_any().downcast_ref::<ListArray>() else {
+                    return internal_err!("Iceberg nested projection expected a list array");
+                };
+                let values = project_or_cast(input.values(), field.data_type(), values.as_deref())?;
+                Ok(Arc::new(ListArray::try_new(
+                    Arc::clone(field),
+                    input.offsets().clone(),
+                    values,
+                    input.nulls().cloned(),
+                )?))
+            }
+            Self::LargeList { field, values } => {
+                let Some(input) = input.as_any().downcast_ref::<LargeListArray>() else {
+                    return internal_err!("Iceberg nested projection expected a large list array");
+                };
+                let values = project_or_cast(input.values(), field.data_type(), values.as_deref())?;
+                Ok(Arc::new(LargeListArray::try_new(
+                    Arc::clone(field),
+                    input.offsets().clone(),
+                    values,
+                    input.nulls().cloned(),
+                )?))
+            }
+            Self::FixedSizeList {
+                field,
+                size,
+                values,
+            } => {
+                let Some(input) = input.as_any().downcast_ref::<FixedSizeListArray>() else {
+                    return internal_err!(
+                        "Iceberg nested projection expected a fixed-size list array"
+                    );
+                };
+                let values = project_or_cast(input.values(), field.data_type(), values.as_deref())?;
+                Ok(Arc::new(FixedSizeListArray::try_new_with_length(
+                    Arc::clone(field),
+                    *size,
+                    values,
+                    input.nulls().cloned(),
+                    input.len(),
+                )?))
+            }
+            Self::Map {
+                field,
+                ordered,
+                entries,
+            } => {
+                let Some(input) = input.as_any().downcast_ref::<MapArray>() else {
+                    return internal_err!("Iceberg nested projection expected a map array");
+                };
+                let input_entries: ArrayRef = Arc::new(input.entries().clone());
+                let projected =
+                    project_or_cast(&input_entries, field.data_type(), entries.as_deref())?;
+                let Some(projected) = projected.as_any().downcast_ref::<StructArray>() else {
+                    return internal_err!("Iceberg map entries must be a struct array");
+                };
+                Ok(Arc::new(MapArray::try_new(
+                    Arc::clone(field),
+                    input.offsets().clone(),
+                    projected.clone(),
+                    input.nulls().cloned(),
+                    *ordered,
+                )?))
+            }
+        }
+    }
+}
+
+fn verify_container_child_id(source: &FieldRef, target: &FieldRef) -> Result<()> {
+    if let (Some(source_id), Some(target_id)) = (field_id(source), field_id(target)) {
+        if source_id != target_id {
+            return exec_err!(
+                "Iceberg container child '{}' changed field ID from {source_id} to {target_id}",
+                target.name()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn project_or_cast(
+    source: &ArrayRef,
+    target: &DataType,
+    projection: Option<&NestedProjection>,
+) -> Result<ArrayRef> {
+    if let Some(projection) = projection {
+        projection.apply(source)
+    } else if source.data_type() == target {
+        Ok(Arc::clone(source))
+    } else {
+        Ok(cast(source.as_ref(), target)?)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct StructProjection {
+    target_fields: Fields,
+    children: Vec<StructChildProjection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct StructChildProjection {
+    source_index: Option<usize>,
+    target: FieldRef,
+    nested: Option<Box<NestedProjection>>,
+}
+
+impl StructProjection {
+    fn new(source: &Fields, target: &Fields) -> Result<Self> {
+        let source_has_ids = source.iter().any(|field| field_id(field).is_some());
+        let children = target
+            .iter()
+            .map(|target_field| {
+                let source_index = match (source_has_ids, field_id(target_field)) {
+                    (true, Some(id)) => source.iter().position(|field| field_id(field) == Some(id)),
+                    _ => source
+                        .iter()
+                        .position(|field| field.name() == target_field.name()),
+                };
+                if source_index.is_none() && !target_field.is_nullable() {
+                    return exec_err!(
+                        "Required Iceberg struct field '{}' is absent from the data file",
+                        target_field.name()
+                    );
+                }
+                let nested = source_index
+                    .map(|index| {
+                        NestedProjection::new(source[index].data_type(), target_field.data_type())
+                    })
+                    .transpose()?
+                    .flatten()
+                    .map(Box::new);
+                Ok(StructChildProjection {
+                    source_index,
+                    target: Arc::clone(target_field),
+                    nested,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            target_fields: target.clone(),
+            children,
+        })
+    }
+
+    fn apply(&self, input: &ArrayRef) -> Result<ArrayRef> {
+        let Some(input) = input.as_any().downcast_ref::<StructArray>() else {
+            return internal_err!("Iceberg nested field projection expected a struct array");
+        };
+        let columns = self
+            .children
+            .iter()
+            .map(|child| {
+                let Some(index) = child.source_index else {
+                    return Ok(new_null_array(child.target.data_type(), input.len()));
+                };
+                let source = input.column(index);
+                project_or_cast(source, child.target.data_type(), child.nested.as_deref())
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Arc::new(StructArray::try_new(
+            self.target_fields.clone(),
+            columns,
+            input.nulls().cloned(),
+        )?))
     }
 }
 
@@ -699,6 +1028,250 @@ mod tests {
             return internal_err!("renamed field unexpectedly evaluated to a scalar");
         };
         assert!(Arc::ptr_eq(&output, &names));
+        Ok(())
+    }
+
+    #[test]
+    fn reused_iceberg_column_name_does_not_read_old_field_id() -> Result<()> {
+        let field_id = |id: i32| [(PARQUET_FIELD_ID_META_KEY.to_owned(), id.to_string())].into();
+        let logical_schema = Arc::new(Schema::new(vec![
+            Field::new("x", DataType::Int64, true).with_metadata(field_id(2))
+        ]));
+        let physical_schema = Arc::new(Schema::new(vec![
+            Field::new("x", DataType::Int64, true).with_metadata(field_id(1))
+        ]));
+        let adapter = IcebergPhysicalExprAdapterFactory
+            .create(logical_schema, Arc::clone(&physical_schema))?;
+        let expr = adapter.rewrite(Arc::new(Column::new("x", 0)))?;
+        let batch = RecordBatch::try_new(
+            physical_schema,
+            vec![Arc::new(Int64Array::from(vec![Some(7), Some(8)]))],
+        )?;
+        let result = expr.evaluate(&batch)?.into_array(batch.num_rows())?;
+        assert_eq!(result.null_count(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn maps_renamed_nested_iceberg_field_by_id() -> Result<()> {
+        use datafusion::arrow::array::Int32Array;
+
+        let field_id = |id: i32| [(PARQUET_FIELD_ID_META_KEY.to_owned(), id.to_string())].into();
+        let physical_nested =
+            Field::new("old_name", DataType::Int32, false).with_metadata(field_id(3));
+        let physical_other =
+            Field::new("old_other", DataType::Int32, false).with_metadata(field_id(4));
+        let logical_nested =
+            Field::new("new_name", DataType::Int32, false).with_metadata(field_id(3));
+        let logical_other =
+            Field::new("new_other", DataType::Int32, false).with_metadata(field_id(4));
+        let logical_added = Field::new("added", DataType::Int32, true).with_metadata(field_id(5));
+        let physical_fields = Fields::from(vec![physical_nested, physical_other]);
+        let physical = StructArray::try_new(
+            physical_fields.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(Int32Array::from(vec![10, 20])),
+            ],
+            None,
+        )?;
+        let physical_schema = Arc::new(Schema::new(vec![Field::new(
+            "obj",
+            DataType::Struct(physical_fields),
+            false,
+        )
+        .with_metadata(field_id(2))]));
+        let logical_schema = Arc::new(Schema::new(vec![Field::new(
+            "obj",
+            DataType::Struct(Fields::from(vec![
+                logical_other,
+                logical_nested,
+                logical_added,
+            ])),
+            false,
+        )
+        .with_metadata(field_id(2))]));
+        let batch = RecordBatch::try_new(Arc::clone(&physical_schema), vec![Arc::new(physical)])?;
+        let adapter = IcebergPhysicalExprAdapterFactory
+            .create(Arc::clone(&logical_schema), Arc::clone(&physical_schema))?;
+        let expr = adapter.rewrite(Arc::new(Column::new("obj", 0)))?;
+        let ColumnarValue::Array(output) = expr.evaluate(&batch)? else {
+            return internal_err!("nested field unexpectedly evaluated to a scalar");
+        };
+        let output = output
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("struct output");
+        assert_eq!(output.data_type(), logical_schema.field(0).data_type());
+        let other = output
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("Int32 child");
+        assert_eq!(other.values().as_ref(), &[10, 20]);
+        let values = output
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("Int32 child");
+        assert_eq!(values.values().as_ref(), &[1, 2]);
+        assert_eq!(output.column(2).null_count(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn maps_nested_iceberg_fields_inside_list_and_map_by_id() -> Result<()> {
+        use datafusion::arrow::array::Int32Array;
+        use datafusion::arrow::buffer::OffsetBuffer;
+
+        let field_id = |id: i32| [(PARQUET_FIELD_ID_META_KEY.to_owned(), id.to_string())].into();
+        let old_list_fields = Fields::from(vec![
+            Field::new("old", DataType::Int32, false).with_metadata(field_id(4)),
+            Field::new("other", DataType::Int32, false).with_metadata(field_id(9)),
+        ]);
+        let new_list_fields = Fields::from(vec![
+            Field::new("other_new", DataType::Int32, false).with_metadata(field_id(9)),
+            Field::new("new", DataType::Int32, false).with_metadata(field_id(4)),
+        ]);
+        let list_values = StructArray::try_new(
+            old_list_fields.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(Int32Array::from(vec![11, 22])),
+            ],
+            None,
+        )?;
+        let old_element = Arc::new(
+            Field::new("element", DataType::Struct(old_list_fields), false)
+                .with_metadata(field_id(3)),
+        );
+        let new_element = Arc::new(
+            Field::new("element", DataType::Struct(new_list_fields), false)
+                .with_metadata(field_id(3)),
+        );
+        let list = ListArray::try_new(
+            Arc::clone(&old_element),
+            OffsetBuffer::from_lengths([2]),
+            Arc::new(list_values),
+            None,
+        )?;
+
+        let old_value_fields = Fields::from(vec![
+            Field::new("old", DataType::Int32, false).with_metadata(field_id(8)),
+            Field::new("other", DataType::Int32, false).with_metadata(field_id(10)),
+        ]);
+        let new_value_fields = Fields::from(vec![
+            Field::new("other_new", DataType::Int32, false).with_metadata(field_id(10)),
+            Field::new("new", DataType::Int32, false).with_metadata(field_id(8)),
+        ]);
+        let map_values = StructArray::try_new(
+            old_value_fields.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![9])),
+                Arc::new(Int32Array::from(vec![19])),
+            ],
+            None,
+        )?;
+        let old_entries_fields = Fields::from(vec![
+            Field::new("key", DataType::Utf8, false).with_metadata(field_id(6)),
+            Field::new("value", DataType::Struct(old_value_fields), false)
+                .with_metadata(field_id(7)),
+        ]);
+        let new_entries_fields = Fields::from(vec![
+            Field::new("key", DataType::Utf8, false).with_metadata(field_id(6)),
+            Field::new("value", DataType::Struct(new_value_fields), false)
+                .with_metadata(field_id(7)),
+        ]);
+        let entries = StructArray::try_new(
+            old_entries_fields.clone(),
+            vec![Arc::new(StringArray::from(vec!["k"])), Arc::new(map_values)],
+            None,
+        )?;
+        let old_entries = Arc::new(Field::new(
+            "entries",
+            DataType::Struct(old_entries_fields),
+            false,
+        ));
+        let new_entries = Arc::new(Field::new(
+            "entries",
+            DataType::Struct(new_entries_fields),
+            false,
+        ));
+        let map = MapArray::try_new(
+            Arc::clone(&old_entries),
+            OffsetBuffer::from_lengths([1]),
+            entries,
+            None,
+            false,
+        )?;
+
+        let physical_schema = Arc::new(Schema::new(vec![
+            Field::new("items", DataType::List(old_element), false).with_metadata(field_id(2)),
+            Field::new("attrs", DataType::Map(old_entries, false), false)
+                .with_metadata(field_id(5)),
+        ]));
+        let logical_schema = Arc::new(Schema::new(vec![
+            Field::new("items", DataType::List(new_element), false).with_metadata(field_id(2)),
+            Field::new("attrs", DataType::Map(new_entries, false), false)
+                .with_metadata(field_id(5)),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&physical_schema),
+            vec![Arc::new(list), Arc::new(map)],
+        )?;
+        let adapter = IcebergPhysicalExprAdapterFactory
+            .create(Arc::clone(&logical_schema), physical_schema)?;
+
+        let list_expr = adapter.rewrite(Arc::new(Column::new("items", 0)))?;
+        let ColumnarValue::Array(list_output) = list_expr.evaluate(&batch)? else {
+            return internal_err!("list unexpectedly evaluated to a scalar");
+        };
+        let list_output = list_output.as_any().downcast_ref::<ListArray>().unwrap();
+        assert_eq!(list_output.data_type(), logical_schema.field(0).data_type());
+        let list_values = list_output
+            .values()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert_eq!(list_values.column_names(), vec!["other_new", "new"]);
+        let values = list_values
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(values.values().as_ref(), &[11, 22]);
+        let values = list_values
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(values.values().as_ref(), &[1, 2]);
+
+        let map_expr = adapter.rewrite(Arc::new(Column::new("attrs", 1)))?;
+        let ColumnarValue::Array(map_output) = map_expr.evaluate(&batch)? else {
+            return internal_err!("map unexpectedly evaluated to a scalar");
+        };
+        let map_output = map_output.as_any().downcast_ref::<MapArray>().unwrap();
+        assert_eq!(map_output.data_type(), logical_schema.field(1).data_type());
+        let map_values = map_output
+            .entries()
+            .column(1)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert_eq!(map_values.column_names(), vec!["other_new", "new"]);
+        let values = map_values
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(values.values().as_ref(), &[19]);
+        let values = map_values
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(values.values().as_ref(), &[9]);
         Ok(())
     }
 }

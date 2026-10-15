@@ -103,6 +103,8 @@ pub enum Operation {
         files_to_overwrite: HashMap<String, Vec<String>>,
         additional_summary: Option<HashMap<String, String>>,
     }, // /// Remove or replace rows in existing data files
+    /// Commit an empty snapshot without reading or rewriting existing manifests.
+    Truncate { branch: Option<String> },
     // NewRowDelta,
     // /// Delete files in the table and commit
     // NewDelete,
@@ -140,6 +142,73 @@ impl Operation {
         }
 
         match self {
+            Operation::Truncate { branch } => {
+                let old_snapshot = table_metadata.current_snapshot(branch.as_deref())?;
+                let snapshot_id = generate_snapshot_id();
+                let location = new_manifest_list_location(
+                    &table_metadata.location,
+                    snapshot_id,
+                    0,
+                    &uuid::Uuid::new_v4().to_string(),
+                );
+                let schema = match table_metadata.format_version {
+                    FormatVersion::V1 => manifest_list_schema_v1(),
+                    FormatVersion::V2 => manifest_list_schema_v2(),
+                    FormatVersion::V3 => manifest_list_schema_v3(),
+                };
+                let bytes = apache_avro::Writer::new(schema, Vec::new()).into_inner()?;
+                object_store
+                    .put(&strip_prefix(&location).into(), bytes.into())
+                    .await?;
+
+                let mut summary = update_snapshot_summary(
+                    None,
+                    std::iter::empty::<&DataFile>(),
+                    std::iter::empty::<&DataFile>(),
+                );
+                summary.insert(
+                    "iceberg-rust.metadata-only-truncate".to_owned(),
+                    "true".to_owned(),
+                );
+                let mut builder = SnapshotBuilder::default();
+                builder
+                    .with_snapshot_id(snapshot_id)
+                    .with_sequence_number(table_metadata.last_sequence_number + 1)
+                    .with_schema_id(*table_metadata.current_schema()?.schema_id())
+                    .with_manifest_list(location)
+                    .with_summary(Summary {
+                        operation: SnapshotOperation::Overwrite,
+                        other: summary,
+                    });
+                if let Some(snapshot) = old_snapshot {
+                    builder.with_parent_snapshot_id(*snapshot.snapshot_id());
+                }
+                if table_metadata.format_version == FormatVersion::V3 {
+                    apply_v3_row_lineage(
+                        &mut builder,
+                        table_metadata,
+                        Some(table_metadata.next_row_id),
+                    )?;
+                }
+                let snapshot = builder.build()?;
+                let ref_name = branch.unwrap_or_else(|| "main".to_owned());
+                Ok((
+                    Some(TableRequirement::AssertRefSnapshotId {
+                        r#ref: ref_name.clone(),
+                        snapshot_id: old_snapshot.map(|snapshot| *snapshot.snapshot_id()),
+                    }),
+                    vec![
+                        TableUpdate::AddSnapshot { snapshot },
+                        TableUpdate::SetSnapshotRef {
+                            ref_name,
+                            snapshot_reference: SnapshotReference {
+                                snapshot_id,
+                                retention: SnapshotRetention::default(),
+                            },
+                        },
+                    ],
+                ))
+            }
             Operation::AppendSequenceGroups {
                 branch,
                 sequence_groups,
@@ -1427,6 +1496,151 @@ mod tests {
             .with_upper_bounds(None)
             .build()
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn truncate_creates_snapshot_for_new_table() {
+        let mut metadata = sample_metadata(&[], None, &[]);
+        metadata.format_version = FormatVersion::V3;
+        let store = Arc::new(InMemory::new());
+        let (requirement, updates) = Operation::Truncate { branch: None }
+            .execute(&metadata, store.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            requirement,
+            Some(TableRequirement::AssertRefSnapshotId {
+                r#ref: "main".to_owned(),
+                snapshot_id: None,
+            })
+        );
+        crate::catalog::commit::apply_table_updates(&mut metadata, updates).unwrap();
+        let snapshot = metadata.current_snapshot(None).unwrap().unwrap();
+        assert_eq!(*snapshot.parent_snapshot_id(), None);
+        assert_eq!(*snapshot.first_row_id(), Some(0));
+        assert_eq!(*snapshot.added_rows(), Some(0));
+        let bytes = store
+            .get(&strip_prefix(snapshot.manifest_list()).into())
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(
+            ManifestListReader::new(&bytes[..], &metadata)
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn truncate_writes_empty_manifest_list_for_v1_and_v2() {
+        for version in [FormatVersion::V1, FormatVersion::V2] {
+            let mut metadata = sample_metadata(&[(101, 1)], Some(101), &[("main", 101)]);
+            metadata.format_version = version;
+            let store = Arc::new(InMemory::new());
+            let (_, updates) = Operation::Truncate { branch: None }
+                .execute(&metadata, store.clone())
+                .await
+                .unwrap();
+            crate::catalog::commit::apply_table_updates(&mut metadata, updates).unwrap();
+            let snapshot = metadata.current_snapshot(None).unwrap().unwrap();
+            assert_eq!(*snapshot.parent_snapshot_id(), Some(101));
+            assert_eq!(*snapshot.first_row_id(), None);
+            let bytes = store
+                .get(&strip_prefix(snapshot.manifest_list()).into())
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap();
+            assert_eq!(
+                ManifestListReader::new(&bytes[..], &metadata)
+                    .unwrap()
+                    .count(),
+                0
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn truncate_preserves_v3_lineage_without_reading_old_manifests() {
+        let mut metadata = sample_metadata(&[(101, 1)], Some(101), &[("main", 101)]);
+        metadata.format_version = FormatVersion::V3;
+        metadata.next_row_id = 44;
+        let store = Arc::new(InMemory::new());
+        // The old snapshot's manifest list is deliberately absent from the store.
+        let (requirement, updates) = Operation::Truncate { branch: None }
+            .execute(&metadata, store.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            requirement,
+            Some(TableRequirement::AssertRefSnapshotId {
+                r#ref: "main".to_owned(),
+                snapshot_id: Some(101),
+            })
+        );
+        crate::catalog::commit::apply_table_updates(&mut metadata, updates).unwrap();
+        let snapshot = metadata.current_snapshot(None).unwrap().unwrap();
+        assert_eq!(*snapshot.parent_snapshot_id(), Some(101));
+        assert_eq!(*snapshot.first_row_id(), Some(44));
+        assert_eq!(*snapshot.added_rows(), Some(0));
+        assert_eq!(metadata.next_row_id, 44);
+        assert_eq!(snapshot.summary().operation, SnapshotOperation::Overwrite);
+        let bytes = store
+            .get(&strip_prefix(snapshot.manifest_list()).into())
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(
+            ManifestListReader::new(&bytes[..], &metadata)
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_truncate_rejects_snapshot_added_on_new_branch() {
+        let base = sample_metadata(&[(101, 1)], Some(101), &[("main", 101)]);
+        let store = Arc::new(InMemory::new());
+        let (requirement, updates) = Operation::Truncate { branch: None }
+            .execute(&base, store)
+            .await
+            .unwrap();
+
+        let mut current = base.clone();
+        let audit = SnapshotBuilder::default()
+            .with_snapshot_id(202)
+            .with_sequence_number(2)
+            .with_manifest_list("audit-manifest.avro".to_owned())
+            .with_summary(Summary {
+                operation: SnapshotOperation::Append,
+                other: HashMap::new(),
+            })
+            .build()
+            .unwrap();
+        current.snapshots.insert(202, audit);
+        current.refs.insert(
+            "audit".to_owned(),
+            SnapshotReference {
+                snapshot_id: 202,
+                retention: SnapshotRetention::default(),
+            },
+        );
+        current.last_sequence_number = 2;
+        assert!(crate::catalog::commit::check_table_requirements(
+            std::slice::from_ref(&requirement.unwrap()),
+            &current,
+        ));
+        assert!(matches!(
+            crate::catalog::commit::apply_table_updates(&mut current, updates),
+            Err(Error::CommitConflict(_))
+        ));
     }
 
     fn partitioned_data_file(path: &str, partition_value: Value) -> DataFile {
