@@ -3295,6 +3295,36 @@ mod tests {
             None,
             Some(changes_config),
         ));
+        fn planned_data_file_count(plan: &dyn ExecutionPlan) -> usize {
+            let current = plan
+                .downcast_ref::<DataSourceExec>()
+                .and_then(|exec| exec.data_source().downcast_ref::<FileScanConfig>())
+                .map(|config| {
+                    config
+                        .file_groups
+                        .iter()
+                        .map(|group| group.files().len())
+                        .sum::<usize>()
+                })
+                .unwrap_or_default();
+            current
+                + plan
+                    .children()
+                    .iter()
+                    .map(|child| planned_data_file_count(child.as_ref()))
+                    .sum::<usize>()
+        }
+        let full_plan = writable
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("plan full v3 scan");
+        let changes_plan = changes
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("plan changed-file scan");
+        assert_eq!(planned_data_file_count(full_plan.as_ref()), 3);
+        assert_eq!(planned_data_file_count(changes_plan.as_ref()), 2);
+
         ctx.deregister_table("lineage_numbers")
             .expect("deregister writable table");
         ctx.register_table("lineage_numbers", changes)
