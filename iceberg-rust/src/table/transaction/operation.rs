@@ -1604,6 +1604,45 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn stale_truncate_rejects_snapshot_added_on_new_branch() {
+        let base = sample_metadata(&[(101, 1)], Some(101), &[("main", 101)]);
+        let store = Arc::new(InMemory::new());
+        let (requirement, updates) = Operation::Truncate { branch: None }
+            .execute(&base, store)
+            .await
+            .unwrap();
+
+        let mut current = base.clone();
+        let audit = SnapshotBuilder::default()
+            .with_snapshot_id(202)
+            .with_sequence_number(2)
+            .with_manifest_list("audit-manifest.avro".to_owned())
+            .with_summary(Summary {
+                operation: SnapshotOperation::Append,
+                other: HashMap::new(),
+            })
+            .build()
+            .unwrap();
+        current.snapshots.insert(202, audit);
+        current.refs.insert(
+            "audit".to_owned(),
+            SnapshotReference {
+                snapshot_id: 202,
+                retention: SnapshotRetention::default(),
+            },
+        );
+        current.last_sequence_number = 2;
+        assert!(crate::catalog::commit::check_table_requirements(
+            std::slice::from_ref(&requirement.unwrap()),
+            &current,
+        ));
+        assert!(matches!(
+            crate::catalog::commit::apply_table_updates(&mut current, updates),
+            Err(Error::CommitConflict(_))
+        ));
+    }
+
     fn partitioned_data_file(path: &str, partition_value: Value) -> DataFile {
         partitioned_data_file_with_value(path, Some(partition_value))
     }
