@@ -18,7 +18,7 @@ use iceberg_rust_spec::{
     },
     schema::Schema,
     snapshot::Snapshot,
-    table_metadata::{FormatVersion, TableMetadata},
+    table_metadata::{partition_fields as bound_partition_fields, FormatVersion, TableMetadata},
     types::Type,
     util::strip_prefix,
 };
@@ -1332,12 +1332,13 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
                 if let Some(filter) = filter {
                     let (manifest_writer, filtered_stats) =
                         ManifestWriter::from_existing_with_filter(
-                            manifest_bytes.as_ref(),
+                            ManifestReader::new(manifest_bytes.as_ref())?,
                             manifest,
                             &filter,
                             snapshot_id,
                             &manifest_schema,
                             self.table_metadata,
+                            None,
                         )?;
                     (manifest_writer, Some(filtered_stats))
                 } else {
@@ -1799,15 +1800,36 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
                     .bytes()
                     .await?;
 
+                let manifest_reader = ManifestReader::new(bytes.as_ref())?;
+                let source_metadata = (manifest.partition_spec_id
+                    != table_metadata.default_spec_id)
+                    .then(|| manifest_reader.metadata());
+                let old_spec_schema = source_metadata
+                    .as_ref()
+                    .map(|metadata| {
+                        let (source_schema, source_spec, _) = metadata.as_ref();
+                        let fields = bound_partition_fields(source_spec, source_schema)?;
+                        Ok::<_, Error>(ManifestEntry::schema(
+                            &partition_value_schema(&fields)?,
+                            &table_metadata.format_version,
+                        )?)
+                    })
+                    .transpose()?;
+                let schema = old_spec_schema.as_ref().unwrap_or(manifest_schema.as_ref());
+                let rewrite_metadata = source_metadata.as_ref().map(|metadata| {
+                    let (schema, spec, _) = metadata.as_ref();
+                    (schema, spec)
+                });
                 manifest.manifest_path = manifest_location;
 
                 let (manifest_writer, filtered_stats) = ManifestWriter::from_existing_with_filter(
-                    &bytes,
+                    manifest_reader,
                     manifest,
                     &data_files_to_filter,
                     snapshot_id,
-                    &manifest_schema,
+                    schema,
                     table_metadata,
+                    rewrite_metadata,
                 )?;
 
                 let new_manifest = manifest_writer.finish(object_store.clone()).await?;
@@ -1827,6 +1849,7 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
 
             if manifest.added_files_count.unwrap_or(0) > 0
                 || manifest.existing_files_count.unwrap_or(0) > 0
+                || manifest.deleted_files_count.unwrap_or(0) > 0
             {
                 self.append_new_manifest(manifest)?;
             }

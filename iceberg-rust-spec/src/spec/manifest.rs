@@ -74,6 +74,11 @@ impl ManifestEntry {
         &mut self.status
     }
 
+    /// Returns a mutable reference to the encoding version used when serializing this entry.
+    pub fn format_version_mut(&mut self) -> &mut FormatVersion {
+        &mut self.format_version
+    }
+
     /// Returns a mutable reference to the sequence number field of this manifest entry.
     ///
     /// The sequence number tracks the order of changes to a table. Modifying this allows
