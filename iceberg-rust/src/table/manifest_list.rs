@@ -19,6 +19,7 @@ use iceberg_rust_spec::{
     schema::Schema,
     snapshot::Snapshot,
     table_metadata::{FormatVersion, TableMetadata},
+    types::Type,
     util::strip_prefix,
 };
 
@@ -63,6 +64,55 @@ pub(crate) struct ManifestListReader<'a, 'metadata, R: Read> {
     reader: AvroReader<'a, R>,
     decoder: ManifestListEntryDecoder<'metadata>,
     writer_format_version: FormatVersion,
+}
+
+pub(crate) struct ManifestRewriteCompatibility {
+    current_spec_id: i32,
+    compatible_schema_ids: HashMap<i32, bool>,
+    partition_types: Vec<Type>,
+}
+
+impl ManifestRewriteCompatibility {
+    pub(crate) fn new(metadata: &TableMetadata) -> Result<Self, Error> {
+        let spec = metadata.default_partition_spec()?;
+        let partition_types = spec.data_types(metadata.current_schema()?.fields())?;
+        Ok(Self {
+            current_spec_id: metadata.default_spec_id,
+            compatible_schema_ids: HashMap::new(),
+            partition_types,
+        })
+    }
+
+    pub(crate) fn allows(
+        &mut self,
+        manifest: &ManifestListEntry,
+        metadata: &TableMetadata,
+    ) -> bool {
+        if manifest.partition_spec_id != self.current_spec_id {
+            return false;
+        }
+        if let Some(schema_id) = metadata
+            .snapshots
+            .get(&manifest.added_snapshot_id)
+            .and_then(|snapshot| *snapshot.schema_id())
+        {
+            if let Some(schema) = metadata.schemas.get(&schema_id) {
+                if let Some(compatible) = self.compatible_schema_ids.get(&schema_id) {
+                    return *compatible;
+                }
+                let compatible = metadata
+                    .partition_specs
+                    .get(&self.current_spec_id)
+                    .and_then(|spec| spec.data_types(schema.fields()).ok())
+                    .is_some_and(|types| types == self.partition_types);
+                self.compatible_schema_ids.insert(schema_id, compatible);
+                return compatible;
+            }
+        }
+
+        // Width inference can make old partition values look current after snapshot expiry.
+        false
+    }
 }
 
 impl<R: Read> Iterator for ManifestListReader<'_, '_, R> {
@@ -827,13 +877,14 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
                 &mut writer,
                 None,
                 &bounding_partition_values,
+                table_metadata,
             )?
         };
 
         Ok(Self {
             table_metadata,
             writer,
-            selected_data_manifest: Some(data_manifest),
+            selected_data_manifest: data_manifest,
             selected_delete_manifest: delete_manifest,
             bounding_partition_values,
             n_existing_files: file_count_all_entries,
@@ -971,6 +1022,7 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
                 row_id_assigner.as_mut(),
                 &bounding_partition_values,
                 manifests_to_overwrite,
+                table_metadata,
             )?
         };
 
@@ -978,7 +1030,7 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
             Self {
                 table_metadata,
                 writer,
-                selected_data_manifest: Some(manifest),
+                selected_data_manifest: manifest,
                 selected_delete_manifest: None,
                 bounding_partition_values,
                 n_existing_files: file_count_all_entries,
@@ -1804,14 +1856,17 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
 mod tests {
     use super::*;
     use iceberg_rust_spec::{
-        manifest_list::{manifest_list_schema_v1, manifest_list_schema_v3, FieldSummary},
+        manifest::FileFormat,
+        manifest_list::{
+            manifest_list_schema_v1, manifest_list_schema_v2, manifest_list_schema_v3, FieldSummary,
+        },
         spec::{
             partition::{PartitionField, PartitionSpec, Transform},
             schema::SchemaBuilder,
             snapshot::{SnapshotBuilder, Summary},
             table_metadata::TableMetadataBuilder,
             types::{PrimitiveType, StructField, Type},
-            values::Value,
+            values::{Struct, Value},
         },
     };
 
@@ -2076,6 +2131,191 @@ mod tests {
                 assert_eq!(bounds.contains_null, vec![false]);
             }
         }
+    }
+
+    #[test]
+    fn v2_writes_after_partition_promotion_keep_old_manifests() {
+        let schema = |schema_id, primitive_type| {
+            SchemaBuilder::default()
+                .with_schema_id(schema_id)
+                .with_struct_field(StructField {
+                    id: 1,
+                    name: "partition_source".to_string(),
+                    required: true,
+                    field_type: Type::Primitive(primitive_type),
+                    doc: None,
+                    initial_default: None,
+                    write_default: None,
+                })
+                .build()
+                .unwrap()
+        };
+        let snapshot = |snapshot_id, schema_id| {
+            SnapshotBuilder::default()
+                .with_snapshot_id(snapshot_id)
+                .with_sequence_number(snapshot_id)
+                .with_timestamp_ms(snapshot_id)
+                .with_manifest_list(format!("snapshot-{snapshot_id}.avro"))
+                .with_summary(Summary::default())
+                .with_schema_id(schema_id)
+                .build()
+                .unwrap()
+        };
+        let metadata = TableMetadataBuilder::default()
+            .format_version(FormatVersion::V2)
+            .location("s3://tests/table".to_string())
+            .current_schema_id(2)
+            .schemas(HashMap::from([
+                (1, schema(1, PrimitiveType::Int)),
+                (2, schema(2, PrimitiveType::Long)),
+            ]))
+            .default_spec_id(0)
+            .partition_specs(HashMap::from([(
+                0,
+                PartitionSpec::builder()
+                    .with_spec_id(0)
+                    .with_partition_field(PartitionField::new(
+                        1,
+                        1000,
+                        "partition_source",
+                        Transform::Identity,
+                    ))
+                    .build()
+                    .unwrap(),
+            )]))
+            .snapshots(HashMap::from([(7, snapshot(7, 1)), (8, snapshot(8, 2))]))
+            .build()
+            .unwrap();
+        let old_entry = ManifestListEntry {
+            format_version: FormatVersion::V2,
+            manifest_path: "old-manifest.avro".to_string(),
+            manifest_length: 1,
+            partition_spec_id: 0,
+            content: Content::Data,
+            sequence_number: 1,
+            min_sequence_number: 1,
+            added_snapshot_id: 7,
+            added_files_count: Some(1),
+            existing_files_count: Some(0),
+            deleted_files_count: Some(0),
+            added_rows_count: Some(1),
+            existing_rows_count: Some(0),
+            deleted_rows_count: Some(0),
+            partitions: Some(vec![FieldSummary {
+                contains_null: false,
+                contains_nan: None,
+                lower_bound: Some(Value::Int(42)),
+                upper_bound: Some(Value::Int(42)),
+            }]),
+            key_metadata: None,
+            first_row_id: None,
+        };
+        let new_file = DataFile::builder()
+            .with_content(iceberg_rust_spec::manifest::Content::Data)
+            .with_file_path("new-file.parquet".to_string())
+            .with_file_format(FileFormat::Parquet)
+            .with_partition(Struct::from_iter([(
+                "partition_source".to_string(),
+                Some(Value::LongInt(-100)),
+            )]))
+            .with_record_count(1)
+            .with_file_size_in_bytes(100)
+            .with_column_sizes(None)
+            .with_value_counts(None)
+            .with_null_value_counts(None)
+            .with_nan_value_counts(None)
+            .with_distinct_counts(None)
+            .with_lower_bounds(None)
+            .with_upper_bounds(None)
+            .build()
+            .unwrap();
+        let mut current_entry = old_entry.clone();
+        current_entry.manifest_path = "current-manifest.avro".to_string();
+        current_entry.added_snapshot_id = 8;
+        current_entry.partitions = Some(vec![FieldSummary {
+            contains_null: false,
+            contains_nan: None,
+            lower_bound: Some(Value::LongInt(10)),
+            upper_bound: Some(Value::LongInt(10)),
+        }]);
+        let mut compatibility = ManifestRewriteCompatibility::new(&metadata).unwrap();
+        let mut missing_snapshot = current_entry.clone();
+        missing_snapshot.added_snapshot_id = 999;
+        assert!(!compatibility.allows(&missing_snapshot, &metadata));
+        missing_snapshot.partitions = None;
+        assert!(!compatibility.allows(&missing_snapshot, &metadata));
+        let mut old_missing_snapshot = old_entry.clone();
+        old_missing_snapshot.added_snapshot_id = 999;
+        assert!(!compatibility.allows(&old_missing_snapshot, &metadata));
+
+        for entries in [
+            vec![old_entry.clone()],
+            vec![old_entry.clone(), current_entry.clone()],
+        ] {
+            let mut avro = AvroWriter::new(manifest_list_schema_v2(), Vec::new());
+            for entry in &entries {
+                avro.append_ser(entry).unwrap();
+            }
+            let bytes = avro.into_inner().unwrap();
+            let selected_path =
+                (entries.len() == 2).then_some(current_entry.manifest_path.as_str());
+
+            let append = ManifestListWriter::from_existing(
+                &bytes,
+                std::iter::once(&new_file),
+                manifest_list_schema_v2(),
+                &metadata,
+            )
+            .unwrap();
+            assert_eq!(
+                append
+                    .selected_data_manifest()
+                    .map(|entry| entry.manifest_path.as_str()),
+                selected_path
+            );
+            let copied_bytes = append.writer.into_inner().unwrap();
+            let copied = ManifestListReader::new(copied_bytes.as_slice(), &metadata)
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(copied, vec![old_entry.clone()]);
+
+            let (overwrite, affected) = ManifestListWriter::from_existing_without_overwrites(
+                &bytes,
+                std::iter::once(&new_file),
+                &HashSet::from([old_entry.manifest_path.clone()]),
+                manifest_list_schema_v2(),
+                &metadata,
+            )
+            .unwrap();
+            assert_eq!(
+                overwrite
+                    .selected_data_manifest()
+                    .map(|entry| entry.manifest_path.as_str()),
+                selected_path
+            );
+            assert_eq!(affected, vec![old_entry.clone()]);
+        }
+
+        let mut expired_metadata = metadata.clone();
+        expired_metadata.snapshots.remove(&7);
+        let mut avro = AvroWriter::new(manifest_list_schema_v2(), Vec::new());
+        avro.append_ser(&old_entry).unwrap();
+        let bytes = avro.into_inner().unwrap();
+        let copied = ManifestListWriter::from_existing(
+            &bytes,
+            std::iter::once(&new_file),
+            manifest_list_schema_v2(),
+            &expired_metadata,
+        )
+        .unwrap();
+        assert!(copied.selected_data_manifest().is_none());
+        let copied_bytes = copied.writer.into_inner().unwrap();
+        let copied_entries = ManifestListReader::new(copied_bytes.as_slice(), &expired_metadata)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(copied_entries, vec![old_entry]);
     }
 
     fn manifest(

@@ -394,12 +394,13 @@ impl ManifestListEntry {
         schema: &Schema,
     ) -> Result<ManifestListEntry, Error> {
         let types = partition_field_types(table_metadata, entry.partition_spec_id, schema)?;
-        Self::try_from_v3_with_types(entry, &types)
+        Self::try_from_v3_with_types(entry, &types, true)
     }
 
     fn try_from_v3_with_types(
         entry: _serde::ManifestListEntryV3,
         types: &[Option<Type>],
+        promote: bool,
     ) -> Result<ManifestListEntry, Error> {
         Ok(ManifestListEntry {
             format_version: FormatVersion::V3,
@@ -416,7 +417,7 @@ impl ManifestListEntry {
             added_rows_count: Some(entry.added_rows_count),
             existing_rows_count: Some(entry.existing_rows_count),
             deleted_rows_count: Some(entry.deleted_rows_count),
-            partitions: decode_partition_summaries(entry.partitions, types)?,
+            partitions: decode_partition_summaries(entry.partitions, types, promote)?,
             key_metadata: entry.key_metadata,
             first_row_id: entry.first_row_id,
         })
@@ -440,12 +441,13 @@ impl ManifestListEntry {
         schema: &Schema,
     ) -> Result<ManifestListEntry, Error> {
         let types = partition_field_types(table_metadata, entry.partition_spec_id, schema)?;
-        Self::try_from_v2_with_types(entry, &types)
+        Self::try_from_v2_with_types(entry, &types, true)
     }
 
     fn try_from_v2_with_types(
         entry: _serde::ManifestListEntryV2,
         types: &[Option<Type>],
+        promote: bool,
     ) -> Result<ManifestListEntry, Error> {
         Ok(ManifestListEntry {
             format_version: FormatVersion::V2,
@@ -462,7 +464,7 @@ impl ManifestListEntry {
             added_rows_count: Some(entry.added_rows_count),
             existing_rows_count: Some(entry.existing_rows_count),
             deleted_rows_count: Some(entry.deleted_rows_count),
-            partitions: decode_partition_summaries(entry.partitions, types)?,
+            partitions: decode_partition_summaries(entry.partitions, types, promote)?,
             key_metadata: entry.key_metadata,
             first_row_id: None,
         })
@@ -486,12 +488,13 @@ impl ManifestListEntry {
         schema: &Schema,
     ) -> Result<ManifestListEntry, Error> {
         let types = partition_field_types(table_metadata, entry.partition_spec_id, schema)?;
-        Self::try_from_v1_with_types(entry, &types)
+        Self::try_from_v1_with_types(entry, &types, true)
     }
 
     fn try_from_v1_with_types(
         entry: _serde::ManifestListEntryV1,
         types: &[Option<Type>],
+        promote: bool,
     ) -> Result<ManifestListEntry, Error> {
         Ok(ManifestListEntry {
             format_version: FormatVersion::V1,
@@ -508,7 +511,7 @@ impl ManifestListEntry {
             added_rows_count: entry.added_rows_count,
             existing_rows_count: entry.existing_rows_count,
             deleted_rows_count: entry.deleted_rows_count,
-            partitions: decode_partition_summaries(entry.partitions, types)?,
+            partitions: decode_partition_summaries(entry.partitions, types, promote)?,
             key_metadata: entry.key_metadata,
             first_row_id: None,
         })
@@ -602,9 +605,10 @@ impl<'a> ManifestListEntryDecoder<'a> {
         match format_version {
             FormatVersion::V1 => {
                 let entry = apache_avro::from_value::<ManifestListEntryV1>(&entry)?;
+                let promote = self.schema.is_some();
                 let (types, has_partition_types) =
                     self.partition_types(entry.partition_spec_id, entry.added_snapshot_id)?;
-                let mut decoded = ManifestListEntry::try_from_v1_with_types(entry, types)?;
+                let mut decoded = ManifestListEntry::try_from_v1_with_types(entry, types, promote)?;
                 if !has_partition_types {
                     decoded.partitions = None;
                 }
@@ -612,9 +616,10 @@ impl<'a> ManifestListEntryDecoder<'a> {
             }
             FormatVersion::V2 => {
                 let entry = apache_avro::from_value::<ManifestListEntryV2>(&entry)?;
+                let promote = self.schema.is_some();
                 let (types, has_partition_types) =
                     self.partition_types(entry.partition_spec_id, entry.added_snapshot_id)?;
-                let mut decoded = ManifestListEntry::try_from_v2_with_types(entry, types)?;
+                let mut decoded = ManifestListEntry::try_from_v2_with_types(entry, types, promote)?;
                 if !has_partition_types {
                     decoded.partitions = None;
                 }
@@ -622,9 +627,10 @@ impl<'a> ManifestListEntryDecoder<'a> {
             }
             FormatVersion::V3 => {
                 let entry = apache_avro::from_value::<ManifestListEntryV3>(&entry)?;
+                let promote = self.schema.is_some();
                 let (types, has_partition_types) =
                     self.partition_types(entry.partition_spec_id, entry.added_snapshot_id)?;
-                let mut decoded = ManifestListEntry::try_from_v3_with_types(entry, types)?;
+                let mut decoded = ManifestListEntry::try_from_v3_with_types(entry, types, promote)?;
                 if !has_partition_types {
                     decoded.partitions = None;
                 }
@@ -634,12 +640,11 @@ impl<'a> ManifestListEntryDecoder<'a> {
     }
 }
 
-/// Decodes an entry's partition field summaries, resolving types from the entry's own
-/// `partition_spec_id` against the scan schema and decoding each bound with the spec's
-/// width-inference rule ([`super::manifest::decode_bound`]).
+/// Decodes partition summaries against the selected schema, promoting bounds only for scans.
 fn decode_partition_summaries(
     partitions: Option<Vec<FieldSummarySerde>>,
     types: &[Option<Type>],
+    promote: bool,
 ) -> Result<Option<Vec<FieldSummary>>, Error> {
     let Some(summaries) = partitions else {
         return Ok(None);
@@ -650,17 +655,31 @@ fn decode_partition_summaries(
     summaries
         .into_iter()
         .zip(types.iter())
-        .map(|(summary, data_type)| FieldSummary::from_serde(summary, data_type.as_ref()))
+        .map(|(summary, data_type)| {
+            FieldSummary::from_serde_with_mode(summary, data_type.as_ref(), promote)
+        })
         .collect::<Result<Vec<_>, Error>>()
         .map(Some)
 }
 
 impl FieldSummary {
+    #[cfg(test)]
     fn from_serde(value: FieldSummarySerde, data_type: Option<&Type>) -> Result<Self, Error> {
+        Self::from_serde_with_mode(value, data_type, true)
+    }
+
+    fn from_serde_with_mode(
+        value: FieldSummarySerde,
+        data_type: Option<&Type>,
+        promote: bool,
+    ) -> Result<Self, Error> {
         let decode = |bytes: Option<ByteBuf>| -> Result<Option<Value>, Error> {
             match (bytes, data_type) {
-                (Some(bytes), Some(data_type)) => {
+                (Some(bytes), Some(data_type)) if promote => {
                     super::manifest::decode_bound(&bytes, data_type).map(Some)
+                }
+                (Some(bytes), Some(data_type)) => {
+                    super::manifest::decode_bound_for_copy(&bytes, data_type).map(Some)
                 }
                 _ => Ok(None),
             }
