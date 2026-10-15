@@ -29,7 +29,6 @@ use lru::LruCache;
 use object_store::path::Path;
 use object_store::ObjectStoreExt;
 use object_store::{ObjectMeta, ObjectStore};
-use std::collections::BTreeMap;
 use std::thread::available_parallelism;
 use std::{
     collections::{HashMap, HashSet},
@@ -108,7 +107,8 @@ use datafusion::{
 };
 use iceberg_rust::spec::{
     manifest::DataFile,
-    partition::Transform,
+    manifest_list::{Content as ManifestContent, ManifestListEntry},
+    partition::{PartitionSpec, Transform},
     schema::Schema,
     sort::{NullOrder, SortDirection, SortOrder},
     table_metadata::FormatVersion,
@@ -723,7 +723,7 @@ async fn table_scan(
         })
         .transpose()?;
 
-    let mut table_partition_cols = datafusion_partition_columns(partition_fields)?;
+    let pruning_partition_cols = datafusion_partition_columns(partition_fields)?;
 
     let mut file_schema_builder =
         SchemaBuilder::from(TryInto::<ArrowSchema>::try_into(schema.fields()).unwrap());
@@ -752,23 +752,6 @@ async fn table_scan(
         .cloned()
         .unwrap_or((0..arrow_schema.fields().len()).collect_vec());
 
-    let mut data_file_path_scan_index = None;
-    if enable_data_file_path_column {
-        data_file_path_scan_index = Some(file_schema.fields().len() + table_partition_cols.len());
-        table_partition_cols.push(Field::new(DATA_FILE_PATH_COLUMN, DataType::Utf8, false));
-    }
-
-    let manifest_file_path_partition_index = enable_manifest_file_path_column.then(|| {
-        let index = table_partition_cols.len();
-        table_partition_cols.push(Field::new(MANIFEST_FILE_PATH_COLUMN, DataType::Utf8, false));
-        index
-    });
-
-    // All files have to be grouped according to their partition values. This is done by using a HashMap with the partition values as the key.
-    // This way data files with the same partition value are mapped to the same vector.
-    let mut data_file_groups: HashMap<Struct, Vec<(ManifestPath, ManifestEntry)>> = HashMap::new();
-    let mut delete_file_groups: HashMap<Struct, PartitionDeleteFileIndex> = HashMap::new();
-
     let manifests = if scan_changed_data_files {
         table
             .change_manifests(snapshot_range.0, snapshot_range.1)
@@ -786,11 +769,36 @@ async fn table_scan(
         )
     });
 
+    // Partition tuples in historical manifests follow their own spec. They cannot be
+    // exposed as current-spec columns: a bucket value would replace the source field.
+    // The mixed-spec path reads source fields from Parquet while retaining partition
+    // metadata for safe pruning of manifests written under the current spec.
+    let include_partition_values = !has_historical_data_manifests(
+        &manifests,
+        table.metadata().default_spec_id,
+        scan_changed_data_files,
+    );
+    let mut table_partition_cols = if include_partition_values {
+        pruning_partition_cols.clone()
+    } else {
+        Vec::new()
+    };
+    let mut data_file_path_scan_index = None;
+    if enable_data_file_path_column {
+        data_file_path_scan_index = Some(file_schema.fields().len() + table_partition_cols.len());
+        table_partition_cols.push(Field::new(DATA_FILE_PATH_COLUMN, DataType::Utf8, false));
+    }
+    let manifest_file_path_partition_index = enable_manifest_file_path_column.then(|| {
+        let index = table_partition_cols.len();
+        table_partition_cols.push(Field::new(MANIFEST_FILE_PATH_COLUMN, DataType::Utf8, false));
+        index
+    });
+
     // Prune data & delete file and insert them into the according map
     let (content_file_iter, mut statistics) = if let Some(physical_predicate) =
         physical_predicate.clone()
     {
-        let partition_schema = Arc::new(ArrowSchema::new(table_partition_cols.clone()));
+        let partition_schema = Arc::new(ArrowSchema::new(pruning_partition_cols));
         let partition_predicates = conjunction(
             filters
                 .iter()
@@ -930,71 +938,16 @@ async fn table_scan(
         (itertools::Either::Right(iter), statistics)
     };
 
-    if partition_fields.is_empty() {
-        let mut data_files = Vec::new();
-        let mut equality_deletes = Vec::new();
-        let mut position_deletes = Vec::new();
-        content_file_iter
-            .filter(|manifest| scan_manifest_entry(&manifest.1, scan_changed_data_files))
-            .for_each(|manifest| match manifest.1.data_file().content() {
-                Content::Data => data_files.push(manifest),
-                Content::EqualityDeletes => equality_deletes.push(manifest),
-                Content::PositionDeletes => position_deletes.push(manifest),
-            });
-        if !data_files.is_empty() {
-            data_file_groups.insert(
-                Struct {
-                    fields: Vec::new(),
-                    lookup: BTreeMap::new(),
-                },
-                data_files,
-            );
-        }
-        if !equality_deletes.is_empty() || !position_deletes.is_empty() {
-            delete_file_groups.insert(
-                Struct {
-                    fields: Vec::new(),
-                    lookup: BTreeMap::new(),
-                },
-                PartitionDeleteFileIndex {
-                    equality_deletes,
-                    position_deletes,
-                },
-            );
-        }
-    } else {
-        content_file_iter.for_each(|manifest| {
-            if scan_manifest_entry(&manifest.1, scan_changed_data_files) {
-                match manifest.1.data_file().content() {
-                    Content::Data => {
-                        data_file_groups
-                            .entry(manifest.1.data_file().partition().clone())
-                            .or_default()
-                            .push(manifest);
-                    }
-                    Content::EqualityDeletes => {
-                        delete_file_groups
-                            .entry(manifest.1.data_file().partition().clone())
-                            .or_default()
-                            .equality_deletes
-                            .push(manifest);
-                    }
-                    Content::PositionDeletes => {
-                        delete_file_groups
-                            .entry(manifest.1.data_file().partition().clone())
-                            .or_default()
-                            .position_deletes
-                            .push(manifest);
-                    }
-                }
-            }
-        });
-    }
-
-    if excluded_data_file_paths.is_some_and(|paths| !paths.is_empty()) {
-        // Delete files cannot affect a partition with no retained data files.
-        delete_file_groups.retain(|partition, _| data_file_groups.contains_key(partition));
-    }
+    let spec_ids_by_manifest = manifests
+        .iter()
+        .map(|manifest| (manifest.manifest_path.as_str(), manifest.partition_spec_id))
+        .collect::<HashMap<_, _>>();
+    let (mut data_file_groups, delete_file_groups) = group_content_files(
+        content_file_iter,
+        &spec_ids_by_manifest,
+        &table.metadata().partition_specs,
+        scan_changed_data_files,
+    )?;
 
     let has_position_deletes = delete_file_groups
         .values()
@@ -1241,6 +1194,7 @@ async fn table_scan(
                                 schema,
                                 &data_manifest.1,
                                 last_updated_ms,
+                                include_partition_values,
                                 include_data_file_path_column,
                                 PartitionedFileMetadataColumns {
                                     first_row_id: enable_row_lineage,
@@ -1307,6 +1261,7 @@ async fn table_scan(
                                 &delete_schema,
                                 &delete_manifest.1,
                                 last_updated_ms,
+                                include_partition_values,
                                 enable_data_file_path_column,
                                 PartitionedFileMetadataColumns::default(),
                                 manifest_path,
@@ -1409,6 +1364,7 @@ async fn table_scan(
                             schema,
                             &x.1,
                             last_updated_ms,
+                            include_partition_values,
                             include_data_file_path_column,
                             PartitionedFileMetadataColumns {
                                 first_row_id: enable_row_lineage,
@@ -1503,6 +1459,7 @@ async fn table_scan(
                 &schema,
                 &entry,
                 last_updated_ms,
+                include_partition_values,
                 include_data_file_path_column,
                 PartitionedFileMetadataColumns {
                     first_row_id: enable_row_lineage,
@@ -1920,21 +1877,26 @@ fn generate_partitioned_file(
     schema: &Schema,
     manifest: &ManifestEntry,
     last_updated_ms: i64,
+    include_partition_values: bool,
     enable_data_file_path: bool,
     metadata_columns: PartitionedFileMetadataColumns,
     manifest_file_path: Option<ManifestPath>,
 ) -> Result<PartitionedFile, DataFusionError> {
     let manifest_statistics = manifest_statistics(schema, manifest);
-    let mut partition_values = manifest
-        .data_file()
-        .partition()
-        .iter()
-        .map(|x| {
-            x.as_ref()
-                .map(value_to_scalarvalue)
-                .unwrap_or(Ok(ScalarValue::Null))
-        })
-        .collect::<Result<Vec<ScalarValue>, _>>()?;
+    let mut partition_values = if include_partition_values {
+        manifest
+            .data_file()
+            .partition()
+            .iter()
+            .map(|x| {
+                x.as_ref()
+                    .map(value_to_scalarvalue)
+                    .unwrap_or(Ok(ScalarValue::Null))
+            })
+            .collect::<Result<Vec<ScalarValue>, _>>()?
+    } else {
+        Vec::new()
+    };
 
     if enable_data_file_path {
         partition_values.push(ScalarValue::Utf8(Some(
@@ -2729,6 +2691,119 @@ struct PartitionDeleteFileIndex {
     pub position_deletes: Vec<(ManifestPath, ManifestEntry)>,
 }
 
+type PartitionKey = (i32, Struct);
+type PartitionDataFileGroups = HashMap<PartitionKey, Vec<(ManifestPath, ManifestEntry)>>;
+type PartitionDeleteFileGroups = HashMap<PartitionKey, PartitionDeleteFileIndex>;
+
+fn has_historical_data_manifests(
+    manifests: &[ManifestListEntry],
+    current_spec_id: i32,
+    scan_changed_data_files: bool,
+) -> bool {
+    manifests.iter().any(|manifest| {
+        manifest.content == ManifestContent::Data
+            && manifest.partition_spec_id != current_spec_id
+            && (manifest.added_files_count != Some(0)
+                || manifest.existing_files_count != Some(0)
+                || (scan_changed_data_files && manifest.deleted_files_count != Some(0)))
+    })
+}
+
+fn group_content_files(
+    content_files: impl IntoIterator<Item = (ManifestPath, ManifestEntry)>,
+    spec_ids_by_manifest: &HashMap<&str, i32>,
+    partition_specs: &HashMap<i32, PartitionSpec>,
+    scan_changed_data_files: bool,
+) -> Result<(PartitionDataFileGroups, PartitionDeleteFileGroups), DataFusionError> {
+    let mut data_file_groups = HashMap::<PartitionKey, Vec<_>>::new();
+    let mut delete_file_groups = HashMap::<PartitionKey, PartitionDeleteFileIndex>::new();
+    let mut global_equality_deletes = Vec::new();
+
+    for manifest in content_files {
+        if !scan_manifest_entry(&manifest.1, scan_changed_data_files) {
+            continue;
+        }
+        let spec_id = *spec_ids_by_manifest
+            .get(manifest.0.as_str())
+            .ok_or_else(|| {
+                DataFusionError::Execution(format!(
+                    "Missing partition spec for manifest {}",
+                    manifest.0
+                ))
+            })?;
+        let spec = partition_specs.get(&spec_id).ok_or_else(|| {
+            DataFusionError::Execution(format!("Unknown partition spec {spec_id}"))
+        })?;
+        let partition = (spec_id, manifest.1.data_file().partition().clone());
+        match manifest.1.data_file().content() {
+            Content::Data => data_file_groups
+                .entry(partition)
+                .or_default()
+                .push(manifest),
+            Content::EqualityDeletes if spec.fields().is_empty() => {
+                global_equality_deletes.push(manifest);
+            }
+            Content::EqualityDeletes => delete_file_groups
+                .entry(partition)
+                .or_default()
+                .equality_deletes
+                .push(manifest),
+            Content::PositionDeletes => delete_file_groups
+                .entry(partition)
+                .or_default()
+                .position_deletes
+                .push(manifest),
+        }
+    }
+
+    delete_file_groups.retain(|partition, _| data_file_groups.contains_key(partition));
+    // Global equality deletes need an anti-join per data group. When there are no
+    // local deletes, coalesce groups to bound repeated delete scans while keeping
+    // enough independent groups to read large tables in parallel.
+    const MAX_GLOBAL_DELETE_APPLICATIONS: usize = 1024;
+    const MAX_GLOBAL_DELETE_SCAN_GROUPS: usize = 32;
+    if !global_equality_deletes.is_empty()
+        && delete_file_groups.is_empty()
+        && data_file_groups.len() > 1
+    {
+        let group_count = data_file_groups
+            .len()
+            .min(MAX_GLOBAL_DELETE_SCAN_GROUPS)
+            .min((MAX_GLOBAL_DELETE_APPLICATIONS / global_equality_deletes.len()).max(1));
+        let mut groups = Vec::<(PartitionKey, Vec<_>)>::with_capacity(group_count);
+        for (index, (key, files)) in data_file_groups.drain().enumerate() {
+            if index < group_count {
+                groups.push((key, files));
+            } else {
+                groups[index % group_count].1.extend(files);
+            }
+        }
+        data_file_groups.extend(groups);
+    }
+    // Mixed global and local deletes cannot be coalesced without broadening
+    // local delete scope. Fail explicitly instead of building an unbounded plan.
+    if data_file_groups.len() > 1
+        && global_equality_deletes
+            .len()
+            .checked_mul(data_file_groups.len())
+            .is_none_or(|count| count > MAX_GLOBAL_DELETE_APPLICATIONS)
+    {
+        return Err(DataFusionError::NotImplemented(format!(
+            "More than {MAX_GLOBAL_DELETE_APPLICATIONS} global equality-delete applications in one scan"
+        )));
+    }
+    if !global_equality_deletes.is_empty() {
+        for partition in data_file_groups.keys() {
+            delete_file_groups
+                .entry(partition.clone())
+                .or_default()
+                .equality_deletes
+                .extend(global_equality_deletes.iter().cloned());
+        }
+    }
+    Ok((data_file_groups, delete_file_groups))
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -2748,6 +2823,8 @@ mod tests {
         catalog::tabular::Tabular,
         object_store::ObjectStoreBuilder,
         spec::{
+            manifest::{Content, DataFile, FileFormat, ManifestEntry, Status},
+            manifest_list::{Content as ManifestContent, ManifestListEntry},
             namespace::Namespace,
             partition::{PartitionField, Transform},
             row_lineage::{
@@ -2758,7 +2835,7 @@ mod tests {
             snapshot::SnapshotBuilder,
             types::{PrimitiveType, StructField, Type},
             util,
-            values::Value,
+            values::{Struct, Value},
         },
     };
     use iceberg_rust::{
@@ -2774,13 +2851,16 @@ mod tests {
     use object_store::ObjectStoreExt;
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
-    use std::sync::Arc;
+    use std::{
+        collections::{HashMap, HashSet},
+        sync::Arc,
+    };
 
     use crate::{catalog::catalog::IcebergCatalog, table::fake_object_store_url, DataFusionTable};
 
     use super::{
-        position_delete_sequence_filter, DataSourceExec, ExecutionPlan, ParquetSource,
-        TableProvider,
+        group_content_files, has_historical_data_manifests, position_delete_sequence_filter,
+        DataSourceExec, ExecutionPlan, ParquetSource, TableProvider,
     };
     use datafusion::datasource::physical_plan::FileScanConfig;
 
@@ -4691,6 +4771,422 @@ mod tests {
                 .collect();
             assert_eq!(values, vec![123], "{name}");
         }
+    }
+
+    #[tokio::test]
+    async fn historical_bucket_partition_does_not_replace_identity_source_value() {
+        let catalog: Arc<dyn Catalog> = Arc::new(
+            SqlCatalog::new("sqlite://", "test", ObjectStoreBuilder::memory())
+                .await
+                .unwrap(),
+        );
+        let schema = Schema::builder()
+            .with_struct_field(StructField::new(
+                1,
+                "id",
+                true,
+                Type::Primitive(PrimitiveType::Long),
+                None,
+            ))
+            .build()
+            .unwrap();
+        let old_spec = PartitionSpec::builder()
+            .with_partition_field(PartitionField::new(
+                1,
+                1000,
+                "id_bucket",
+                Transform::Bucket(16),
+            ))
+            .build()
+            .unwrap();
+        let table = Table::builder()
+            .with_name("bucket_to_identity")
+            .with_location("/test/bucket_to_identity")
+            .with_schema(schema)
+            .with_partition_spec(old_spec)
+            .build(&["test".to_owned()], catalog)
+            .await
+            .unwrap();
+        let ctx = SessionContext::new();
+        let provider = Arc::new(DataFusionTable::from(table));
+        ctx.register_table("bucket_to_identity", provider.clone())
+            .unwrap();
+        ctx.sql("INSERT INTO bucket_to_identity VALUES (1), (2), (3), (4)")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        let committed = match provider.tabular.read().unwrap().clone() {
+            Tabular::Table(table) => table,
+            _ => panic!("expected Iceberg table"),
+        };
+        let identifier = committed.identifier().clone();
+        let catalog = committed.catalog();
+        let object_store = committed.object_store();
+        let mut metadata = committed.into_metadata();
+        metadata.partition_specs.insert(
+            1,
+            PartitionSpec::builder()
+                .with_spec_id(1)
+                .with_partition_field(PartitionField::new(1, 1001, "id", Transform::Identity))
+                .build()
+                .unwrap(),
+        );
+        metadata.default_spec_id = 1;
+        let evolved = Table::new(identifier, catalog, object_store, metadata)
+            .await
+            .unwrap();
+        let ctx = SessionContext::new();
+        ctx.register_table(
+            "bucket_to_identity",
+            Arc::new(DataFusionTable::from(evolved)),
+        )
+        .unwrap();
+
+        for (sql, expected) in [
+            (
+                "SELECT id FROM bucket_to_identity ORDER BY id",
+                vec![1, 2, 3, 4],
+            ),
+            ("SELECT id FROM bucket_to_identity WHERE id = 1", vec![1]),
+        ] {
+            let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+            let values = batches
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .values()
+                        .iter()
+                        .copied()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(values, expected, "{sql}");
+        }
+    }
+
+    #[test]
+    fn mixed_spec_deletes_match_spec_and_partition_or_are_global() {
+        let partition = Struct::from_iter([("part".to_owned(), Some(Value::Int(4)))]);
+        let empty_partition = Struct::from_iter(Vec::<(String, Option<Value>)>::new());
+        let entry = |name: &str, content: Content, partition: Struct| {
+            let file = DataFile::builder()
+                .with_content(content)
+                .with_file_path(format!("/{name}.parquet"))
+                .with_file_format(FileFormat::Parquet)
+                .with_partition(partition)
+                .with_record_count(1)
+                .with_file_size_in_bytes(1)
+                .with_column_sizes(None)
+                .with_value_counts(None)
+                .with_null_value_counts(None)
+                .with_nan_value_counts(None)
+                .with_distinct_counts(None)
+                .with_lower_bounds(None)
+                .with_upper_bounds(None)
+                .build()
+                .unwrap();
+            (
+                name.to_owned(),
+                ManifestEntry::builder()
+                    .with_format_version(super::FormatVersion::V2)
+                    .with_status(Status::Added)
+                    .with_data_file(file)
+                    .build()
+                    .unwrap(),
+            )
+        };
+        let files = vec![
+            entry("data-old", Content::Data, partition.clone()),
+            entry("data-new", Content::Data, partition.clone()),
+            entry("eq-old", Content::EqualityDeletes, partition.clone()),
+            entry("pos-new", Content::PositionDeletes, partition.clone()),
+            entry("eq-global", Content::EqualityDeletes, empty_partition),
+        ];
+        let spec_ids_by_manifest = HashMap::from([
+            ("data-old", 0),
+            ("data-new", 1),
+            ("eq-old", 0),
+            ("pos-new", 1),
+            ("eq-global", 2),
+        ]);
+        let specs = HashMap::from([
+            (
+                0,
+                PartitionSpec::builder()
+                    .with_spec_id(0)
+                    .with_partition_field(PartitionField::new(
+                        1,
+                        1000,
+                        "part",
+                        Transform::Bucket(16),
+                    ))
+                    .build()
+                    .unwrap(),
+            ),
+            (
+                1,
+                PartitionSpec::builder()
+                    .with_spec_id(1)
+                    .with_partition_field(PartitionField::new(1, 1001, "part", Transform::Identity))
+                    .build()
+                    .unwrap(),
+            ),
+            (
+                2,
+                PartitionSpec::builder()
+                    .with_spec_id(2)
+                    .with_fields(Vec::new())
+                    .build()
+                    .unwrap(),
+            ),
+        ]);
+        let mut global_only = files
+            .iter()
+            .filter(|(path, _)| ["data-old", "data-new", "eq-global"].contains(&path.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        for value in 100..138 {
+            global_only.push(entry(
+                "data-old",
+                Content::Data,
+                Struct::from_iter([("part".to_owned(), Some(Value::Int(value)))]),
+            ));
+        }
+        let (global_data, global_deletes) =
+            group_content_files(global_only, &spec_ids_by_manifest, &specs, false).unwrap();
+        assert_eq!(global_data.len(), 32);
+        assert_eq!(global_deletes.len(), 32);
+        assert_eq!(global_data.values().map(Vec::len).sum::<usize>(), 40);
+
+        let (data, deletes) =
+            group_content_files(files, &spec_ids_by_manifest, &specs, false).unwrap();
+        assert_eq!(data.len(), 2);
+        let old = &deletes[&(0, partition.clone())];
+        assert_eq!(old.position_deletes.len(), 0);
+        assert_eq!(
+            old.equality_deletes
+                .iter()
+                .map(|(path, _)| path.as_str())
+                .collect::<HashSet<_>>(),
+            HashSet::from(["eq-old", "eq-global"])
+        );
+        let current = &deletes[&(1, partition)];
+        assert_eq!(current.position_deletes.len(), 1);
+        assert_eq!(current.position_deletes[0].0, "pos-new");
+        assert_eq!(current.equality_deletes.len(), 1);
+        assert_eq!(current.equality_deletes[0].0, "eq-global");
+    }
+
+    #[test]
+    fn global_delete_plan_fanout_is_bounded() {
+        let file = |content, partition| {
+            DataFile::builder()
+                .with_content(content)
+                .with_file_path("/test.parquet".to_owned())
+                .with_file_format(FileFormat::Parquet)
+                .with_partition(partition)
+                .with_record_count(1)
+                .with_file_size_in_bytes(1)
+                .with_column_sizes(None)
+                .with_value_counts(None)
+                .with_null_value_counts(None)
+                .with_nan_value_counts(None)
+                .with_distinct_counts(None)
+                .with_lower_bounds(None)
+                .with_upper_bounds(None)
+                .build()
+                .unwrap()
+        };
+        let entry = |file| {
+            ManifestEntry::builder()
+                .with_format_version(super::FormatVersion::V2)
+                .with_status(Status::Added)
+                .with_data_file(file)
+                .build()
+                .unwrap()
+        };
+        let data = entry(file(Content::Data, Struct::from_iter(Vec::new())));
+        let local = entry(file(
+            Content::PositionDeletes,
+            Struct::from_iter(Vec::new()),
+        ));
+        let global = entry(file(
+            Content::EqualityDeletes,
+            Struct::from_iter(Vec::new()),
+        ));
+        let single_group = std::iter::once(("data-a".to_owned(), data.clone()))
+            .chain(std::iter::repeat_n(
+                ("global".to_owned(), global.clone()),
+                1025,
+            ))
+            .collect::<Vec<_>>();
+        let specs = [0, 1]
+            .map(|id| {
+                (
+                    id,
+                    PartitionSpec::builder()
+                        .with_spec_id(id)
+                        .with_fields(Vec::new())
+                        .build()
+                        .unwrap(),
+                )
+            })
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+        let ids = HashMap::from([("data-a", 0), ("data-b", 1), ("local", 0), ("global", 0)]);
+        assert!(group_content_files(single_group, &ids, &specs, false).is_ok());
+        let files = [
+            ("data-a".to_owned(), data.clone()),
+            ("data-b".to_owned(), data),
+            ("local".to_owned(), local),
+        ]
+        .into_iter()
+        .chain(std::iter::repeat_n(("global".to_owned(), global), 513))
+        .collect::<Vec<_>>();
+        let error = group_content_files(files, &ids, &specs, false).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("global equality-delete applications"));
+    }
+
+    #[test]
+    #[ignore = "manual mixed-spec scan planning benchmark"]
+    fn benchmark_global_delete_grouping() {
+        use std::time::Instant;
+
+        let file = |content, partition| {
+            DataFile::builder()
+                .with_content(content)
+                .with_file_path("/test.parquet".to_owned())
+                .with_file_format(FileFormat::Parquet)
+                .with_partition(partition)
+                .with_record_count(1)
+                .with_file_size_in_bytes(1)
+                .with_column_sizes(None)
+                .with_value_counts(None)
+                .with_null_value_counts(None)
+                .with_nan_value_counts(None)
+                .with_distinct_counts(None)
+                .with_lower_bounds(None)
+                .with_upper_bounds(None)
+                .build()
+                .unwrap()
+        };
+        let entry = |file| {
+            ManifestEntry::builder()
+                .with_format_version(super::FormatVersion::V2)
+                .with_status(Status::Added)
+                .with_data_file(file)
+                .build()
+                .unwrap()
+        };
+        let data = (0..10_000)
+            .map(|value| {
+                (
+                    "data".to_owned(),
+                    entry(file(
+                        Content::Data,
+                        Struct::from_iter([("part".to_owned(), Some(Value::Int(value)))]),
+                    )),
+                )
+            })
+            .collect::<Vec<_>>();
+        let global = (0..4)
+            .map(|_| {
+                (
+                    "global".to_owned(),
+                    entry(file(
+                        Content::EqualityDeletes,
+                        Struct::from_iter(Vec::<(String, Option<Value>)>::new()),
+                    )),
+                )
+            })
+            .collect::<Vec<_>>();
+        let specs = HashMap::from([
+            (
+                0,
+                PartitionSpec::builder()
+                    .with_spec_id(0)
+                    .with_partition_field(PartitionField::new(1, 1000, "part", Transform::Identity))
+                    .build()
+                    .unwrap(),
+            ),
+            (
+                1,
+                PartitionSpec::builder()
+                    .with_spec_id(1)
+                    .with_fields(Vec::new())
+                    .build()
+                    .unwrap(),
+            ),
+        ]);
+        let ids = HashMap::from([("data", 0), ("global", 1)]);
+        for with_global in [false, true] {
+            let start = Instant::now();
+            for _ in 0..20 {
+                let files = data
+                    .iter()
+                    .cloned()
+                    .chain(global.iter().filter(|_| with_global).cloned());
+                let (groups, deletes) = group_content_files(files, &ids, &specs, false).unwrap();
+                if with_global {
+                    assert_eq!(groups.len(), 32);
+                    assert_eq!(deletes.len(), 32);
+                } else {
+                    assert_eq!(groups.len(), 10_000);
+                    assert!(deletes.is_empty());
+                }
+                std::hint::black_box((groups, deletes));
+            }
+            eprintln!(
+                "10k files, global={with_global}, 20 plans: {:?}",
+                start.elapsed()
+            );
+        }
+    }
+
+    #[test]
+    fn deleted_only_historical_manifest_keeps_current_partition_fast_path() {
+        let deleted_only = ManifestListEntry {
+            format_version: super::FormatVersion::V2,
+            manifest_path: "old".to_owned(),
+            manifest_length: 0,
+            partition_spec_id: 0,
+            content: ManifestContent::Data,
+            sequence_number: 0,
+            min_sequence_number: 0,
+            added_snapshot_id: 0,
+            added_files_count: Some(0),
+            existing_files_count: Some(0),
+            deleted_files_count: Some(1),
+            added_rows_count: Some(0),
+            existing_rows_count: Some(0),
+            deleted_rows_count: Some(1),
+            partitions: None,
+            key_metadata: None,
+            first_row_id: None,
+        };
+        assert!(!has_historical_data_manifests(
+            &[deleted_only.clone()],
+            1,
+            false
+        ));
+        assert!(has_historical_data_manifests(
+            &[deleted_only.clone()],
+            1,
+            true
+        ));
+        let mut live = deleted_only.clone();
+        live.existing_files_count = Some(1);
+        assert!(has_historical_data_manifests(&[live.clone()], 1, false));
+        live.content = ManifestContent::Deletes;
+        assert!(!has_historical_data_manifests(&[live], 1, true));
     }
 
     #[tokio::test]
