@@ -5173,18 +5173,22 @@ mod tests {
             first_row_id: None,
         };
         assert!(!has_historical_data_manifests(
-            &[deleted_only.clone()],
+            std::slice::from_ref(&deleted_only),
             1,
             false
         ));
         assert!(has_historical_data_manifests(
-            &[deleted_only.clone()],
+            std::slice::from_ref(&deleted_only),
             1,
             true
         ));
-        let mut live = deleted_only.clone();
+        let mut live = deleted_only;
         live.existing_files_count = Some(1);
-        assert!(has_historical_data_manifests(&[live.clone()], 1, false));
+        assert!(has_historical_data_manifests(
+            std::slice::from_ref(&live),
+            1,
+            false
+        ));
         live.content = ManifestContent::Deletes;
         assert!(!has_historical_data_manifests(&[live], 1, true));
     }
