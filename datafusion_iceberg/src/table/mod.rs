@@ -758,7 +758,7 @@ async fn table_scan(
         .metadata()
         .default_sort_order()
         .ok()
-        .and_then(|order| declared_output_ordering(order, &schema, &file_schema));
+        .and_then(|order| declared_output_ordering(order, schema, &file_schema));
 
     // If no projection was specified default to projecting all the fields
     let requested_projection = projection
@@ -892,9 +892,9 @@ async fn table_scan(
             .try_build(physical_predicate)?;
         // After the first pruning stage the data_files are pruned again based on the pruning statistics in the manifest files.
         let files_to_prune =
-            pruning_predicate.prune(&PruneDataFiles::new(&schema, &arrow_schema, &data_files))?;
+            pruning_predicate.prune(&PruneDataFiles::new(schema, &arrow_schema, &data_files))?;
 
-        let mut statistics = statistics_from_datafiles(&schema, &data_files);
+        let mut statistics = statistics_from_datafiles(schema, &data_files);
         for _ in 0..usize::from(enable_row_id_column)
             + usize::from(enable_last_updated_sequence_number_column)
         {
@@ -931,7 +931,7 @@ async fn table_scan(
             });
         }
 
-        let mut statistics = statistics_from_datafiles(&schema, &data_files);
+        let mut statistics = statistics_from_datafiles(schema, &data_files);
         for _ in 0..usize::from(enable_row_id_column)
             + usize::from(enable_last_updated_sequence_number_column)
         {
@@ -1469,7 +1469,7 @@ async fn table_scan(
                 .as_ref()
                 .is_some_and(|(order_id, _)| entry.data_file().sort_order_id() == &Some(*order_id));
             let file = generate_partitioned_file(
-                &schema,
+                schema,
                 &entry,
                 last_updated_ms,
                 include_partition_values,
