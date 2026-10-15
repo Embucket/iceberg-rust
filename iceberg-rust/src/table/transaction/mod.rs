@@ -58,14 +58,28 @@ fn reject_spec_change_with_file_write(
         Some(Operation::SetDefaultSpec(spec_id)) if *spec_id != current_spec_id
     );
     if changes_spec
-        && [
-            APPEND_INDEX,
-            APPEND_SEQUENCE_GROUPS_INDEX,
-            REPLACE_INDEX,
-            OVERWRITE_INDEX,
-        ]
-        .iter()
-        .any(|&index| operations[index].is_some())
+        && operations
+            .iter()
+            .flatten()
+            .any(|operation| match operation {
+                Operation::Append {
+                    data_files,
+                    delete_files,
+                    ..
+                } => !data_files.is_empty() || !delete_files.is_empty(),
+                Operation::AppendSequenceGroups {
+                    sequence_groups, ..
+                } => sequence_groups
+                    .iter()
+                    .any(|group| !group.data_files.is_empty() || !group.delete_files.is_empty()),
+                Operation::Replace { files, .. } => !files.is_empty(),
+                Operation::Overwrite {
+                    data_files,
+                    files_to_overwrite,
+                    ..
+                } => !data_files.is_empty() || !files_to_overwrite.is_empty(),
+                _ => false,
+            })
     {
         return Err(Error::NotSupported(
             "Changing the default partition spec and writing files in one transaction is not supported"
@@ -584,6 +598,8 @@ impl<'table> TableTransaction<'table> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::{
         reject_spec_change_with_file_write, Operation, APPEND_INDEX, APPEND_SEQUENCE_GROUPS_INDEX,
         NUM_OPERATIONS, OVERWRITE_INDEX, REPLACE_INDEX, SET_DEFAULT_SPEC_INDEX,
@@ -634,13 +650,24 @@ mod tests {
         ];
         for (index, operation) in writes {
             operations[index] = Some(operation);
-            assert!(matches!(
-                reject_spec_change_with_file_write(&operations, 0),
-                Err(Error::NotSupported(_))
-            ));
+            assert!(reject_spec_change_with_file_write(&operations, 0).is_ok());
             assert!(reject_spec_change_with_file_write(&operations, 1).is_ok());
             operations[index] = None;
         }
+
+        operations[OVERWRITE_INDEX] = Some(Operation::Overwrite {
+            branch: None,
+            data_files: Vec::new(),
+            files_to_overwrite: HashMap::from([(
+                "manifest.avro".to_owned(),
+                vec!["data.parquet".to_owned()],
+            )]),
+            additional_summary: None,
+        });
+        assert!(matches!(
+            reject_spec_change_with_file_write(&operations, 0),
+            Err(Error::NotSupported(_))
+        ));
     }
 
     // -----------------------------------------------------------------------
