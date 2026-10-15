@@ -1964,6 +1964,10 @@ mod tests {
             .bytes()
             .await
             .unwrap();
+        assert_eq!(
+            usize::try_from(old.manifest_length).unwrap(),
+            old_bytes.len()
+        );
         let reader = ManifestReader::new(old_bytes.as_ref()).unwrap();
         let (_, source_spec, _) = reader.metadata().as_ref().clone();
         assert_eq!(*source_spec.spec_id(), 0);

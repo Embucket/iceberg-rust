@@ -818,7 +818,7 @@ impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
 
         let manifest_length: i64 = manifest_bytes.len() as i64;
 
-        self.manifest.manifest_length += manifest_length;
+        self.manifest.manifest_length = manifest_length;
 
         object_store
             .put(
@@ -859,7 +859,7 @@ impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
 
         let manifest_length: i64 = manifest_bytes.len() as i64;
 
-        self.manifest.manifest_length += manifest_length;
+        self.manifest.manifest_length = manifest_length;
 
         let path = strip_prefix(&self.manifest.manifest_path).as_str().into();
         let future = async move {

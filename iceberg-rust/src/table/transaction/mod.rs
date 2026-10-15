@@ -49,6 +49,32 @@ pub(crate) static REPLACE_SORT_ORDER_INDEX: usize = 9;
 
 pub(crate) static NUM_OPERATIONS: usize = 10;
 
+fn reject_spec_change_with_file_write(
+    operations: &[Option<Operation>],
+    current_spec_id: i32,
+) -> Result<(), Error> {
+    let changes_spec = matches!(
+        operations[SET_DEFAULT_SPEC_INDEX].as_ref(),
+        Some(Operation::SetDefaultSpec(spec_id)) if *spec_id != current_spec_id
+    );
+    if changes_spec
+        && [
+            APPEND_INDEX,
+            APPEND_SEQUENCE_GROUPS_INDEX,
+            REPLACE_INDEX,
+            OVERWRITE_INDEX,
+        ]
+        .iter()
+        .any(|&index| operations[index].is_some())
+    {
+        return Err(Error::NotSupported(
+            "Changing the default partition spec and writing files in one transaction is not supported"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// A transaction that can perform multiple operations on a table atomically
 ///
 /// TableTransaction allows grouping multiple table operations (like schema updates,
@@ -502,9 +528,13 @@ impl<'table> TableTransaction<'table> {
         {
             return Err(Error::NotSupported(
                 "writes to Iceberg tables without a table UUID cannot be fenced against DROP/recreate"
-                    .to_owned(),
+                .to_owned(),
             ));
         }
+        reject_spec_change_with_file_write(
+            &self.operations,
+            self.table.metadata().default_spec_id,
+        )?;
         let catalog = self.table.catalog();
         let identifier = self.table.identifier.clone();
 
@@ -554,7 +584,64 @@ impl<'table> TableTransaction<'table> {
 
 #[cfg(test)]
 mod tests {
+    use super::{
+        reject_spec_change_with_file_write, Operation, APPEND_INDEX, APPEND_SEQUENCE_GROUPS_INDEX,
+        NUM_OPERATIONS, OVERWRITE_INDEX, REPLACE_INDEX, SET_DEFAULT_SPEC_INDEX,
+    };
+    use crate::error::Error;
     use rstest::rstest;
+
+    #[test]
+    fn spec_change_and_file_write_fail_closed() {
+        let mut operations: Vec<Option<Operation>> = (0..NUM_OPERATIONS).map(|_| None).collect();
+        operations[SET_DEFAULT_SPEC_INDEX] = Some(Operation::SetDefaultSpec(1));
+        assert!(reject_spec_change_with_file_write(&operations, 0).is_ok());
+
+        let writes = [
+            (
+                APPEND_INDEX,
+                Operation::Append {
+                    branch: None,
+                    data_files: Vec::new(),
+                    delete_files: Vec::new(),
+                    additional_summary: None,
+                },
+            ),
+            (
+                APPEND_SEQUENCE_GROUPS_INDEX,
+                Operation::AppendSequenceGroups {
+                    branch: None,
+                    sequence_groups: Vec::new(),
+                },
+            ),
+            (
+                REPLACE_INDEX,
+                Operation::Replace {
+                    branch: None,
+                    files: Vec::new(),
+                    additional_summary: None,
+                },
+            ),
+            (
+                OVERWRITE_INDEX,
+                Operation::Overwrite {
+                    branch: None,
+                    data_files: Vec::new(),
+                    files_to_overwrite: Default::default(),
+                    additional_summary: None,
+                },
+            ),
+        ];
+        for (index, operation) in writes {
+            operations[index] = Some(operation);
+            assert!(matches!(
+                reject_spec_change_with_file_write(&operations, 0),
+                Err(Error::NotSupported(_))
+            ));
+            assert!(reject_spec_change_with_file_write(&operations, 1).is_ok());
+            operations[index] = None;
+        }
+    }
 
     // -----------------------------------------------------------------------
     // Placeholders for table-operation + snapshot-producer + partition-spec
