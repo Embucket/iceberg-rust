@@ -236,7 +236,9 @@ pub(crate) fn select_manifest_unpartitioned(
     manifest_list_reader: ManifestListReader<&[u8]>,
     manifest_list_writer: &mut apache_avro::Writer<Vec<u8>>,
     mut row_id_assigner: Option<&mut RowIdAssigner>,
+    table_metadata: &TableMetadata,
 ) -> Result<SelectedManifest, Error> {
+    let mut compatibility = ManifestRewriteCompatibility::new(table_metadata)?;
     let mut selected_data_state = None;
     let mut selected_delete_state = None;
     let mut file_count_all_entries = 0;
@@ -245,6 +247,15 @@ pub(crate) fn select_manifest_unpartitioned(
         // TODO: should this also account for existing_rows_count / existing_files_count?
         let row_count = manifest.added_rows_count;
         file_count_all_entries += manifest.added_files_count.unwrap_or(0) as usize;
+
+        if !compatibility.allows(&manifest, table_metadata) {
+            append_manifest(
+                manifest_list_writer,
+                row_id_assigner.as_deref_mut(),
+                manifest,
+            )?;
+            continue;
+        }
 
         match manifest.content {
             iceberg_rust_spec::manifest_list::Content::Data => {
@@ -315,11 +326,8 @@ pub(crate) fn select_manifest_unpartitioned(
             }
         }
     }
-    let (_, data_manifest) =
-        selected_data_state.ok_or(Error::NotFound("Manifest for insert".to_owned()))?;
-
     Ok(SelectedManifest {
-        data_manifest: Some(data_manifest),
+        data_manifest: selected_data_state.map(|(_, manifest)| manifest),
         delete_manifest: selected_delete_state.map(|(_, x)| x),
         file_count_all_entries,
     })

@@ -870,7 +870,7 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
             delete_manifest,
             file_count_all_entries,
         } = if partition_column_names.is_empty() {
-            select_manifest_unpartitioned(manifest_list_reader, &mut writer, None)?
+            select_manifest_unpartitioned(manifest_list_reader, &mut writer, None, table_metadata)?
         } else {
             select_manifest_partitioned(
                 manifest_list_reader,
@@ -1014,6 +1014,7 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
                 &mut writer,
                 row_id_assigner.as_mut(),
                 manifests_to_overwrite,
+                table_metadata,
             )?
         } else {
             select_manifest_without_overwrites_partitioned(

@@ -100,7 +100,9 @@ pub(crate) fn select_manifest_without_overwrites_unpartitioned(
     manifest_list_writer: &mut apache_avro::Writer<Vec<u8>>,
     mut row_id_assigner: Option<&mut RowIdAssigner>,
     overwrites: &HashSet<String>,
+    table_metadata: &TableMetadata,
 ) -> Result<OverwriteManifest, Error> {
+    let mut compatibility = ManifestRewriteCompatibility::new(table_metadata)?;
     let mut selected_state = None;
     let mut file_count_all_entries = 0;
     let mut manifests_to_overwrite = Vec::new();
@@ -109,6 +111,19 @@ pub(crate) fn select_manifest_without_overwrites_unpartitioned(
         // TODO: should this also account for existing_rows_count / existing_files_count?
         let row_count = manifest.added_rows_count;
         file_count_all_entries += manifest.added_files_count.unwrap_or(0) as usize;
+
+        if !compatibility.allows(&manifest, table_metadata) {
+            if overwrites.contains(&manifest.manifest_path) {
+                manifests_to_overwrite.push(manifest);
+            } else {
+                append_manifest(
+                    manifest_list_writer,
+                    row_id_assigner.as_deref_mut(),
+                    manifest,
+                )?;
+            }
+            continue;
+        }
 
         let Some((selected_row_count, _)) = &selected_state else {
             selected_state = Some((row_count, manifest));
@@ -144,11 +159,9 @@ pub(crate) fn select_manifest_without_overwrites_unpartitioned(
             continue;
         }
     }
-    selected_state
-        .map(|(_, entry)| OverwriteManifest {
-            manifest: Some(entry),
-            file_count_all_entries,
-            manifests_to_overwrite,
-        })
-        .ok_or(Error::NotFound("Manifest for insert".to_owned()))
+    Ok(OverwriteManifest {
+        manifest: selected_state.map(|(_, entry)| entry),
+        file_count_all_entries,
+        manifests_to_overwrite,
+    })
 }
