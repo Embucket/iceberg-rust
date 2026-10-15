@@ -365,23 +365,34 @@ impl Table {
 /// Path of a Manifest file
 pub type ManifestPath = String;
 
-#[instrument(name = "iceberg_rust::table::datafiles", level = "debug", skip(object_store, manifests), fields(
-    manifest_count = manifests.len(),
-    filter_provided = filter.is_some(),
-    sequence_range = ?sequence_number_range
-))]
 async fn datafiles(
     object_store: Arc<dyn ObjectStore>,
     manifests: &'_ [ManifestListEntry],
     filter: Option<Vec<bool>>,
     sequence_number_range: (Option<i64>, Option<i64>),
 ) -> Result<impl Stream<Item = Result<(ManifestPath, ManifestEntry), Error>> + '_, Error> {
+    let span = tracing::debug_span!(
+        "iceberg_rust::table::datafiles",
+        manifest_count = manifests.len(),
+        filter_provided = filter.is_some(),
+        sequence_range = ?sequence_number_range
+    );
+    let _guard = span.enter();
+    if let Some(predicate) = &filter {
+        if predicate.len() != manifests.len() {
+            return Err(Error::InvalidFormat(format!(
+                "manifest filter length {} does not match manifest count {}",
+                predicate.len(),
+                manifests.len()
+            )));
+        }
+    }
     // filter manifest files according to filter vector
     let iter: Box<dyn Iterator<Item = &ManifestListEntry> + Send + Sync> = match filter {
         Some(predicate) => {
             let iter = manifests
                 .iter()
-                .zip(predicate.into_iter())
+                .zip(predicate)
                 .filter(|(_, predicate)| *predicate)
                 .map(|(manifest, _)| manifest);
             Box::new(iter)
@@ -389,65 +400,63 @@ async fn datafiles(
         None => Box::new(manifests.iter()),
     };
 
-    let futures: Vec<_> = iter
-        .map(|file| {
-            let object_store = object_store.clone();
-            let manifest_path = file.manifest_path.clone();
-            let manifest_sequence_number = file.sequence_number;
-            let manifest_snapshot_id = file.added_snapshot_id;
-            let manifest_first_row_id = file.first_row_id;
-            async move {
-                // Manifest files are immutable by path. Key by the original
-                // URI so equal store-relative paths cannot alias across stores.
-                let data = match crate::util::manifest_cache::get(&manifest_path) {
-                    Some(bytes) => bytes,
-                    None => {
-                        let path: Path = util::strip_prefix(&manifest_path).into();
-                        let bytes = object_store
-                            .get(&path)
-                            .and_then(|file| file.bytes())
-                            .instrument(tracing::trace_span!("iceberg_rust::get_manifest"))
-                            .await?;
-                        crate::util::manifest_cache::put(&manifest_path, &bytes);
-                        bytes
+    let futures = iter.map(move |file| {
+        let object_store = object_store.clone();
+        let manifest_path = file.manifest_path.clone();
+        let manifest_sequence_number = file.sequence_number;
+        let manifest_snapshot_id = file.added_snapshot_id;
+        let manifest_first_row_id = file.first_row_id;
+        async move {
+            // Manifest files are immutable by path. Key by the original
+            // URI so equal store-relative paths cannot alias across stores.
+            let data = match crate::util::manifest_cache::get(&manifest_path) {
+                Some(bytes) => bytes,
+                None => {
+                    let path: Path = util::strip_prefix(&manifest_path).into();
+                    let bytes = object_store
+                        .get(&path)
+                        .and_then(|file| file.bytes())
+                        .instrument(tracing::trace_span!("iceberg_rust::get_manifest"))
+                        .await?;
+                    crate::util::manifest_cache::put(&manifest_path, &bytes);
+                    bytes
+                }
+            };
+            let bytes = Cursor::new(Vec::from(data));
+
+            let mut first_row_id_inheritance =
+                FirstRowIdInheritance::try_for_committed_manifest(manifest_first_row_id)?;
+
+            ManifestReader::new(bytes)?
+                .map(move |entry| {
+                    let mut entry = entry?;
+                    first_row_id_inheritance.apply(&mut entry)?;
+                    Ok(entry)
+                })
+                .filter_map_ok(|mut x| {
+                    if x.snapshot_id().is_none() {
+                        *x.snapshot_id_mut() = Some(manifest_snapshot_id);
                     }
-                };
-                let bytes = Cursor::new(Vec::from(data));
+                    let sequence_number = if let Some(sequence_number) = x.sequence_number() {
+                        *sequence_number
+                    } else {
+                        *x.sequence_number_mut() = Some(manifest_sequence_number);
+                        manifest_sequence_number
+                    };
 
-                let mut first_row_id_inheritance =
-                    FirstRowIdInheritance::try_for_committed_manifest(manifest_first_row_id)?;
-
-                ManifestReader::new(bytes)?
-                    .map(move |entry| {
-                        let mut entry = entry?;
-                        first_row_id_inheritance.apply(&mut entry)?;
-                        Ok(entry)
-                    })
-                    .filter_map_ok(|mut x| {
-                        if x.snapshot_id().is_none() {
-                            *x.snapshot_id_mut() = Some(manifest_snapshot_id);
+                    let keep = match sequence_number_range {
+                        (Some(start), Some(end)) => {
+                            start < sequence_number && sequence_number <= end
                         }
-                        let sequence_number = if let Some(sequence_number) = x.sequence_number() {
-                            *sequence_number
-                        } else {
-                            *x.sequence_number_mut() = Some(manifest_sequence_number);
-                            manifest_sequence_number
-                        };
-
-                        let keep = match sequence_number_range {
-                            (Some(start), Some(end)) => {
-                                start < sequence_number && sequence_number <= end
-                            }
-                            (Some(start), None) => start < sequence_number,
-                            (None, Some(end)) => sequence_number <= end,
-                            _ => true,
-                        };
-                        keep.then(|| (manifest_path.clone(), x))
-                    })
-                    .collect::<Result<Vec<_>, Error>>()
-            }
-        })
-        .collect();
+                        (Some(start), None) => start < sequence_number,
+                        (None, Some(end)) => sequence_number <= end,
+                        _ => true,
+                    };
+                    keep.then(|| (manifest_path.clone(), x))
+                })
+                .collect::<Result<Vec<_>, Error>>()
+        }
+    });
 
     // `buffered` keeps at most `concurrent_manifest_ops` fetch+decode futures in flight, bounding
     // request fan-out and the raw manifest bytes held at once (each future drops its bytes once
@@ -516,7 +525,81 @@ pub(crate) async fn delete_all_table_files(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use iceberg_rust_spec::spec::{
+        manifest_list::Content as ManifestContent, table_metadata::FormatVersion,
+    };
+    use object_store::memory::InMemory;
     use rstest::rstest;
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    fn test_manifest(index: usize) -> ManifestListEntry {
+        ManifestListEntry {
+            format_version: FormatVersion::V2,
+            manifest_path: format!("/{index}.avro"),
+            manifest_length: 0,
+            partition_spec_id: 0,
+            content: ManifestContent::Data,
+            sequence_number: 0,
+            min_sequence_number: 0,
+            added_snapshot_id: 0,
+            added_files_count: Some(1),
+            existing_files_count: Some(0),
+            deleted_files_count: Some(0),
+            added_rows_count: Some(1),
+            existing_rows_count: Some(0),
+            deleted_rows_count: Some(0),
+            partitions: None,
+            key_metadata: None,
+            first_row_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn datafiles_rejects_mismatched_manifest_filter() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let manifests = [test_manifest(0)];
+        for filter in [vec![], vec![true, false]] {
+            let result = datafiles(store.clone(), &manifests, Some(filter), (None, None)).await;
+            assert!(
+                matches!(result, Err(Error::InvalidFormat(message)) if message.contains("manifest filter length"))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn datafiles_skips_filtered_manifests_without_reading_them() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let manifests = [test_manifest(0), test_manifest(1)];
+        let stream = datafiles(store, &manifests, Some(vec![false, false]), (None, None))
+            .await
+            .expect("construct manifest stream");
+        assert!(stream
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("read stream")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore = "manual stream-construction benchmark; does not read manifests"]
+    async fn benchmark_datafiles_stream_setup() {
+        let manifests = (0..100_000).map(test_manifest).collect::<Vec<_>>();
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let mut samples = Vec::with_capacity(9);
+        for _ in 0..9 {
+            let filter = vec![true; manifests.len()];
+            let start = Instant::now();
+            let stream = datafiles(store.clone(), &manifests, Some(filter), (None, None))
+                .await
+                .expect("construct manifest stream");
+            drop(black_box(stream));
+            samples.push(start.elapsed());
+        }
+        samples.sort_unstable();
+        eprintln!("100k manifest stream setup median: {:?}", samples[4]);
+    }
 
     // -----------------------------------------------------------------------
     // Placeholders for upstream scan + planning + metadata-table tests.
