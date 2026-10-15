@@ -505,19 +505,18 @@ pub(crate) fn transform_predicate(
     let field = partition_fields
         .iter()
         .find(|field| field.source_name() == column.name())?;
-    if field.transform() != &Transform::Identity {
+    let legacy_negative_day_hour = if field.transform() != &Transform::Identity {
         let Expr::Literal(value, _) = &literal else {
             return None;
         };
         if !literal_matches_source(value, field) {
             return None;
         }
-        if matches!(field.transform(), Transform::Day | Transform::Hour)
+        matches!(field.transform(), Transform::Day | Transform::Hour)
             && matches!(value, ScalarValue::TimestampMicrosecond(Some(value), _) if *value < 0)
-        {
-            return None;
-        }
-    }
+    } else {
+        false
+    };
     let op = if column_on_left {
         op
     } else {
@@ -530,6 +529,18 @@ pub(crate) fn transform_predicate(
             _ => return None,
         }
     };
+    if legacy_negative_day_hour && field.transform() == &Transform::Hour {
+        // Hour IDs wrap outside i32. Equality remains safe with both encodings, but a
+        // monotone range can drop matching rows whose partition ID has wrapped.
+        if op != Operator::Eq {
+            return None;
+        }
+        let Expr::Literal(ScalarValue::TimestampMicrosecond(Some(micros), _), _) = &literal else {
+            return None;
+        };
+        let hour = i32::try_from(micros.div_euclid(3_600_000_000)).ok()?;
+        hour.checked_add(1)?;
+    }
     let op = match field.transform() {
         Transform::Identity => op,
         // Legacy numeric manifests and truncated String min/max statistics can
@@ -550,7 +561,8 @@ pub(crate) fn transform_predicate(
     };
     let literal = transform_literal(literal, field.transform())?;
     let column = Expr::Column(Column::new(column.relation, field.name().to_owned()));
-    if field.transform() == &Transform::Month {
+    // Legacy pre-epoch day/hour IDs may be truncated toward zero instead of floored.
+    if field.transform() == &Transform::Month || legacy_negative_day_hour {
         let legacy = Expr::BinaryExpr(BinaryExpr::new(
             Box::new(literal.clone()),
             Operator::Plus,
@@ -638,6 +650,21 @@ fn transform_literal(expr: Expr, transform: &Transform) -> Option<Expr> {
         return None;
     }
     match transform {
+        Transform::Day | Transform::Hour if matches!(value, ScalarValue::TimestampMicrosecond(Some(micros), _) if *micros < 0) =>
+        {
+            let ScalarValue::TimestampMicrosecond(Some(micros), _) = value else {
+                return None;
+            };
+            let unit = if transform == &Transform::Day {
+                86_400_000_000
+            } else {
+                3_600_000_000
+            };
+            Some(Expr::Literal(
+                ScalarValue::Int32(Some(i32::try_from(micros.div_euclid(unit)).ok()?)),
+                None,
+            ))
+        }
         Transform::Year => Some(Expr::ScalarFunction(ScalarFunction::new_udf(
             Arc::new(ScalarUDF::new_from_impl(DateTransform::new())),
             vec![Expr::Literal(ScalarValue::new_utf8("year"), None), expr],
@@ -1695,23 +1722,152 @@ mod tests {
     }
 
     #[test]
-    fn negative_timestamp_day_and_hour_skip_legacy_unsafe_pruning() {
+    fn negative_timestamp_day_and_hour_prune_both_partition_encodings() {
+        let manifests = (-2..=1)
+            .map(|partition_id| ManifestListEntry {
+                format_version: FormatVersion::V2,
+                manifest_path: format!("/{partition_id}.avro"),
+                manifest_length: 1,
+                partition_spec_id: 1,
+                content: ManifestContent::Data,
+                sequence_number: 1,
+                min_sequence_number: 1,
+                added_snapshot_id: 1,
+                added_files_count: Some(1),
+                existing_files_count: Some(0),
+                deleted_files_count: Some(0),
+                added_rows_count: Some(1),
+                existing_rows_count: Some(0),
+                deleted_rows_count: Some(0),
+                partitions: Some(vec![FieldSummary {
+                    contains_null: false,
+                    contains_nan: None,
+                    lower_bound: Some(Value::Int(partition_id)),
+                    upper_bound: Some(Value::Int(partition_id)),
+                }]),
+                key_metadata: None,
+                first_row_id: None,
+            })
+            .collect::<Vec<_>>();
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "partition_id",
+            DataType::Int32,
+            true,
+        )]));
+        let session = SessionContext::new();
+        let state = session.state();
         for transform in [Transform::Day, Transform::Hour] {
-            assert!(project_id_predicate(
-                transform,
-                PrimitiveType::Timestamp,
-                Operator::Eq,
-                ScalarValue::TimestampMicrosecond(Some(-1), None),
-            )
-            .is_none());
+            let source = StructField::new(
+                1,
+                "id",
+                false,
+                Type::Primitive(PrimitiveType::Timestamp),
+                None,
+            );
+            let partition = PartitionField::new(1, 1000, "partition_id", transform.clone());
+            let fields = [BoundPartitionField::new(&partition, &source)];
+            let cases = if transform == Transform::Hour {
+                vec![(Operator::Eq, [false, true, true, false])]
+            } else {
+                vec![
+                    (Operator::Eq, [false, true, true, false]),
+                    (Operator::Lt, [true, true, true, false]),
+                    (Operator::Gt, [false, true, true, true]),
+                ]
+            };
+            for (op, expected) in cases {
+                let expr = project_id_predicate(
+                    transform.clone(),
+                    PrimitiveType::Timestamp,
+                    op,
+                    ScalarValue::TimestampMicrosecond(Some(-1), None),
+                )
+                .expect("pre-epoch timestamp should permit conservative pruning");
+                let physical = create_physical_expr(
+                    &expr,
+                    &schema.clone().try_into().unwrap(),
+                    state.execution_props(),
+                    &PhysicalPlanningContext::default(),
+                )
+                .unwrap();
+                let predicate = PruningPredicateBuilder::new()
+                    .with_file_schema(schema.clone())
+                    .try_build(physical)
+                    .unwrap();
+                assert_eq!(
+                    predicate
+                        .prune(&PruneManifests::new(&fields, 1, &manifests))
+                        .unwrap(),
+                    expected,
+                    "{transform:?} {op:?} must retain floor and legacy IDs"
+                );
+            }
+            if transform == Transform::Hour {
+                for op in [Operator::Lt, Operator::LtEq, Operator::Gt, Operator::GtEq] {
+                    assert!(
+                        project_id_predicate(
+                            Transform::Hour,
+                            PrimitiveType::Timestamp,
+                            op,
+                            ScalarValue::TimestampMicrosecond(Some(-1), None),
+                        )
+                        .is_none(),
+                        "negative hour ranges cannot safely prune wrapped partition IDs"
+                    );
+                }
+                assert!(
+                    project_id_predicate(
+                        Transform::Hour,
+                        PrimitiveType::Timestamp,
+                        Operator::Eq,
+                        ScalarValue::TimestampMicrosecond(Some(-7_730_941_136_400_000_000), None),
+                    )
+                    .is_none(),
+                    "out-of-range hour ID must not overflow its adjacent candidate"
+                );
+            }
         }
-        assert!(project_id_predicate(
+        let extreme_day = project_id_predicate(
+            Transform::Day,
+            PrimitiveType::Timestamp,
+            Operator::Eq,
+            ScalarValue::TimestampMicrosecond(Some(i64::MIN), None),
+        )
+        .expect("extreme pre-epoch day should project without Chrono conversion");
+        let Expr::BinaryExpr(BinaryExpr {
+            left,
+            op: Operator::And,
+            ..
+        }) = extreme_day
+        else {
+            panic!("expected conservative day interval");
+        };
+        let Expr::BinaryExpr(BinaryExpr { right, .. }) = *left else {
+            panic!("expected lower day bound");
+        };
+        assert_eq!(
+            *right,
+            Expr::Literal(
+                ScalarValue::Int32(Some(
+                    i32::try_from(i64::MIN.div_euclid(86_400_000_000)).unwrap()
+                )),
+                None
+            )
+        );
+        let date = project_id_predicate(
             Transform::Day,
             PrimitiveType::Date,
             Operator::Eq,
             ScalarValue::Date32(Some(-1)),
         )
-        .is_some());
+        .expect("Date32 does not need a legacy timestamp candidate");
+        assert!(matches!(
+            date,
+            Expr::BinaryExpr(BinaryExpr {
+                op: Operator::Eq,
+                ..
+            })
+        ));
     }
 
     #[test]
