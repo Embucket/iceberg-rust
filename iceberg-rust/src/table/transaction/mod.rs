@@ -25,7 +25,9 @@ use iceberg_rust_spec::spec::{
 use crate::table::transaction::append::append_summary;
 use crate::table::transaction::operation::SequenceGroup;
 use crate::{
-    catalog::commit::{CommitTable, TableRequirement},
+    catalog::commit::{
+        apply_table_updates, check_table_requirements, CommitTable, TableRequirement,
+    },
     error::Error,
     table::Table,
 };
@@ -551,21 +553,40 @@ impl<'table> TableTransaction<'table> {
         )?;
         let catalog = self.table.catalog();
         let identifier = self.table.identifier.clone();
+        let base_metadata = self.table.metadata();
+        let mut staged_metadata = self
+            .operations
+            .iter()
+            .flatten()
+            .nth(1)
+            .map(|_| base_metadata.clone());
 
-        // Execute the table operations
         let (mut requirements, mut updates) = (
             vec![TableRequirement::AssertTableUuid {
-                uuid: self.table.metadata().table_uuid,
+                uuid: base_metadata.table_uuid,
             }],
             Vec::new(),
         );
         for operation in self.operations.into_iter().flatten() {
+            let metadata = staged_metadata.as_ref().unwrap_or(base_metadata);
             let (requirement, update) = operation
-                .execute(self.table.metadata(), self.table.object_store())
+                .execute(metadata, self.table.object_store())
                 .await?;
 
             if let Some(requirement) = requirement {
-                requirements.push(requirement);
+                if staged_metadata.is_some() {
+                    if !check_table_requirements(std::slice::from_ref(&requirement), metadata) {
+                        return Err(Error::CommitConflict(identifier.to_string()));
+                    }
+                    if check_table_requirements(std::slice::from_ref(&requirement), base_metadata) {
+                        requirements.push(requirement);
+                    }
+                } else {
+                    requirements.push(requirement);
+                }
+            }
+            if let Some(staged_metadata) = staged_metadata.as_mut() {
+                apply_table_updates(staged_metadata, update.clone())?;
             }
             updates.extend(update);
         }

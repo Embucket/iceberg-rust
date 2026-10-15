@@ -14,12 +14,13 @@ use iceberg_rust::catalog::Catalog;
 use iceberg_rust::error::Error;
 use iceberg_rust::object_store::ObjectStoreBuilder;
 use iceberg_rust::table::Table;
-use iceberg_rust_spec::spec::manifest::Status;
+use iceberg_rust_spec::manifest::FileFormat;
+use iceberg_rust_spec::spec::manifest::{Content, DataFile, Status};
 use iceberg_rust_spec::spec::partition::{PartitionField, PartitionSpec, Transform};
 use iceberg_rust_spec::spec::schema::Schema;
 use iceberg_rust_spec::spec::table_metadata::FormatVersion;
 use iceberg_rust_spec::spec::types::{PrimitiveType, StructField, Type};
-use iceberg_rust_spec::spec::values::Value;
+use iceberg_rust_spec::spec::values::{Struct, Value};
 use iceberg_sql_catalog::SqlCatalog;
 
 #[tokio::test]
@@ -120,6 +121,96 @@ async fn uuidless_v1_table_write_is_rejected_before_commit() {
         .await
         .expect_err("UUID-less v1 table writes cannot be fenced");
     assert!(matches!(error, Error::NotSupported(_)));
+}
+
+#[tokio::test]
+async fn v3_append_then_overwrite_in_one_transaction_stages_row_lineage() {
+    let catalog: Arc<dyn Catalog> = Arc::new(
+        SqlCatalog::new("sqlite://", "test", ObjectStoreBuilder::memory())
+            .await
+            .unwrap(),
+    );
+    let schema = Schema::builder()
+        .with_struct_field(StructField::new(
+            1,
+            "id",
+            true,
+            Type::Primitive(PrimitiveType::Long),
+            None,
+        ))
+        .build()
+        .unwrap();
+    let mut table = Table::builder()
+        .with_name("staged_v3_lineage")
+        .with_location("/test/staged_v3_lineage")
+        .with_schema(schema)
+        .with_property(("format-version".to_owned(), "3".to_owned()))
+        .build(&["test".to_owned()], catalog.clone())
+        .await
+        .unwrap();
+    assert_eq!(table.metadata().format_version, FormatVersion::V3);
+
+    let data_file = |name: &str, rows| {
+        DataFile::builder()
+            .with_content(Content::Data)
+            .with_file_path(format!("s3://tests/staged_v3_lineage/{name}.parquet"))
+            .with_file_format(FileFormat::Parquet)
+            .with_partition(Struct::from_iter(Vec::<(String, Option<Value>)>::new()))
+            .with_record_count(rows)
+            .with_file_size_in_bytes(100)
+            .with_column_sizes(None)
+            .with_value_counts(None)
+            .with_null_value_counts(None)
+            .with_nan_value_counts(None)
+            .with_distinct_counts(None)
+            .with_lower_bounds(None)
+            .with_upper_bounds(None)
+            .build()
+            .unwrap()
+    };
+    let mut stale = table.clone();
+
+    table
+        .new_transaction(None)
+        .append_data(vec![data_file("first", 3)])
+        .overwrite(vec![data_file("second", 2)], HashMap::new())
+        .commit()
+        .await
+        .unwrap();
+    let stale_error = stale
+        .new_transaction(None)
+        .append_data(vec![data_file("stale-first", 1)])
+        .overwrite(vec![data_file("stale-second", 1)], HashMap::new())
+        .commit()
+        .await
+        .expect_err("stale multi-operation commit must fail catalog requirements");
+    assert!(matches!(
+        stale_error,
+        Error::InvalidFormat(message) if message == "Table requirements not valid"
+    ));
+
+    let Tabular::Table(loaded) = catalog.load_tabular(table.identifier()).await.unwrap() else {
+        panic!("staged_v3_lineage should be a table");
+    };
+    let metadata = loaded.metadata();
+    assert_eq!(metadata.snapshots.len(), 2);
+    let first = metadata
+        .snapshots
+        .values()
+        .find(|snapshot| *snapshot.sequence_number() == 1)
+        .unwrap();
+    let second = metadata
+        .snapshots
+        .values()
+        .find(|snapshot| *snapshot.sequence_number() == 2)
+        .unwrap();
+    assert_eq!(*first.first_row_id(), Some(0));
+    assert_eq!(*first.added_rows(), Some(3));
+    assert_eq!(*second.parent_snapshot_id(), Some(*first.snapshot_id()));
+    assert_eq!(*second.first_row_id(), Some(3));
+    assert_eq!(*second.added_rows(), Some(2));
+    assert_eq!(metadata.next_row_id, 5);
+    assert_eq!(metadata.current_snapshot_id, Some(*second.snapshot_id()));
 }
 
 #[tokio::test]
