@@ -28,8 +28,20 @@ pub fn object_store_path_from_metadata(
     if !path.is_ascii() || has_invalid_percent_escape(path) {
         Ok(ObjectPath::from(path))
     } else {
-        ObjectPath::parse(path)
+        match ObjectPath::parse(path) {
+            Ok(path) => Ok(path),
+            Err(object_store::path::Error::EmptySegment { .. }) => Ok(ObjectPath::from(path)),
+            Err(error) => Err(error),
+        }
     }
+}
+
+pub(crate) fn legacy_object_store_path_from_metadata(
+    location: &str,
+    preferred: &ObjectPath,
+) -> Option<ObjectPath> {
+    let legacy = ObjectPath::from(iceberg_rust_spec::util::strip_prefix(location));
+    (legacy != *preferred).then_some(legacy)
 }
 
 pub(crate) async fn read_metadata_object(
@@ -110,6 +122,10 @@ mod metadata_path_tests {
             object_store_path_from_metadata("/data/name=%E6%97%A5%F0%9F%98%80/part.parquet")
                 .unwrap(),
             ObjectPath::from("/data/name=日😀/part.parquet")
+        );
+        assert_eq!(
+            object_store_path_from_metadata("s3://bucket/table//data/part.parquet").unwrap(),
+            ObjectPath::from("/table//data/part.parquet")
         );
     }
 
