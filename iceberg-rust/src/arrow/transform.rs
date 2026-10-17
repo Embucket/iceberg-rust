@@ -14,7 +14,10 @@
 use std::sync::Arc;
 
 use arrow::{
-    array::{as_primitive_array, downcast_array, Array, ArrayRef, PrimitiveArray, StringArray},
+    array::{
+        as_primitive_array, downcast_array, Array, ArrayRef, LargeStringArray, PrimitiveArray,
+        StringArray, StringViewArray,
+    },
     buffer::ScalarBuffer,
     compute::{binary, cast, date_part, unary, DatePart},
     datatypes::{
@@ -59,6 +62,13 @@ pub fn transform_arrow(array: ArrayRef, transform: &Transform) -> Result<ArrayRe
     if let Transform::Bucket(width) = transform {
         if *width == 0 || *width > i32::MAX as u32 {
             return Err(ArrowError::ComputeError("Invalid bucket width".to_owned()));
+        }
+    }
+    if let Transform::Truncate(width) = transform {
+        if *width == 0 {
+            return Err(ArrowError::ComputeError(
+                "Invalid truncate width".to_owned(),
+            ));
         }
     }
     match (array.data_type(), transform) {
@@ -175,21 +185,57 @@ pub fn transform_arrow(array: ArrayRef, transform: &Transform) -> Result<ArrayRe
                 |value| bucket(&value.to_le_bytes(), *m),
             )))
         }
-        (DataType::Int16, Transform::Truncate(m)) => Ok(Arc::<PrimitiveArray<Int16Type>>::new(
-            unary(as_primitive_array::<Int16Type>(&array), |i| {
-                i - i.rem_euclid(*m as i16)
-            }),
-        )),
-        (DataType::Int32, Transform::Truncate(m)) => Ok(Arc::<PrimitiveArray<Int32Type>>::new(
-            unary(as_primitive_array::<Int32Type>(&array), |i| {
-                i - i.rem_euclid(*m as i32)
-            }),
-        )),
+        (DataType::Int16, Transform::Truncate(m)) => {
+            let width = i16::try_from(*m)
+                .map_err(|_| ArrowError::ComputeError("Invalid truncate width".to_owned()))?;
+            Ok(Arc::<PrimitiveArray<Int16Type>>::new(unary(
+                as_primitive_array::<Int16Type>(&array),
+                |i| i - i.rem_euclid(width),
+            )))
+        }
+        (DataType::Int32, Transform::Truncate(m)) => {
+            let width = i32::try_from(*m)
+                .map_err(|_| ArrowError::ComputeError("Invalid truncate width".to_owned()))?;
+            Ok(Arc::<PrimitiveArray<Int32Type>>::new(unary(
+                as_primitive_array::<Int32Type>(&array),
+                |i| i - i.rem_euclid(width),
+            )))
+        }
         (DataType::Int64, Transform::Truncate(m)) => Ok(Arc::<PrimitiveArray<Int64Type>>::new(
             unary(as_primitive_array::<Int64Type>(&array), |i| {
-                i - i.rem_euclid(*m as i64)
+                i - i.rem_euclid(i64::from(*m))
             }),
         )),
+        (DataType::Utf8, Transform::Truncate(m)) => {
+            let width = usize::try_from(*m)
+                .map_err(|_| ArrowError::ComputeError("Invalid truncate width".to_owned()))?;
+            let values = downcast_array::<StringArray>(&array);
+            Ok(Arc::new(StringArray::from_iter(
+                values
+                    .iter()
+                    .map(|value| value.map(|v| truncate_str(v, width))),
+            )))
+        }
+        (DataType::LargeUtf8, Transform::Truncate(m)) => {
+            let width = usize::try_from(*m)
+                .map_err(|_| ArrowError::ComputeError("Invalid truncate width".to_owned()))?;
+            let values = downcast_array::<LargeStringArray>(&array);
+            Ok(Arc::new(LargeStringArray::from_iter(
+                values
+                    .iter()
+                    .map(|value| value.map(|v| truncate_str(v, width))),
+            )))
+        }
+        (DataType::Utf8View, Transform::Truncate(m)) => {
+            let width = usize::try_from(*m)
+                .map_err(|_| ArrowError::ComputeError("Invalid truncate width".to_owned()))?;
+            let values = downcast_array::<StringViewArray>(&array);
+            Ok(Arc::new(StringViewArray::from_iter(
+                values
+                    .iter()
+                    .map(|value| value.map(|v| truncate_str(v, width))),
+            )))
+        }
         (DataType::Int32, Transform::Bucket(m)) => Ok(Arc::<PrimitiveArray<Int32Type>>::new(
             unary(as_primitive_array::<Int32Type>(&array), |i| {
                 bucket(&(i as i64).to_le_bytes(), *m)
@@ -244,6 +290,20 @@ pub fn transform_arrow(array: ArrayRef, transform: &Transform) -> Result<ArrayRe
 }
 
 #[inline]
+fn truncate_str(value: &str, width: usize) -> &str {
+    if value.len() <= width {
+        value
+    } else if value.as_bytes()[..width].is_ascii() {
+        &value[..width]
+    } else {
+        value
+            .char_indices()
+            .nth(width)
+            .map_or(value, |(end, _)| &value[..end])
+    }
+}
+
+#[inline]
 fn micros_to_days(a: i64) -> i32 {
     a.div_euclid(MICROS_IN_DAY) as i32
 }
@@ -275,8 +335,86 @@ mod tests {
 
     use super::*;
     use arrow::array::{
-        ArrayRef, Date32Array, TimestampMicrosecondArray, TimestampNanosecondArray,
+        ArrayRef, Date32Array, Int16Array, StringArray, TimestampMicrosecondArray,
+        TimestampNanosecondArray,
     };
+
+    #[test]
+    fn truncate_string_uses_unicode_code_points_for_all_arrow_encodings() -> Result<(), ArrowError>
+    {
+        let source: ArrayRef = Arc::new(StringArray::from(vec![
+            Some("日😀e\u{0301}X"),
+            Some("ascii"),
+            Some("abé"),
+            Some("é"),
+            None,
+        ]));
+        let expected: ArrayRef = Arc::new(StringArray::from(vec![
+            Some("日😀"),
+            Some("as"),
+            Some("ab"),
+            Some("é"),
+            None,
+        ]));
+        for data_type in [DataType::Utf8, DataType::LargeUtf8, DataType::Utf8View] {
+            let input = cast(&source, &data_type)?;
+            let expected = cast(&expected, &data_type)?;
+            assert_eq!(
+                transform_arrow(input, &Transform::Truncate(2))?.to_data(),
+                expected.to_data()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn truncate_invalid_width_returns_error() {
+        let values: ArrayRef = Arc::new(Int16Array::from(vec![1, 2]));
+        assert!(transform_arrow(Arc::clone(&values), &Transform::Truncate(0)).is_err());
+        assert!(transform_arrow(values, &Transform::Truncate(65_536)).is_err());
+    }
+
+    #[test]
+    #[ignore = "local truncate throughput comparison; run with --ignored --nocapture"]
+    fn benchmark_string_truncate_against_arrow_kernel() -> Result<(), ArrowError> {
+        use std::{hint::black_box, time::Instant};
+
+        use arrow::compute::kernels::substring::substring_by_char;
+
+        for (name, value) in [
+            ("ascii", "abcdefghijklmnopqrstuvwx"),
+            ("unicode", "日😀abcdefghijklmnopqrstuvwx"),
+        ] {
+            let values: ArrayRef = Arc::new(StringArray::from_iter_values(std::iter::repeat_n(
+                value, 100_000,
+            )));
+            let typed = downcast_array::<StringArray>(&values);
+            let mut ours = std::time::Duration::ZERO;
+            let mut arrow = std::time::Duration::ZERO;
+            for _ in 0..10 {
+                let start = Instant::now();
+                black_box(transform_arrow(
+                    Arc::clone(&values),
+                    &Transform::Truncate(2),
+                )?);
+                ours += start.elapsed();
+
+                let start = Instant::now();
+                black_box(substring_by_char(&typed, 0, Some(2))?);
+                arrow += start.elapsed();
+            }
+            let scalar = iceberg_rust_spec::spec::values::Value::String(value.to_owned());
+            let start = Instant::now();
+            for _ in 0..1_000_000 {
+                black_box(scalar.transform(&Transform::Truncate(2)).unwrap());
+            }
+            let scalar_elapsed = start.elapsed();
+            eprintln!(
+                "{name}: ours {ours:?}, arrow {arrow:?}, scalar {scalar_elapsed:?} for 1M rows"
+            );
+        }
+        Ok(())
+    }
 
     fn create_date32_array() -> ArrayRef {
         Arc::new(Date32Array::from(vec![

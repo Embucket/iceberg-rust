@@ -441,18 +441,31 @@ impl Value {
                 let hash = murmur3::murmur3_32(&mut Cursor::new(bytes), 0)?;
                 Ok(Value::Int(((hash & i32::MAX as u32) % n) as i32))
             }
-            Transform::Truncate(w) => match self {
-                Value::Int(i) => Ok(Value::Int(i - i.rem_euclid(*w as i32))),
-                Value::LongInt(i) => Ok(Value::LongInt(i - i.rem_euclid(*w as i64))),
-                Value::String(s) => {
-                    let mut s = s.clone();
-                    s.truncate(*w as usize);
-                    Ok(Value::String(s))
+            Transform::Truncate(w) => {
+                if *w == 0 {
+                    return Err(Error::InvalidFormat("truncate width".to_owned()));
                 }
-                _ => Err(Error::NotSupported(
-                    "Datatype for truncate partition transform.".to_string(),
-                )),
-            },
+                let width = usize::try_from(*w)
+                    .map_err(|_| Error::InvalidFormat("truncate width".to_owned()))?;
+                match self {
+                    Value::Int(i) => {
+                        let width = i32::try_from(*w)
+                            .map_err(|_| Error::InvalidFormat("truncate width".to_owned()))?;
+                        Ok(Value::Int(i - i.rem_euclid(width)))
+                    }
+                    Value::LongInt(i) => {
+                        let width = i64::from(*w);
+                        Ok(Value::LongInt(i - i.rem_euclid(width)))
+                    }
+                    Value::String(s) => {
+                        let end = s.char_indices().nth(width).map_or(s.len(), |(i, _)| i);
+                        Ok(Value::String(s[..end].to_owned()))
+                    }
+                    _ => Err(Error::NotSupported(
+                        "Datatype for truncate partition transform.".to_string(),
+                    )),
+                }
+            }
             Transform::Year => match self {
                 Value::Date(date) => Ok(Value::Int(date_to_years(&days_to_date(*date)))),
                 Value::Timestamp(time) => Ok(Value::Int(
@@ -1744,6 +1757,16 @@ mod tests {
         let value = Value::String("Hello, World!".to_string());
         let result = value.transform(&Transform::Truncate(5)).unwrap();
         assert_eq!(result, Value::String("Hello".to_string()));
+
+        let unicode = Value::String("日😀e\u{0301}X".to_string());
+        assert_eq!(
+            unicode.transform(&Transform::Truncate(4)).unwrap(),
+            Value::String("日😀e\u{0301}".to_string())
+        );
+        assert_eq!(
+            unicode.transform(&Transform::Truncate(20)).unwrap(),
+            unicode
+        );
     }
 
     #[test]
@@ -2630,20 +2653,26 @@ mod tests {
     }
 
     #[test]
-    fn test_truncate_int_zero_width_panics_and_negative_width_unreachable_at_type_level() {
+    fn test_truncate_zero_width_is_rejected() {
         // Rust's Transform::Truncate(u32) cannot carry a negative width by construction
         // (the upstream contract requires a runtime check; in Rust the type system enforces it).
-        // Width=0 makes the implementation call i32::rem_euclid(0), which panics — semantic
-        // equivalent of Java's IllegalArgumentException.
         let size_of_u32 = std::mem::size_of::<u32>();
         assert_eq!(
             size_of_u32, 4,
             "Transform::Truncate(u32) prevents negative widths"
         );
 
-        let value = Value::Int(100);
-        let result = std::panic::catch_unwind(|| value.transform(&Transform::Truncate(0)));
-        assert!(result.is_err(), "truncate with width=0 should panic");
+        for value in [
+            Value::Int(100),
+            Value::LongInt(100),
+            Value::String("abc".to_owned()),
+            Value::Binary(vec![1, 2, 3]),
+        ] {
+            assert!(matches!(
+                value.transform(&Transform::Truncate(0)),
+                Err(Error::InvalidFormat(_))
+            ));
+        }
     }
 
     #[test]
