@@ -29,6 +29,7 @@ use smallvec::SmallVec;
 
 use crate::{
     error::Error,
+    object_store::read_metadata_object,
     table::datafiles,
     util::{summary_to_rectangle, Rectangle, Vec4},
 };
@@ -249,11 +250,8 @@ pub(crate) async fn hydrate_v1_manifest_list_row_counts(
                 return Ok(entry);
             }
 
-            let manifest_bytes = object_store
-                .get(&strip_prefix(&entry.manifest_path).into())
-                .await?
-                .bytes()
-                .await?;
+            let manifest_bytes =
+                read_metadata_object(object_store.as_ref(), &entry.manifest_path).await?;
             let mut file_counts = [0_i32; 3];
             let mut row_counts = [0_i64; 3];
             for manifest_entry in ManifestReader::new(&manifest_bytes[..])? {
@@ -329,8 +327,7 @@ pub(crate) async fn read_snapshot<'metadata>(
     let data = match crate::util::manifest_cache::get(uri) {
         Some(bytes) => bytes,
         None => {
-            let path = strip_prefix(uri);
-            let bytes = object_store.get(&path.into()).await?.bytes().await?;
+            let bytes = read_metadata_object(object_store.as_ref(), uri).await?;
             crate::util::manifest_cache::put(uri, &bytes);
             bytes
         }
@@ -389,10 +386,7 @@ pub async fn snapshot_partition_bounds(
     object_store: Arc<dyn ObjectStore>,
 ) -> Result<Option<Rectangle>, Error> {
     let bytes: Cursor<Vec<u8>> = Cursor::new(
-        object_store
-            .get(&strip_prefix(snapshot.manifest_list()).into())
-            .await?
-            .bytes()
+        read_metadata_object(object_store.as_ref(), snapshot.manifest_list())
             .await?
             .into(),
     );
@@ -435,11 +429,7 @@ pub async fn snapshot_partition_bounds_with_nulls(
     table_metadata: &TableMetadata,
     object_store: Arc<dyn ObjectStore>,
 ) -> Result<Option<PartitionBoundsWithNulls>, Error> {
-    let bytes = object_store
-        .get(&strip_prefix(snapshot.manifest_list()).into())
-        .await?
-        .bytes()
-        .await?;
+    let bytes = read_metadata_object(object_store.as_ref(), snapshot.manifest_list()).await?;
     let reader = ManifestListReader::new_with_schema(
         Cursor::new(bytes),
         table_metadata,
@@ -1793,12 +1783,8 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
                     .map(ToOwned::to_owned)
                     .collect();
 
-                let bytes = object_store
-                    .clone()
-                    .get(&strip_prefix(&manifest.manifest_path).into())
-                    .await?
-                    .bytes()
-                    .await?;
+                let bytes =
+                    read_metadata_object(object_store.as_ref(), &manifest.manifest_path).await?;
 
                 let manifest_reader = ManifestReader::new(bytes.as_ref())?;
                 let source_metadata = (manifest.partition_spec_id
@@ -1893,6 +1879,7 @@ mod tests {
             values::{Struct, Value},
         },
     };
+    use object_store::{memory::InMemory, path::Path as ObjectPath, ObjectStoreExt};
 
     fn test_metadata(format_version: FormatVersion) -> TableMetadata {
         let schema = SchemaBuilder::default()
@@ -1915,6 +1902,138 @@ mod tests {
             .schemas(HashMap::from_iter([(0, schema)]))
             .build()
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn read_snapshot_uses_encoded_manifest_list_key() {
+        let metadata = test_metadata(FormatVersion::V2);
+        let uri = "s3://tests/table/metadata/name=%E6%97%A5%F0%9F%98%80/snap.avro";
+        let snapshot = SnapshotBuilder::default()
+            .with_snapshot_id(1)
+            .with_sequence_number(1)
+            .with_timestamp_ms(1)
+            .with_manifest_list(uri.to_string())
+            .with_summary(Summary::default())
+            .with_schema_id(0)
+            .build()
+            .expect("snapshot");
+        let bytes = AvroWriter::new(manifest_list_schema_v2(), Vec::new())
+            .into_inner()
+            .expect("manifest list bytes");
+        let store = Arc::new(InMemory::new());
+        store
+            .put(
+                &ObjectPath::parse("table/metadata/name=%E6%97%A5%F0%9F%98%80/snap.avro")
+                    .expect("object key"),
+                bytes.into(),
+            )
+            .await
+            .expect("store manifest list");
+
+        let entries = read_snapshot(&snapshot, &metadata, store)
+            .await
+            .expect("read manifest list")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("decode manifest list");
+        assert!(entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn read_snapshot_falls_back_to_legacy_manifest_list_key() {
+        let metadata = test_metadata(FormatVersion::V2);
+        let uri = "s3://tests/table/metadata/name=%E6%97%A5/legacy.avro";
+        let snapshot = SnapshotBuilder::default()
+            .with_snapshot_id(2)
+            .with_sequence_number(1)
+            .with_timestamp_ms(1)
+            .with_manifest_list(uri.to_string())
+            .with_summary(Summary::default())
+            .with_schema_id(0)
+            .build()
+            .expect("snapshot");
+        let bytes = AvroWriter::new(manifest_list_schema_v2(), Vec::new())
+            .into_inner()
+            .expect("manifest list bytes");
+        let store = Arc::new(InMemory::new());
+        store
+            .put(
+                &ObjectPath::from("table/metadata/name=%E6%97%A5/legacy.avro"),
+                bytes.into(),
+            )
+            .await
+            .expect("store legacy manifest list");
+
+        let entries = read_snapshot(&snapshot, &metadata, store)
+            .await
+            .expect("read legacy manifest list")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("decode legacy manifest list");
+        assert!(entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn overwrite_reads_encoded_manifest_key() {
+        let metadata = test_metadata(FormatVersion::V2);
+        let uri = "s3://tests/table/metadata/name=%E6%97%A5/manifest.avro";
+        let partition_fields = metadata
+            .current_partition_fields()
+            .expect("partition fields");
+        let schema = ManifestEntry::schema(
+            &partition_value_schema(&partition_fields).expect("partition values"),
+            &metadata.format_version,
+        )
+        .expect("manifest schema");
+        let store = Arc::new(InMemory::new());
+        let manifest = ManifestWriter::new(uri, 1, &schema, &metadata, Content::Data)
+            .expect("manifest writer")
+            .finish(store.clone())
+            .await
+            .expect("write manifest");
+        let legacy = ObjectPath::from(strip_prefix(uri));
+        let encoded = ObjectPath::parse("table/metadata/name=%E6%97%A5/manifest.avro")
+            .expect("encoded object key");
+        let bytes = store
+            .get(&legacy)
+            .await
+            .expect("legacy manifest")
+            .bytes()
+            .await
+            .expect("manifest bytes");
+        store
+            .put(&encoded, bytes.into())
+            .await
+            .expect("encoded manifest");
+        store.delete(&legacy).await.expect("remove legacy manifest");
+
+        let data_file = DataFile::builder()
+            .with_content(iceberg_rust_spec::manifest::Content::Data)
+            .with_file_path("new-file.parquet".to_string())
+            .with_file_format(FileFormat::Parquet)
+            .with_partition(Struct::from_iter(Vec::<(String, Option<Value>)>::new()))
+            .with_record_count(1)
+            .with_file_size_in_bytes(100)
+            .with_column_sizes(None)
+            .with_value_counts(None)
+            .with_null_value_counts(None)
+            .with_nan_value_counts(None)
+            .with_distinct_counts(None)
+            .with_lower_bounds(None)
+            .with_upper_bounds(None)
+            .build()
+            .expect("data file");
+        let list_schema = manifest_list_schema_v2();
+        let mut list_writer =
+            ManifestListWriter::new(std::iter::once(&data_file), list_schema, &metadata)
+                .expect("manifest list writer");
+        list_writer
+            .append_and_filter(
+                vec![manifest],
+                &HashMap::from([(uri.to_string(), Vec::new())]),
+                store,
+                2,
+            )
+            .await
+            .expect("overwrite encoded manifest");
     }
 
     #[test]

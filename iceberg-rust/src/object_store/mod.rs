@@ -11,7 +11,7 @@ use object_store::{
     local::LocalFileSystem,
     memory::InMemory,
     path::Path as ObjectPath,
-    ObjectStore,
+    ObjectStore, ObjectStoreExt,
 };
 
 use crate::error::Error;
@@ -30,6 +30,26 @@ pub fn object_store_path_from_metadata(
     } else {
         ObjectPath::parse(path)
     }
+}
+
+pub(crate) async fn read_metadata_object(
+    object_store: &dyn ObjectStore,
+    location: &str,
+) -> Result<bytes::Bytes, Error> {
+    let legacy = ObjectPath::from(iceberg_rust_spec::util::strip_prefix(location));
+    let path = object_store_path_from_metadata(location).unwrap_or_else(|_| legacy.clone());
+    let result = match object_store.get(&path).await {
+        Ok(result) => result,
+        Err(error @ object_store::Error::NotFound { .. }) => {
+            // Older writers encoded URI escapes again when constructing object-store keys.
+            if legacy == path {
+                return Err(error.into());
+            }
+            object_store.get(&legacy).await?
+        }
+        Err(error) => return Err(error.into()),
+    };
+    Ok(result.bytes().await?)
 }
 
 fn has_invalid_percent_escape(path: &str) -> bool {
@@ -53,7 +73,7 @@ fn has_invalid_percent_escape(path: &str) -> bool {
 
 #[cfg(test)]
 mod metadata_path_tests {
-    use super::{object_store_path_from_metadata, ObjectPath};
+    use super::{object_store_path_from_metadata, read_metadata_object, ObjectPath};
     use object_store::{memory::InMemory, ObjectStoreExt};
 
     #[test]
@@ -138,6 +158,50 @@ mod metadata_path_tests {
             assert_eq!(from_metadata, written);
             assert!(store.get(&from_metadata).await.is_ok());
         }
+    }
+
+    #[tokio::test]
+    async fn metadata_read_prefers_encoded_key_and_falls_back_to_legacy_key() {
+        let store = InMemory::new();
+        let uri = "s3://bucket/table/name=%E6%97%A5/manifest.avro";
+        let encoded = ObjectPath::parse("table/name=%E6%97%A5/manifest.avro").expect("encoded");
+        let legacy = ObjectPath::from("table/name=%E6%97%A5/manifest.avro");
+        store
+            .put(&legacy, bytes::Bytes::from_static(b"legacy").into())
+            .await
+            .expect("legacy put");
+        assert_eq!(
+            read_metadata_object(&store, uri)
+                .await
+                .expect("legacy read"),
+            bytes::Bytes::from_static(b"legacy")
+        );
+        store
+            .put(&encoded, bytes::Bytes::from_static(b"encoded").into())
+            .await
+            .expect("encoded put");
+        assert_eq!(
+            read_metadata_object(&store, uri)
+                .await
+                .expect("encoded read"),
+            bytes::Bytes::from_static(b"encoded")
+        );
+
+        let trailing_slash_uri = "s3://bucket/table//metadata/snap.avro";
+        let trailing_slash_key = ObjectPath::from("table//metadata/snap.avro");
+        store
+            .put(
+                &trailing_slash_key,
+                bytes::Bytes::from_static(b"trailing slash").into(),
+            )
+            .await
+            .expect("trailing slash put");
+        assert_eq!(
+            read_metadata_object(&store, trailing_slash_uri)
+                .await
+                .expect("trailing slash read"),
+            bytes::Bytes::from_static(b"trailing slash")
+        );
     }
 }
 
