@@ -5,7 +5,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use futures::{future, TryStreamExt};
+use futures::TryStreamExt;
 use iceberg_rust::{
     catalog::{
         commit::{
@@ -31,7 +31,8 @@ use iceberg_rust::{
     table::Table,
     view::View,
 };
-use object_store::{ObjectStore, ObjectStoreExt};
+use object_store::{path::Path as ObjectPath, ObjectStore, ObjectStoreExt};
+use percent_encoding::percent_decode_str;
 
 use crate::error::Error;
 
@@ -230,13 +231,15 @@ impl Catalog for FileCatalog {
         } else {
             let bucket = Bucket::from_path(&self.path)?;
             let object_store = self.object_store.build(bucket)?;
-            let bytes = object_store
-                .get(&strip_prefix(&metadata_location).as_str().into())
+            object_store
+                .get_metadata(&metadata_location)
                 .await
-                .map_err(|_| IcebergError::CatalogNotFound)?
-                .bytes()
-                .await?;
-            serde_json::from_slice(&bytes)?
+                .map_err(|error| match error {
+                    IcebergError::ObjectStore(object_store::Error::NotFound { .. }) => {
+                        IcebergError::CatalogNotFound
+                    }
+                    other => other,
+                })?
         };
         if !matches!(metadata, TabularMetadata::Table(_)) {
             return Err(IcebergError::InvalidFormat(format!(
@@ -280,14 +283,15 @@ impl Catalog for FileCatalog {
 
         let metadata_location = self.metadata_location(identifier).await?;
 
-        let bytes = object_store
-            .get(&strip_prefix(&metadata_location).as_str().into())
+        let metadata = object_store
+            .get_metadata(&metadata_location)
             .await
-            .map_err(|_| IcebergError::CatalogNotFound)?
-            .bytes()
-            .await?;
-
-        let metadata: TabularMetadata = serde_json::from_slice(&bytes)?;
+            .map_err(|error| match error {
+                IcebergError::ObjectStore(object_store::Error::NotFound { .. }) => {
+                    IcebergError::CatalogNotFound
+                }
+                other => other,
+            })?;
 
         self.cache.write().unwrap().insert(
             identifier.clone(),
@@ -711,55 +715,52 @@ impl FileCatalog {
             &physical_identifier.namespace()[0],
             physical_identifier.name(),
         ) + "/metadata";
-        let mut files: Vec<String> = object_store
-            .list(Some(&strip_prefix(&path).into()))
-            .map_ok(|x| x.location.to_string())
-            .try_filter(|x| {
-                future::ready(
-                    x.ends_with("metadata.json")
-                        && x.starts_with((strip_prefix(&path) + "/v").trim_start_matches('/')),
-                )
+        let metadata_dir = ObjectPath::from(strip_prefix(&path));
+        let latest = object_store
+            .list(Some(&metadata_dir))
+            .try_fold(None, |latest: Option<(u64, String)>, object| {
+                let direct_child = object
+                    .location
+                    .parent()
+                    .as_ref()
+                    .is_some_and(|parent| parent == &metadata_dir);
+                let path = object.location.to_string();
+                let version = direct_child.then(|| parse_version(&path).ok()).flatten();
+                async move {
+                    Ok::<_, object_store::Error>(match version {
+                        Some(version)
+                            if latest
+                                .as_ref()
+                                .is_none_or(|(current, _)| version >= *current) =>
+                        {
+                            Some((version, path))
+                        }
+                        _ => latest,
+                    })
+                }
             })
-            .try_collect()
             .await
             .map_err(IcebergError::from)?;
-        files.sort_by(|x, y| {
-            let x = x
-                .trim_start_matches((strip_prefix(&path) + "/v").trim_start_matches("/"))
-                .trim_end_matches("/")
-                .trim_end_matches(".metadata.json")
-                .trim_end_matches(".gz")
-                .parse::<usize>()
-                .unwrap();
-            let y = y
-                .trim_start_matches((strip_prefix(&path) + "/v").trim_start_matches("/"))
-                .trim_end_matches("/")
-                .trim_end_matches(".metadata.json")
-                .trim_end_matches(".gz")
-                .parse::<usize>()
-                .unwrap();
-            x.cmp(&y)
-        });
-        files
-            .into_iter()
-            .next_back()
+        latest
+            .map(|(_, path)| path)
             .ok_or(IcebergError::CatalogNotFound)
     }
 
     fn identifier(&self, path: &str) -> Identifier {
         let relative = self.relative_to_root(path);
         let parts: Vec<&str> = relative.split('/').take(2).collect();
-        Identifier::new(&[parts[0].to_owned()], parts[1])
+        let namespace = decode_path_component(parts[0]);
+        let name = decode_path_component(parts[1]);
+        Identifier::new(&[namespace], &name)
     }
 
     fn namespace(&self, path: &str) -> Result<Namespace, IcebergError> {
         let relative = self.relative_to_root(path);
-        let parts = relative
+        let part = relative
             .split('/')
             .next()
-            .ok_or(IcebergError::InvalidFormat("Namespace in path".to_owned()))?
-            .to_owned();
-        Namespace::try_new(&[parts]).map_err(IcebergError::from)
+            .ok_or(IcebergError::InvalidFormat("Namespace in path".to_owned()))?;
+        Namespace::try_new(&[decode_path_component(part)]).map_err(IcebergError::from)
     }
 
     // Project `path` (a value coming back from `ObjectStore::list*`, which has
@@ -771,8 +772,8 @@ impl FileCatalog {
     fn relative_to_root(&self, path: &str) -> String {
         let path = strip_prefix(path);
         let path = path.trim_start_matches('/');
-        let root = strip_prefix(&self.path);
-        let root = root.trim_start_matches('/');
+        let root = ObjectPath::from(strip_prefix(&self.path));
+        let root = root.as_ref();
         path.strip_prefix(root)
             .unwrap_or(path)
             .trim_start_matches('/')
@@ -780,13 +781,23 @@ impl FileCatalog {
     }
 }
 
+fn decode_path_component(component: &str) -> String {
+    percent_decode_str(component)
+        .decode_utf8()
+        .map_or_else(|_| component.to_owned(), |decoded| decoded.into_owned())
+}
+
 fn parse_version(path: &str) -> Result<u64, IcebergError> {
-    path.split('/')
+    let filename = path
+        .split('/')
         .next_back()
-        .ok_or(IcebergError::InvalidFormat("Metadata location".to_owned()))?
-        .trim_start_matches('v')
-        .trim_end_matches(".metadata.json")
-        .trim_end_matches(".gz")
+        .ok_or(IcebergError::InvalidFormat("Metadata location".to_owned()))?;
+    let stem = filename
+        .strip_suffix(".metadata.json")
+        .ok_or_else(|| IcebergError::InvalidFormat(format!("Metadata version in {path}")))?;
+    let stem = stem.strip_suffix(".gz").unwrap_or(stem);
+    stem.strip_prefix('v')
+        .ok_or_else(|| IcebergError::InvalidFormat(format!("Metadata version in {path}")))?
         .parse()
         .map_err(IcebergError::from)
 }
@@ -830,6 +841,13 @@ mod metadata_naming_tests {
             parse_version("/wh/ns/t/metadata/v7.gz.metadata.json").unwrap(),
             7
         );
+        for filename in [
+            "v7metadata.json",
+            "vv7.metadata.json",
+            "v7.other.metadata.json",
+        ] {
+            assert!(parse_version(filename).is_err(), "accepted {filename}");
+        }
     }
 
     /// The final versioned name must carry the same encoding as the file that
@@ -970,7 +988,7 @@ pub mod tests {
             util::strip_prefix,
         },
     };
-    use object_store::ObjectStoreExt;
+    use object_store::{path::Path as ObjectPath, ObjectStoreExt};
     use std::{sync::Arc, time::Duration};
     use testcontainers::{core::ExecCommand, runners::AsyncRunner, ImageExt};
     use testcontainers_modules::localstack::LocalStack;
@@ -981,9 +999,71 @@ pub mod tests {
     use crate::FileCatalog;
 
     #[tokio::test]
+    async fn fresh_catalog_loads_encoded_metadata_paths() {
+        let catalog_path = "/dev/embucket_日";
+        let store = ObjectStoreBuilder::memory();
+        let catalog = Arc::new(FileCatalog::new(catalog_path, store.clone()).await.unwrap());
+        let namespace = Namespace::try_new(&["public_日".to_string()]).unwrap();
+        for name in ["unicode_日😀", "percent_50%"] {
+            let identifier = iceberg_rust::catalog::identifier::Identifier::new(&namespace, name);
+            let schema = Schema::builder()
+                .with_struct_field(StructField {
+                    id: 1,
+                    name: "id".to_string(),
+                    required: true,
+                    field_type: Type::Primitive(PrimitiveType::Long),
+                    doc: None,
+                    initial_default: None,
+                    write_default: None,
+                })
+                .build()
+                .unwrap();
+            let mut builder = CreateTableBuilder::default();
+            builder
+                .with_name(identifier.name())
+                .with_schema(schema)
+                .build(&namespace, catalog.clone())
+                .await
+                .unwrap();
+
+            let bucket = Bucket::from_path(catalog_path).unwrap();
+            let object_store = store.build(bucket).unwrap();
+            for suffix in ["vbroken.metadata.json", "v_archive/v99.metadata.json"] {
+                let location = format!(
+                    "{}/metadata/{suffix}",
+                    catalog.tabular_path(&namespace[0], identifier.name())
+                );
+                object_store
+                    .put(
+                        &ObjectPath::from(strip_prefix(&location)),
+                        b"malformed".to_vec().into(),
+                    )
+                    .await
+                    .unwrap();
+            }
+
+            let fresh = Arc::new(FileCatalog::new(catalog_path, store.clone()).await.unwrap());
+            assert!(fresh
+                .list_namespaces(None)
+                .await
+                .unwrap()
+                .contains(&namespace));
+            let listed = fresh.list_tabulars(&namespace).await.unwrap();
+            assert!(listed.contains(&identifier), "missing {name} in {listed:?}");
+            let listed_identifier = listed.into_iter().find(|id| id == &identifier).unwrap();
+            let Tabular::Table(table) = fresh.load_tabular(&listed_identifier).await.unwrap()
+            else {
+                panic!("expected Iceberg table");
+            };
+            assert_eq!(table.identifier(), &identifier);
+        }
+    }
+
+    #[tokio::test]
     async fn rename_table_in_memory_moves_catalog_identity() {
+        let store = ObjectStoreBuilder::memory();
         let catalog = Arc::new(
-            FileCatalog::new("/dev/embucket", ObjectStoreBuilder::memory())
+            FileCatalog::new("/dev/embucket", store.clone())
                 .await
                 .unwrap(),
         );
@@ -1011,6 +1091,7 @@ pub mod tests {
             .await
             .unwrap();
 
+        let catalog = Arc::new(FileCatalog::new("/dev/embucket", store).await.unwrap());
         catalog.rename_table(&source, &destination).await.unwrap();
 
         assert!(!catalog.tabular_exists(&source).await.unwrap());
