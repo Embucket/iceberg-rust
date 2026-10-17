@@ -15,6 +15,8 @@ use lazy_static::lazy_static;
 use regex::Regex;
 use std::io::{Read, Write};
 
+use super::read_metadata_object;
+
 /// Simplify interaction with iceberg files
 #[async_trait]
 pub trait IcebergStore {
@@ -33,11 +35,7 @@ pub trait IcebergStore {
 #[async_trait]
 impl<T: ObjectStore> IcebergStore for T {
     async fn get_metadata(&self, location: &str) -> Result<TabularMetadata, Error> {
-        let bytes = self
-            .get(&strip_prefix(location).into())
-            .await?
-            .bytes()
-            .await?;
+        let bytes = read_metadata_object(self, location).await?;
 
         parse_metadata(location, &bytes)
     }

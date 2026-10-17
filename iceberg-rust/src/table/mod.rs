@@ -15,11 +15,10 @@ use std::{io::Cursor, sync::Arc};
 use itertools::Itertools;
 use manifest::ManifestReader;
 use manifest_list::read_snapshot;
+use object_store::ObjectStore;
 use object_store::ObjectStoreExt;
-use object_store::{path::Path, ObjectStore};
 
-use futures::{stream, Stream, StreamExt, TryFutureExt, TryStreamExt};
-use iceberg_rust_spec::util::{self};
+use futures::{stream, Stream, StreamExt, TryStreamExt};
 use iceberg_rust_spec::{
     spec::{
         manifest::{Content, FirstRowIdInheritance, ManifestEntry},
@@ -38,6 +37,7 @@ use tracing::{instrument, Instrument};
 use crate::{
     catalog::{create::CreateTableBuilder, identifier::Identifier, Catalog},
     error::Error,
+    object_store::read_metadata_object,
     table::transaction::TableTransaction,
 };
 
@@ -412,10 +412,7 @@ async fn datafiles(
             let data = match crate::util::manifest_cache::get(&manifest_path) {
                 Some(bytes) => bytes,
                 None => {
-                    let path: Path = util::strip_prefix(&manifest_path).into();
-                    let bytes = object_store
-                        .get(&path)
-                        .and_then(|file| file.bytes())
+                    let bytes = read_metadata_object(object_store.as_ref(), &manifest_path)
                         .instrument(tracing::trace_span!("iceberg_rust::get_manifest"))
                         .await?;
                     crate::util::manifest_cache::put(&manifest_path, &bytes);
