@@ -18,7 +18,7 @@ use iceberg_rust::file_format::parquet::{
     parquet_to_datafile, parquet_to_datafile_with_partition,
     ICEBERG_ESTIMATE_INT64_DISTINCT_COUNT_META_KEY,
 };
-use iceberg_rust::object_store::Bucket;
+use iceberg_rust::object_store::{object_store_path_from_metadata, Bucket};
 use iceberg_rust::spec::partition::BoundPartitionField;
 use iceberg_rust::spec::schema::Schema as IcebergSchema;
 use iceberg_rust::spec::table_metadata::{
@@ -123,7 +123,6 @@ use iceberg_rust::{
     spec::{
         arrow::schema::PARQUET_FIELD_ID_META_KEY,
         manifest::{Content, FileFormat as IcebergFileFormat, ManifestEntry, Status},
-        util,
         values::{Struct, Value},
     },
     table::ManifestPath,
@@ -1952,7 +1951,8 @@ fn generate_partitioned_file(
     }
 
     let object_meta = ObjectMeta {
-        location: util::strip_prefix(manifest.data_file().file_path()).into(),
+        location: object_store_path_from_metadata(manifest.data_file().file_path())
+            .map_err(|error| DataFusionError::External(Box::new(error)))?,
         size: *manifest.data_file().file_size_in_bytes() as u64,
         last_modified: {
             let secs = last_updated_ms / 1000;
@@ -1977,6 +1977,22 @@ fn generate_partitioned_file(
         arrow_schema: None,
     };
     Ok(file)
+}
+
+fn position_delete_file_from_metadata(
+    path: &str,
+    size: u64,
+) -> Result<PartitionedFile, DataFusionError> {
+    let location = object_store_path_from_metadata(path)
+        .map_err(|error| DataFusionError::External(Box::new(error)))?;
+    // PartitionedFile::new converts its input back through Path::from.
+    Ok(PartitionedFile::new_from_meta(ObjectMeta {
+        location,
+        size,
+        last_modified: DateTime::UNIX_EPOCH,
+        e_tag: None,
+        version: None,
+    }))
 }
 
 async fn apply_position_deletes(
@@ -2058,15 +2074,13 @@ async fn apply_position_deletes(
         .into_iter()
         .map(|(_, entry)| {
             let data_file = entry.data_file();
-            let mut file = PartitionedFile::new(
-                util::strip_prefix(data_file.file_path()),
-                u64::try_from(*data_file.file_size_in_bytes()).map_err(|_| {
-                    DataFusionError::Execution(format!(
-                        "Position delete file has a negative size: {}",
-                        data_file.file_size_in_bytes()
-                    ))
-                })?,
-            );
+            let size = u64::try_from(*data_file.file_size_in_bytes()).map_err(|_| {
+                DataFusionError::Execution(format!(
+                    "Position delete file has a negative size: {}",
+                    data_file.file_size_in_bytes()
+                ))
+            })?;
+            let mut file = position_delete_file_from_metadata(data_file.file_path(), size)?;
             // Same footer prefetch hint as data files: a cold metadata load of a
             // delete file should also cost one ranged read, not two or three.
             file.metadata_size_hint =
@@ -2178,7 +2192,8 @@ async fn load_deletion_vectors(
                         data_file.file_path()
                     ))
                 })?;
-                let path = Path::from(util::strip_prefix(data_file.file_path()));
+                let path = object_store_path_from_metadata(data_file.file_path())
+                    .map_err(|error| DataFusionError::External(Box::new(error)))?;
                 let blob = object_store
                     .get_range(&path, offset..end)
                     .await
@@ -2852,7 +2867,6 @@ mod tests {
             schema::Schema,
             snapshot::SnapshotBuilder,
             types::{PrimitiveType, StructField, Type},
-            util,
             values::{Struct, Value},
         },
     };
@@ -2877,10 +2891,25 @@ mod tests {
     use crate::{catalog::catalog::IcebergCatalog, table::fake_object_store_url, DataFusionTable};
 
     use super::{
-        group_content_files, has_historical_data_manifests, position_delete_sequence_filter,
-        DataSourceExec, ExecutionPlan, ParquetSource, TableProvider,
+        group_content_files, has_historical_data_manifests, object_store_path_from_metadata,
+        position_delete_file_from_metadata, position_delete_sequence_filter, DataSourceExec,
+        ExecutionPlan, ParquetSource, TableProvider,
     };
     use datafusion::datasource::physical_plan::FileScanConfig;
+
+    #[test]
+    fn position_delete_metadata_path_is_not_reencoded() {
+        let file = position_delete_file_from_metadata(
+            "s3://bucket/data/name=%E6%97%A5%F0%9F%98%80/delete.parquet",
+            123,
+        )
+        .expect("position delete file");
+        assert_eq!(file.object_meta.size, 123);
+        assert_eq!(
+            file.object_meta.location.as_ref(),
+            "data/name=%E6%97%A5%F0%9F%98%80/delete.parquet"
+        );
+    }
 
     /// Walk `plan` and assert every parquet scan node carries the
     /// process-wide metadata cache factory, returning how many were found.
@@ -3456,7 +3485,7 @@ mod tests {
             assert!(!metrics.contains_key(&LAST_UPDATED_SEQUENCE_NUMBER_FIELD_ID));
         }
 
-        let path = util::strip_prefix(file.file_path()).into();
+        let path = object_store_path_from_metadata(file.file_path()).expect("data file path");
         let bytes = table
             .object_store()
             .get(&path)

@@ -7,7 +7,6 @@ use std::{convert, ops::Range, sync::Arc};
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use futures::{future::BoxFuture, stream, FutureExt, Stream, StreamExt, TryFutureExt};
-use iceberg_rust_spec::util;
 use object_store::{path::Path, ObjectStore, ObjectStoreExt};
 use parquet::{
     arrow::{
@@ -18,7 +17,7 @@ use parquet::{
     file::metadata::{ParquetMetaData, ParquetMetaDataReader},
 };
 
-use crate::error::Error;
+use crate::{error::Error, object_store::object_store_path_from_metadata};
 
 use iceberg_rust_spec::spec::manifest::{FileFormat, ManifestEntry};
 
@@ -86,7 +85,8 @@ pub async fn read(
                     FileFormat::Parquet => {
                         let object_reader = DataFileReader {
                             object_store,
-                            path: util::strip_prefix(data_file.file_path()).into(),
+                            path: object_store_path_from_metadata(data_file.file_path())
+                                .map_err(|error| Error::InvalidFormat(error.to_string()))?,
                             file_size: (*data_file.file_size_in_bytes()) as u64,
                         };
                         Ok::<_, Error>(
