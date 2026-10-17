@@ -15,8 +15,9 @@ use std::{
 
 use arrow::{
     array::{
-        as_primitive_array, as_string_array, Array, ArrayRef, BooleanArray, BooleanBufferBuilder,
-        PrimitiveArray, Scalar, StringArray, UInt32Array,
+        as_primitive_array, as_string_array, downcast_array, Array, ArrayRef, BooleanArray,
+        BooleanBufferBuilder, LargeStringArray, PrimitiveArray, Scalar, StringArray,
+        StringViewArray, UInt32Array,
     },
     compute::{
         and, filter, filter_record_batch, is_not_null, is_null,
@@ -151,7 +152,13 @@ pub fn partition_record_batch<'a>(
                     DistinctValues::String(set) => set
                         .into_iter()
                         .map(|x| {
-                            let res = eq(&StringArray::new_scalar(&x), value)?;
+                            let res = match value.data_type() {
+                                DataType::LargeUtf8 => {
+                                    eq(&LargeStringArray::new_scalar(&x), value)?
+                                }
+                                DataType::Utf8View => eq(&StringViewArray::new_scalar(&x), value)?,
+                                _ => eq(&StringArray::new_scalar(&x), value)?,
+                            };
                             Ok((Some(Value::String(x)), res))
                         })
                         .collect::<Result<Vec<_>, ArrowError>>(),
@@ -246,6 +253,16 @@ fn partition_value_at(array: &ArrayRef, row: usize) -> Result<Option<Value>, Arr
             }
         }
         DataType::Utf8 => Value::String(as_string_array(array).value(row).to_owned()),
+        DataType::LargeUtf8 => Value::String(
+            downcast_array::<LargeStringArray>(array)
+                .value(row)
+                .to_owned(),
+        ),
+        DataType::Utf8View => Value::String(
+            downcast_array::<StringViewArray>(array)
+                .value(row)
+                .to_owned(),
+        ),
         _ => {
             return Err(ArrowError::ComputeError(
                 "Datatype not supported for partitioning".into(),
@@ -268,6 +285,7 @@ fn partition_value_at(array: &ArrayRef, row: usize) -> Result<Option<Value>, Arr
 /// * Int32 - Converted to DistinctValues::Int
 /// * Int64 - Converted to DistinctValues::Long
 /// * Utf8 - Converted to DistinctValues::String
+/// * LargeUtf8 and Utf8View - Converted to DistinctValues::String
 fn distinct_values(array: ArrayRef) -> Result<DistinctValues, ArrowError> {
     let array = if array.null_count() == 0 {
         array
@@ -292,6 +310,12 @@ fn distinct_values(array: ArrayRef) -> Result<DistinctValues, ArrowError> {
             timezone.clone(),
         )),
         DataType::Utf8 => Ok(DistinctValues::String(distinct_values_string(array)?)),
+        DataType::LargeUtf8 => Ok(DistinctValues::String(distinct_values_string_borrowed(
+            downcast_array::<LargeStringArray>(&array).iter(),
+        ))),
+        DataType::Utf8View => Ok(DistinctValues::String(distinct_values_string_borrowed(
+            downcast_array::<StringViewArray>(&array).iter(),
+        ))),
         _ => Err(ArrowError::ComputeError(
             "Datatype not supported for transform.".to_string(),
         )),
@@ -390,6 +414,18 @@ fn distinct_values_string(array: ArrayRef) -> Result<HashSet<String>, ArrowError
     Ok(set)
 }
 
+fn distinct_values_string_borrowed<'a>(
+    values: impl Iterator<Item = Option<&'a str>>,
+) -> HashSet<String> {
+    let mut distinct = HashSet::new();
+    for value in values.flatten() {
+        if !distinct.contains(value) {
+            distinct.insert(value.to_owned());
+        }
+    }
+    distinct
+}
+
 /// Represents distinct values found in Arrow arrays during partitioning
 ///
 /// This enum stores unique values from different Arrow array types:
@@ -422,12 +458,92 @@ mod tests {
     use std::sync::Arc;
 
     use arrow::array::{ArrayRef, TimestampMicrosecondArray, TimestampNanosecondArray};
+    use arrow::compute::cast;
     use iceberg_rust_spec::spec::{
         partition::{PartitionField, Transform},
         types::{PrimitiveType, StructField, Type},
     };
 
     use super::*;
+
+    #[test]
+    fn unicode_truncate_partition_groups_by_code_point() -> Result<(), ArrowError> {
+        let source_values: ArrayRef = Arc::new(StringArray::from(vec![
+            Some("日😀x"),
+            Some("日😀y"),
+            Some("éx"),
+            Some("ascii"),
+            None,
+        ]));
+        let source = StructField::new(
+            1,
+            "value",
+            false,
+            Type::Primitive(PrimitiveType::String),
+            None,
+        );
+        let partition = PartitionField::new(1, 1000, "value_part", Transform::Truncate(2));
+        for data_type in [DataType::Utf8, DataType::LargeUtf8, DataType::Utf8View] {
+            let values = cast(&source_values, &data_type)?;
+            let batch = RecordBatch::try_from_iter(vec![("value", values)])?;
+            let mut groups =
+                partition_record_batch(&batch, &[BoundPartitionField::new(&partition, &source)])?
+                    .map(|group| group.map(|(values, rows)| (values[0].clone(), rows.num_rows())))
+                    .collect::<Result<Vec<_>, ArrowError>>()?;
+            groups.sort();
+            assert_eq!(
+                groups,
+                vec![
+                    (None, 1),
+                    (Some(Value::String("as".to_owned())), 1),
+                    (Some(Value::String("éx".to_owned())), 1),
+                    (Some(Value::String("日😀".to_owned())), 2),
+                ],
+                "{data_type:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn unicode_truncate_partition_uses_indexed_groups() -> Result<(), ArrowError> {
+        let values: ArrayRef = Arc::new(StringArray::from_iter_values(
+            (0..60_000).map(|row| format!("日{:02}suffix", row % 17)),
+        ));
+        let values = cast(&values, &DataType::Utf8View)?;
+        let batch = RecordBatch::try_from_iter(vec![("value", values)])?;
+        let source = StructField::new(
+            1,
+            "value",
+            false,
+            Type::Primitive(PrimitiveType::String),
+            None,
+        );
+        let partition = PartitionField::new(1, 1000, "value_part", Transform::Truncate(3));
+        let groups =
+            partition_record_batch(&batch, &[BoundPartitionField::new(&partition, &source)])?
+                .collect::<Result<Vec<_>, ArrowError>>()?;
+        assert_eq!(groups.len(), 17);
+        assert_eq!(
+            groups
+                .iter()
+                .map(|(_, rows)| rows.num_rows())
+                .sum::<usize>(),
+            60_000
+        );
+        for (keys, rows) in groups {
+            let value = rows
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .ok_or_else(|| ArrowError::ComputeError("Expected string view array".into()))?;
+            assert_eq!(
+                keys[0],
+                Some(Value::String(value.value(0).chars().take(3).collect()))
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn identity_partition_preserves_timestamp_kind() -> Result<(), ArrowError> {
