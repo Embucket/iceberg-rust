@@ -3370,6 +3370,7 @@ dependencies = [
  "futures",
  "iceberg-rust",
  "object_store",
+ "percent-encoding",
  "serde_json",
  "testcontainers",
  "testcontainers-modules",

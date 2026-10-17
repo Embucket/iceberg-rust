@@ -14,6 +14,7 @@ async-trait.workspace = true
 futures.workspace = true
 iceberg-rust = { path = "../../iceberg-rust", version = "0.10.0" }
 object_store.workspace = true
+percent-encoding = "2.3"
 serde_json.workspace = true
 thiserror.workspace = true
 url.workspace = true
