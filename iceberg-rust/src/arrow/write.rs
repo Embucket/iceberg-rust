@@ -38,7 +38,7 @@ use futures::{
     SinkExt, StreamExt, TryStreamExt,
 };
 use lru::LruCache;
-use object_store::{buffered::BufWriter, ObjectStore, ObjectStoreExt};
+use object_store::{buffered::BufWriter, path::Path as ObjectPath, ObjectStore, ObjectStoreExt};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::{fmt::Write, thread::available_parallelism};
@@ -554,7 +554,7 @@ async fn write_parquet_files(
                     .await
                     .map_err(|err| ArrowError::from_external_error(err.into()))?
                     .size;
-                let location = bucket + &writer.0;
+                let location = data_file_location(&bucket, &writer.0);
                 Ok(match partition_values {
                     Some(values) => parquet_to_datafile_with_partition(
                         &location,
@@ -995,6 +995,35 @@ pub fn generate_file_path(data_location: &str, partition_path: Option<String>) -
         "/"
     };
     base + separator + &path + &Uuid::now_v1(&rand).to_string() + ".parquet"
+}
+
+fn data_file_location(bucket: &str, raw_path: &str) -> String {
+    let key = ObjectPath::from(raw_path);
+    format!("{bucket}/{key}")
+}
+
+#[cfg(test)]
+mod data_file_location_tests {
+    use super::{data_file_location, ObjectPath};
+    use crate::object_store::object_store_path_from_metadata;
+
+    #[test]
+    fn metadata_uses_the_written_key_for_unicode_and_percent_values() {
+        for raw_path in [
+            "/data/name=日😀/part.parquet",
+            "/data/name=a%2Fb/part.parquet",
+        ] {
+            let written = ObjectPath::from(raw_path);
+            for bucket in ["", "s3://bucket"] {
+                let location = data_file_location(bucket, raw_path);
+                assert_eq!(
+                    object_store_path_from_metadata(&location).expect("metadata location"),
+                    written,
+                    "{location}"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
