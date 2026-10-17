@@ -13,23 +13,21 @@ use iceberg_rust::{
         create::{CreateMaterializedView, CreateTable, CreateView},
         identifier::Identifier,
         namespace::Namespace,
-        tabular::Tabular,
+        tabular::{get_tabular_metadata, Tabular},
         Catalog, CatalogList,
     },
     error::Error as IcebergError,
     materialized_view::MaterializedView,
-    object_store::{store::IcebergStore, Bucket, ObjectStoreBuilder},
+    object_store::{delete_metadata_object, store::IcebergStore, Bucket, ObjectStoreBuilder},
     spec::{
         materialized_view_metadata::MaterializedViewMetadata,
         table_metadata::{new_metadata_location, MetadataLog, TableMetadata},
         tabular::TabularMetadata,
-        util::strip_prefix,
         view_metadata::ViewMetadata,
     },
     table::Table,
     view::View,
 };
-use object_store::ObjectStoreExt;
 use sqlx::{
     any::{install_default_drivers, AnyPoolOptions, AnyRow},
     pool::PoolOptions,
@@ -505,12 +503,7 @@ impl Catalog for SqlCatalog {
         let bucket = Bucket::from_path(&path)?;
         let object_store = self.default_object_store(bucket);
 
-        let bytes = object_store
-            .get(&strip_prefix(&path).as_str().into())
-            .await?
-            .bytes()
-            .await?;
-        let metadata: TabularMetadata = serde_json::from_slice(&bytes)?;
+        let metadata = get_tabular_metadata(&path, object_store.clone()).await?;
         self.cache
             .write()
             .unwrap()
@@ -740,7 +733,7 @@ impl Catalog for SqlCatalog {
 
         if delete_after_commit {
             for path in expired_metadata_files {
-                let _ = object_store.delete(&strip_prefix(&path).into()).await;
+                let _ = delete_metadata_object(object_store.as_ref(), &path).await;
             }
         }
 
@@ -870,13 +863,13 @@ impl Catalog for SqlCatalog {
         let bucket = Bucket::from_path(metadata_location)?;
         let object_store = self.default_object_store(bucket);
 
-        let metadata: TableMetadata = serde_json::from_slice(
-            &object_store
-                .get(&metadata_location.into())
-                .await?
-                .bytes()
-                .await?,
-        )?;
+        let TabularMetadata::Table(metadata) =
+            get_tabular_metadata(metadata_location, object_store.clone()).await?
+        else {
+            return Err(IcebergError::InvalidFormat(
+                "Registered metadata is not a table".to_owned(),
+            ));
+        };
 
         {
             let catalog_name = self.name.clone();

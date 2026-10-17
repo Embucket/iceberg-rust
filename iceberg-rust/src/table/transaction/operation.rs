@@ -25,7 +25,6 @@ use iceberg_rust_spec::spec::{
     sort::{SortOrder, DEFAULT_SORT_ORDER_ID},
 };
 use iceberg_rust_spec::table_metadata::FormatVersion;
-use iceberg_rust_spec::util::strip_prefix;
 use itertools::Either;
 use object_store::{ObjectStore, ObjectStoreExt};
 use smallvec::SmallVec;
@@ -575,7 +574,9 @@ impl Operation {
 
                 object_store
                     .put(
-                        &strip_prefix(&new_manifest_list_location).into(),
+                        &crate::object_store::metadata_object_store_path(
+                            &new_manifest_list_location,
+                        ),
                         manifest_list_bytes.into(),
                     )
                     .await?;
@@ -1016,18 +1017,12 @@ pub fn bounding_partition_values<'a>(
 pub(crate) fn prefetch_manifest(
     selected_manifest_opt: &Option<ManifestListEntry>,
     object_store: &Arc<dyn ObjectStore>,
-) -> Option<JoinHandle<Result<Bytes, object_store::Error>>> {
+) -> Option<JoinHandle<Result<Bytes, Error>>> {
     selected_manifest_opt.as_ref().map(|selected_manifest| {
         tokio::task::spawn({
             let object_store = object_store.clone();
             let path = selected_manifest.manifest_path.clone();
-            async move {
-                object_store
-                    .get(&strip_prefix(&path).as_str().into())
-                    .await?
-                    .bytes()
-                    .await
-            }
+            async move { crate::object_store::read_metadata_object(object_store.as_ref(), &path).await }
         })
     })
 }
@@ -1051,7 +1046,7 @@ fn apply_v3_row_lineage(
 fn prefetch_manifest_list(
     old_snapshot: Option<&Snapshot>,
     object_store: &Arc<dyn ObjectStore>,
-) -> Option<JoinHandle<Result<Bytes, object_store::Error>>> {
+) -> Option<JoinHandle<Result<Bytes, Error>>> {
     old_snapshot
         .map(|x| x.manifest_list())
         .cloned()
@@ -1061,11 +1056,11 @@ fn prefetch_manifest_list(
                 let object_store = object_store.clone();
                 let old_manifest_list_location = old_manifest_list_location.clone();
                 async move {
-                    object_store
-                        .get(&strip_prefix(&old_manifest_list_location).as_str().into())
-                        .await?
-                        .bytes()
-                        .await
+                    crate::object_store::read_metadata_object(
+                        object_store.as_ref(),
+                        &old_manifest_list_location,
+                    )
+                    .await
                 }
             })
         })
@@ -1244,6 +1239,7 @@ mod tests {
     use iceberg_rust_spec::spec::schema::SchemaBuilder;
     use iceberg_rust_spec::spec::table_metadata::TableMetadataBuilder;
     use iceberg_rust_spec::spec::types::{PrimitiveType, StructField, Type};
+    use iceberg_rust_spec::util::strip_prefix;
     use iceberg_rust_spec::values::{Struct, Value};
     use object_store::memory::InMemory;
 

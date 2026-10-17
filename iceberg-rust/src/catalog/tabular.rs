@@ -5,12 +5,15 @@
 use std::sync::Arc;
 
 use iceberg_rust_spec::spec::tabular::TabularMetadata;
-use object_store::{ObjectStore, ObjectStoreExt};
+use object_store::ObjectStore;
 
-use crate::error::Error;
 use crate::materialized_view::MaterializedView;
 use crate::table::Table;
 use crate::view::View;
+use crate::{
+    error::Error,
+    object_store::{read_metadata_object, store::parse_metadata},
+};
 
 use super::identifier::Identifier;
 use super::Catalog;
@@ -109,10 +112,6 @@ pub async fn get_tabular_metadata(
     metadata_location: &str,
     object_store: Arc<dyn ObjectStore>,
 ) -> Result<TabularMetadata, Error> {
-    let bytes = object_store
-        .get(&metadata_location.into())
-        .await?
-        .bytes()
-        .await?;
-    Ok(serde_json::from_slice(&bytes)?)
+    let bytes = read_metadata_object(object_store.as_ref(), metadata_location).await?;
+    parse_metadata(metadata_location, &bytes)
 }

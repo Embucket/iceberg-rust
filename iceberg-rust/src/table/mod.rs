@@ -15,11 +15,9 @@ use std::{io::Cursor, sync::Arc};
 use itertools::Itertools;
 use manifest::ManifestReader;
 use manifest_list::read_snapshot;
-use object_store::ObjectStoreExt;
-use object_store::{path::Path, ObjectStore};
+use object_store::ObjectStore;
 
-use futures::{stream, Stream, StreamExt, TryFutureExt, TryStreamExt};
-use iceberg_rust_spec::util::{self};
+use futures::{stream, Stream, StreamExt, TryStreamExt};
 use iceberg_rust_spec::{
     spec::{
         manifest::{Content, FirstRowIdInheritance, ManifestEntry, Status},
@@ -38,6 +36,7 @@ use tracing::{instrument, Instrument};
 use crate::{
     catalog::{create::CreateTableBuilder, identifier::Identifier, Catalog},
     error::Error,
+    object_store::{delete_metadata_object, read_metadata_object},
     table::transaction::TableTransaction,
 };
 
@@ -334,11 +333,8 @@ async fn datafiles(
             let manifest_snapshot_id = file.added_snapshot_id;
             let manifest_first_row_id = file.first_row_id;
             async move {
-                let path: Path = util::strip_prefix(&manifest_path).into();
                 let bytes = Cursor::new(Vec::from(
-                    object_store
-                        .get(&path)
-                        .and_then(|file| file.bytes())
+                    read_metadata_object(object_store.as_ref(), &manifest_path)
                         .instrument(tracing::trace_span!("iceberg_rust::get_manifest"))
                         .await?,
                 ));
@@ -412,9 +408,11 @@ pub(crate) async fn delete_all_table_files(
         .try_for_each_concurrent(concurrency, |datafile| {
             let object_store = object_store.clone();
             async move {
-                object_store
-                    .delete(&datafile.1.data_file().file_path().as_str().into())
-                    .await?;
+                delete_metadata_object(
+                    object_store.as_ref(),
+                    datafile.1.data_file().file_path().as_str(),
+                )
+                .await?;
                 Ok(())
             }
         })
@@ -425,7 +423,7 @@ pub(crate) async fn delete_all_table_files(
         .try_for_each_concurrent(concurrency, |manifest| {
             let object_store = object_store.clone();
             async move {
-                object_store.delete(&manifest.manifest_path.into()).await?;
+                delete_metadata_object(object_store.as_ref(), &manifest.manifest_path).await?;
                 Ok(())
             }
         })
@@ -436,8 +434,7 @@ pub(crate) async fn delete_all_table_files(
         .try_for_each_concurrent(concurrency, |snapshot| {
             let object_store = object_store.clone();
             async move {
-                object_store
-                    .delete(&snapshot.manifest_list().as_str().into())
+                delete_metadata_object(object_store.as_ref(), snapshot.manifest_list().as_str())
                     .await?;
                 Ok(())
             }

@@ -17,13 +17,13 @@ use iceberg_rust_spec::{
     schema::Schema,
     snapshot::Snapshot,
     table_metadata::{FormatVersion, TableMetadata},
-    util::strip_prefix,
 };
 use object_store::{ObjectStore, ObjectStoreExt};
 use smallvec::SmallVec;
 
 use crate::{
     error::Error,
+    object_store::{metadata_object_store_path, read_metadata_object},
     table::datafiles,
     util::{summary_to_rectangle, Rectangle, Vec4},
 };
@@ -193,10 +193,7 @@ pub(crate) async fn read_snapshot<'metadata>(
     object_store: Arc<dyn ObjectStore>,
 ) -> Result<impl Iterator<Item = Result<ManifestListEntry, Error>> + 'metadata, Error> {
     let bytes: Cursor<Vec<u8>> = Cursor::new(
-        object_store
-            .get(&strip_prefix(snapshot.manifest_list()).into())
-            .await?
-            .bytes()
+        read_metadata_object(object_store.as_ref(), snapshot.manifest_list())
             .await?
             .into(),
     );
@@ -253,10 +250,7 @@ pub async fn snapshot_partition_bounds(
     object_store: Arc<dyn ObjectStore>,
 ) -> Result<Option<Rectangle>, Error> {
     let bytes: Cursor<Vec<u8>> = Cursor::new(
-        object_store
-            .get(&strip_prefix(snapshot.manifest_list()).into())
-            .await?
-            .bytes()
+        read_metadata_object(object_store.as_ref(), snapshot.manifest_list())
             .await?
             .into(),
     );
@@ -1482,7 +1476,7 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
 
         object_store
             .put(
-                &strip_prefix(&new_manifest_list_location).into(),
+                &metadata_object_store_path(&new_manifest_list_location),
                 manifest_list_bytes.into(),
             )
             .await?;
@@ -1585,12 +1579,9 @@ impl<'schema, 'metadata> ManifestListWriter<'schema, 'metadata> {
                         .map(ToOwned::to_owned)
                         .collect();
 
-                    let bytes = object_store
-                        .clone()
-                        .get(&strip_prefix(&manifest.manifest_path).into())
-                        .await?
-                        .bytes()
-                        .await?;
+                    let bytes =
+                        read_metadata_object(object_store.as_ref(), &manifest.manifest_path)
+                            .await?;
 
                     manifest.manifest_path = manifest_location;
                     let source_snapshot_id = (manifest.partition_spec_id
@@ -1663,7 +1654,110 @@ mod tests {
         types::{PrimitiveType, StructField, StructType, Type},
         values::Value,
     };
-    use object_store::memory::InMemory;
+    use object_store::{memory::InMemory, path::Path as ObjectPath};
+
+    #[tokio::test]
+    async fn read_snapshot_uses_encoded_and_legacy_manifest_list_keys() {
+        let uri = "s3://bucket/table/name=%E6%97%A5/snap.avro";
+        let snapshot = SnapshotBuilder::default()
+            .with_snapshot_id(1)
+            .with_sequence_number(1)
+            .with_manifest_list(uri.to_string())
+            .with_schema_id(0)
+            .build()
+            .unwrap();
+        let schema = Schema::from_struct_type(
+            StructType::new(vec![StructField::new(
+                1,
+                "id",
+                false,
+                Type::Primitive(PrimitiveType::Int),
+                None,
+            )]),
+            0,
+            None,
+        );
+        let metadata = TableMetadataBuilder::default()
+            .format_version(FormatVersion::V2)
+            .location("s3://bucket/table/name=%E6%97%A5")
+            .current_schema_id(0)
+            .schemas(HashMap::from([(0, schema)]))
+            .default_spec_id(0)
+            .partition_specs(HashMap::from([(0, PartitionSpec::default())]))
+            .snapshots(HashMap::from([(1, snapshot.clone())]))
+            .current_snapshot_id(Some(1))
+            .build()
+            .unwrap();
+        let bytes = AvroWriter::new(manifest_list_schema_v2(), Vec::new())
+            .into_inner()
+            .unwrap();
+
+        for path in [
+            ObjectPath::parse("table/name=%E6%97%A5/snap.avro").unwrap(),
+            ObjectPath::from("table/name=%E6%97%A5/snap.avro"),
+        ] {
+            let store = Arc::new(InMemory::new());
+            store.put(&path, bytes.clone().into()).await.unwrap();
+            let entries = read_snapshot(&snapshot, &metadata, store)
+                .await
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert!(entries.is_empty());
+        }
+
+        let manifest_uri = "s3://bucket/table/name=%E6%97%A5/manifest.avro";
+        let partition_schema =
+            partition_value_schema(&metadata.current_partition_fields().unwrap()).unwrap();
+        let manifest_schema =
+            ManifestEntry::schema(&partition_schema, &metadata.format_version).unwrap();
+        let writer =
+            ManifestWriter::new(manifest_uri, 1, &manifest_schema, &metadata, Content::Data)
+                .unwrap();
+        let store = Arc::new(InMemory::new());
+        writer.finish(store.clone()).await.unwrap();
+        assert!(store
+            .get(&ObjectPath::parse("table/name=%E6%97%A5/manifest.avro").unwrap())
+            .await
+            .is_ok());
+        assert!(
+            store
+                .get(&ObjectPath::from("table/name=%E6%97%A5/manifest.avro"))
+                .await
+                .is_err(),
+            "new manifests must not require a legacy-key retry"
+        );
+
+        let data_file = DataFile::builder()
+            .with_content(iceberg_rust_spec::manifest::Content::Data)
+            .with_file_path("s3://bucket/table/data/part.parquet".to_string())
+            .with_file_format(iceberg_rust_spec::manifest::FileFormat::Parquet)
+            .with_partition(iceberg_rust_spec::values::Struct::from_iter(Vec::<(
+                String,
+                Option<Value>,
+            )>::new(
+            )))
+            .with_record_count(1)
+            .with_file_size_in_bytes(100)
+            .with_column_sizes(None)
+            .with_value_counts(None)
+            .with_null_value_counts(None)
+            .with_nan_value_counts(None)
+            .with_distinct_counts(None)
+            .with_lower_bounds(None)
+            .with_upper_bounds(None)
+            .build()
+            .unwrap();
+        let list_schema = manifest_list_schema_v2();
+        let writer =
+            ManifestListWriter::new(std::iter::once(&data_file), list_schema, &metadata).unwrap();
+        let (location, _) = writer.finish(2, store.clone()).await.unwrap();
+        let canonical =
+            ObjectPath::parse(iceberg_rust_spec::util::strip_prefix(&location)).unwrap();
+        let legacy = ObjectPath::from(iceberg_rust_spec::util::strip_prefix(&location));
+        assert!(store.get(&canonical).await.is_ok());
+        assert!(store.get(&legacy).await.is_err());
+    }
 
     #[tokio::test]
     async fn historical_manifest_list_uses_snapshot_schema_for_bounds() {

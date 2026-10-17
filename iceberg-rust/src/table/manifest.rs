@@ -36,12 +36,11 @@ use iceberg_rust_spec::{
     partition::{PartitionField, PartitionSpec},
     schema::{Schema, SchemaV1, SchemaV2},
     table_metadata::{FormatVersion, TableMetadata},
-    util::strip_prefix,
     values::{Struct, Value},
 };
 use object_store::{ObjectStore, ObjectStoreExt};
 
-use crate::error::Error;
+use crate::{error::Error, object_store::metadata_object_store_path};
 
 type ReaderZip<'a, R> = Zip<AvroReader<'a, R>, Repeat<Arc<(Schema, PartitionSpec, FormatVersion)>>>;
 type ReaderMap<'a, R> = Map<
@@ -779,7 +778,7 @@ impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
 
         object_store
             .put(
-                &strip_prefix(&self.manifest.manifest_path).as_str().into(),
+                &metadata_object_store_path(&self.manifest.manifest_path),
                 manifest_bytes.into(),
             )
             .await?;
@@ -818,7 +817,7 @@ impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
 
         self.manifest.manifest_length += manifest_length;
 
-        let path = strip_prefix(&self.manifest.manifest_path).as_str().into();
+        let path = metadata_object_store_path(&self.manifest.manifest_path);
         let future = async move {
             object_store
                 .put(&path, manifest_bytes.into())

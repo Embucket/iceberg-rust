@@ -3643,6 +3643,7 @@ dependencies = [
  "testcontainers-modules",
  "thiserror",
  "tokio",
+ "tracing",
  "url",
  "uuid",
 ]

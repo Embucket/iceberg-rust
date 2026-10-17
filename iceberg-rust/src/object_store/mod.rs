@@ -11,7 +11,7 @@ use object_store::{
     local::LocalFileSystem,
     memory::InMemory,
     path::Path as ObjectPath,
-    ObjectStore,
+    ObjectStore, ObjectStoreExt,
 };
 
 use crate::error::Error;
@@ -44,6 +44,57 @@ pub(crate) fn legacy_object_store_path_from_metadata(
     (legacy != *preferred).then_some(legacy)
 }
 
+/// Resolve a metadata location to the key used for new Iceberg files.
+pub fn metadata_object_store_path(location: &str) -> ObjectPath {
+    object_store_path_from_metadata(location)
+        .unwrap_or_else(|_| ObjectPath::from(iceberg_rust_spec::util::strip_prefix(location)))
+}
+
+pub(crate) async fn read_metadata_object(
+    object_store: &dyn ObjectStore,
+    location: &str,
+) -> Result<bytes::Bytes, Error> {
+    let path = metadata_object_store_path(location);
+    let result = match object_store.get(&path).await {
+        Ok(result) => result,
+        Err(error @ object_store::Error::NotFound { .. }) => {
+            let Some(legacy) = legacy_object_store_path_from_metadata(location, &path) else {
+                return Err(error.into());
+            };
+            object_store.get(&legacy).await?
+        }
+        Err(error) => return Err(error.into()),
+    };
+    Ok(result.bytes().await?)
+}
+
+/// Delete the key selected by metadata reads, including keys from older writers.
+pub async fn delete_metadata_object(
+    object_store: &dyn ObjectStore,
+    location: &str,
+) -> Result<(), Error> {
+    let path = metadata_object_store_path(location);
+    let Some(legacy) = legacy_object_store_path_from_metadata(location, &path) else {
+        match object_store.delete(&path).await {
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => return Ok(()),
+            Err(error) => return Err(error.into()),
+        }
+    };
+    let selected = match object_store.head(&path).await {
+        Ok(_) => path,
+        Err(object_store::Error::NotFound { .. }) => match object_store.head(&legacy).await {
+            Ok(_) => legacy,
+            Err(object_store::Error::NotFound { .. }) => return Ok(()),
+            Err(error) => return Err(error.into()),
+        },
+        Err(error) => return Err(error.into()),
+    };
+    match object_store.delete(&selected).await {
+        Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn has_invalid_percent_escape(path: &str) -> bool {
     let bytes = path.as_bytes();
     let mut i = 0;
@@ -65,8 +116,19 @@ fn has_invalid_percent_escape(path: &str) -> bool {
 
 #[cfg(test)]
 mod metadata_path_tests {
-    use super::{object_store_path_from_metadata, ObjectPath};
+    use super::{
+        delete_metadata_object, object_store_path_from_metadata, read_metadata_object, ObjectPath,
+    };
+    use crate::{catalog::tabular::get_tabular_metadata, object_store::store::IcebergStore};
+    use iceberg_rust_spec::spec::{
+        partition::PartitionSpec,
+        schema::Schema,
+        table_metadata::{FormatVersion, TableMetadataBuilder},
+        tabular::TabularMetadata,
+        types::{PrimitiveType, StructField, StructType, Type},
+    };
     use object_store::{memory::InMemory, ObjectStoreExt};
+    use std::{collections::HashMap, sync::Arc};
 
     #[test]
     fn preserves_percent_encoded_metadata_paths() {
@@ -154,6 +216,145 @@ mod metadata_path_tests {
             assert_eq!(from_metadata, written);
             assert!(store.get(&from_metadata).await.is_ok());
         }
+    }
+
+    #[tokio::test]
+    async fn reads_encoded_and_legacy_metadata_keys() {
+        let store = InMemory::new();
+        let uri = "s3://bucket/table/name=%E6%97%A5/manifest.avro";
+        let encoded = ObjectPath::parse("table/name=%E6%97%A5/manifest.avro").unwrap();
+        let legacy = ObjectPath::from("table/name=%E6%97%A5/manifest.avro");
+        store
+            .put(&legacy, bytes::Bytes::from_static(b"legacy").into())
+            .await
+            .unwrap();
+        assert_eq!(
+            read_metadata_object(&store, uri).await.unwrap(),
+            bytes::Bytes::from_static(b"legacy")
+        );
+        store
+            .put(&encoded, bytes::Bytes::from_static(b"canonical").into())
+            .await
+            .unwrap();
+        assert_eq!(
+            read_metadata_object(&store, uri).await.unwrap(),
+            bytes::Bytes::from_static(b"canonical")
+        );
+
+        let old_uri = "s3://bucket/table//metadata/snap.avro";
+        store
+            .put(
+                &ObjectPath::from("table//metadata/snap.avro"),
+                bytes::Bytes::from_static(b"old").into(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            read_metadata_object(&store, old_uri).await.unwrap(),
+            bytes::Bytes::from_static(b"old")
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_loaders_read_old_relative_and_encoded_locations() {
+        let schema = Schema::from_struct_type(
+            StructType::new(vec![StructField::new(
+                1,
+                "id",
+                false,
+                Type::Primitive(PrimitiveType::Int),
+                None,
+            )]),
+            0,
+            None,
+        );
+        let metadata = TableMetadataBuilder::default()
+            .format_version(FormatVersion::V2)
+            .location("memory:///table")
+            .current_schema_id(0)
+            .schemas(HashMap::from([(0, schema)]))
+            .default_spec_id(0)
+            .partition_specs(HashMap::from([(0, PartitionSpec::default())]))
+            .build()
+            .unwrap();
+        let store = Arc::new(InMemory::new());
+
+        let old_location = "./table/metadata.json";
+        store
+            .put_metadata(old_location, (&metadata).into())
+            .await
+            .unwrap();
+        let TabularMetadata::Table(loaded) = store.get_metadata(old_location).await.unwrap() else {
+            panic!("expected table metadata");
+        };
+        assert_eq!(loaded.table_uuid, metadata.table_uuid);
+
+        let uri = "s3://bucket/table/name=%E6%97%A5/metadata.json";
+        let path = ObjectPath::parse("table/name=%E6%97%A5/metadata.json").unwrap();
+        store.put_metadata(uri, (&metadata).into()).await.unwrap();
+        assert!(store.get(&path).await.is_ok());
+        assert!(
+            store
+                .get(&ObjectPath::from("table/name=%E6%97%A5/metadata.json"))
+                .await
+                .is_err(),
+            "new metadata must not require a legacy-key retry"
+        );
+        let TabularMetadata::Table(loaded) =
+            get_tabular_metadata(uri, store.clone()).await.unwrap()
+        else {
+            panic!("expected table metadata");
+        };
+        assert_eq!(loaded.table_uuid, metadata.table_uuid);
+        let TabularMetadata::Table(loaded) = store.get_metadata(uri).await.unwrap() else {
+            panic!("expected table metadata");
+        };
+        assert_eq!(loaded.table_uuid, metadata.table_uuid);
+
+        let gz_uri = "s3://bucket/table/name=%E6%97%A5/v1.gz.metadata.json";
+        store
+            .put_metadata(gz_uri, (&metadata).into())
+            .await
+            .unwrap();
+        let TabularMetadata::Table(loaded) =
+            get_tabular_metadata(gz_uri, store.clone()).await.unwrap()
+        else {
+            panic!("expected compressed table metadata");
+        };
+        assert_eq!(loaded.table_uuid, metadata.table_uuid);
+    }
+
+    #[tokio::test]
+    async fn deletes_only_the_metadata_key_selected_for_reads() {
+        let store = InMemory::new();
+        let uri = "s3://bucket/table/name=%E6%97%A5/metadata.json";
+        let canonical = ObjectPath::parse("table/name=%E6%97%A5/metadata.json").unwrap();
+        let legacy = ObjectPath::from("table/name=%E6%97%A5/metadata.json");
+        store
+            .put(&legacy, bytes::Bytes::from_static(b"old").into())
+            .await
+            .unwrap();
+        delete_metadata_object(&store, uri).await.unwrap();
+        assert!(store.get(&legacy).await.is_err());
+
+        store
+            .put(&canonical, bytes::Bytes::from_static(b"new").into())
+            .await
+            .unwrap();
+        store
+            .put(&legacy, bytes::Bytes::from_static(b"other").into())
+            .await
+            .unwrap();
+        delete_metadata_object(&store, uri).await.unwrap();
+        assert!(store.get(&canonical).await.is_err());
+        assert!(store.get(&legacy).await.is_ok());
+        delete_metadata_object(&store, uri).await.unwrap();
+        delete_metadata_object(&store, uri).await.unwrap();
+        assert!(store.get(&legacy).await.is_err());
+
+        delete_metadata_object(&store, "s3://bucket/simple/metadata.json")
+            .await
+            .unwrap();
     }
 }
 

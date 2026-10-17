@@ -15,6 +15,8 @@ use lazy_static::lazy_static;
 use regex::Regex;
 use std::io::{Read, Write};
 
+use super::{metadata_object_store_path, read_metadata_object};
+
 /// Simplify interaction with iceberg files
 #[async_trait]
 pub trait IcebergStore {
@@ -33,11 +35,7 @@ pub trait IcebergStore {
 #[async_trait]
 impl<T: ObjectStore> IcebergStore for T {
     async fn get_metadata(&self, location: &str) -> Result<TabularMetadata, Error> {
-        let bytes = self
-            .get(&strip_prefix(location).into())
-            .await?
-            .bytes()
-            .await?;
+        let bytes = read_metadata_object(self, location).await?;
 
         parse_metadata(location, &bytes)
     }
@@ -48,7 +46,7 @@ impl<T: ObjectStore> IcebergStore for T {
         metadata: TabularMetadataRef<'_>,
     ) -> Result<(), Error> {
         self.put(
-            &strip_prefix(location).into(),
+            &metadata_object_store_path(location),
             serialize_metadata(location, metadata)?.into(),
         )
         .await?;
@@ -58,11 +56,9 @@ impl<T: ObjectStore> IcebergStore for T {
 
     async fn put_version_hint(&self, location: &str) -> Result<(), Error> {
         self.put_opts(
-            &version_hint_path(&strip_prefix(location))
-                .ok_or(Error::InvalidFormat(format!(
-                    "Path for version-hint for {location}"
-                )))?
-                .into(),
+            &metadata_object_store_path(&version_hint_path(&strip_prefix(location)).ok_or(
+                Error::InvalidFormat(format!("Path for version-hint for {location}")),
+            )?),
             version_hint_content(location).into(),
             PutOptions {
                 mode: object_store::PutMode::Overwrite,
@@ -139,7 +135,7 @@ fn serialize_metadata(location: &str, metadata: TabularMetadataRef<'_>) -> Resul
     encoder.finish().map_err(Error::from)
 }
 
-fn parse_metadata(location: &str, bytes: &[u8]) -> Result<TabularMetadata, Error> {
+pub(crate) fn parse_metadata(location: &str, bytes: &[u8]) -> Result<TabularMetadata, Error> {
     if location.ends_with(".gz.metadata.json") {
         let mut decoder = GzDecoder::new(bytes);
         let mut decompressed_data = Vec::new();
