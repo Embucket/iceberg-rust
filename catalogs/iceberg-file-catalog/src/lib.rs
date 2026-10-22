@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     convert::identity,
+    path::Path,
     sync::{Arc, RwLock},
 };
 
@@ -73,9 +74,20 @@ impl Catalog for FileCatalog {
     /// Create a namespace in the catalog
     async fn create_namespace(
         &self,
-        _namespace: &Namespace,
+        namespace: &Namespace,
         _properties: Option<HashMap<String, String>>,
     ) -> Result<HashMap<String, String>, IcebergError> {
+        if let ObjectStoreBuilder::Filesystem(store) = &self.object_store {
+            if let Some(name) = durable_local_namespace_name(namespace) {
+                let directory = store
+                    .path_to_filesystem(&self.catalog_root_path().join(name))
+                    .map_err(IcebergError::from)?;
+                tokio::task::spawn_blocking(move || std::fs::create_dir_all(directory))
+                    .await
+                    .map_err(|error| IcebergError::External(Box::new(error)))?
+                    .map_err(|error| IcebergError::External(Box::new(error)))?;
+            }
+        }
         Ok(HashMap::new())
     }
     /// Drop a namespace in the catalog
@@ -83,9 +95,15 @@ impl Catalog for FileCatalog {
         let bucket = Bucket::from_path(&self.path)?;
         let object_store = self.object_store.build(bucket)?;
 
-        let prefix = strip_prefix(&self.namespace_path(&namespace[0]));
+        let local_durable = matches!(self.object_store, ObjectStoreBuilder::Filesystem(_))
+            && durable_local_namespace_name(namespace).is_some();
+        let prefix = if local_durable {
+            self.catalog_root_path().join(namespace[0].as_str())
+        } else {
+            ObjectPath::from(strip_prefix(&self.namespace_path(&namespace[0])))
+        };
         let paths: Vec<_> = object_store
-            .list(Some(&prefix.as_str().into()))
+            .list(Some(&prefix))
             .map_ok(|x| x.location)
             .try_collect()
             .await
@@ -96,6 +114,18 @@ impl Catalog for FileCatalog {
                 .delete(&path)
                 .await
                 .map_err(IcebergError::from)?;
+        }
+
+        if local_durable {
+            if let ObjectStoreBuilder::Filesystem(store) = &self.object_store {
+                let directory = store
+                    .path_to_filesystem(&prefix)
+                    .map_err(IcebergError::from)?;
+                tokio::task::spawn_blocking(move || remove_empty_directory_tree(&directory))
+                    .await
+                    .map_err(|error| IcebergError::External(Box::new(error)))?
+                    .map_err(|error| IcebergError::External(Box::new(error)))?;
+            }
         }
 
         let target = namespace[0].clone();
@@ -127,9 +157,7 @@ impl Catalog for FileCatalog {
     ) -> Result<(), IcebergError> {
         Ok(())
     }
-    /// Check if a namespace exists. Namespaces are implicit on the filesystem
-    /// — a namespace exists iff `list_namespaces` would report it (i.e., it
-    /// has at least one tabular underneath).
+    /// Check if a namespace exists, including an empty local filesystem directory.
     async fn namespace_exists(&self, namespace: &Namespace) -> Result<bool, IcebergError> {
         let target = &namespace[0];
         Ok(self
@@ -181,7 +209,6 @@ impl Catalog for FileCatalog {
     async fn list_namespaces(&self, _parent: Option<&str>) -> Result<Vec<Namespace>, IcebergError> {
         let bucket = Bucket::from_path(&self.path)?;
         let object_store = self.object_store.build(bucket)?;
-
         object_store
             .list_with_delimiter(Some(
                 &strip_prefix(self.path.trim_start_matches('/')).into(),
@@ -655,6 +682,10 @@ impl FileCatalog {
         self.path.as_str().trim_end_matches('/').to_owned() + "/" + namespace
     }
 
+    fn catalog_root_path(&self) -> ObjectPath {
+        ObjectPath::from(strip_prefix(&self.path))
+    }
+
     fn tabular_path(&self, namespace: &str, name: &str) -> String {
         self.path.as_str().trim_end_matches('/').to_owned() + "/" + namespace + "/" + name
     }
@@ -778,6 +809,46 @@ impl FileCatalog {
             .unwrap_or(path)
             .trim_start_matches('/')
             .to_owned()
+    }
+}
+
+fn remove_empty_directory_tree(directory: &Path) -> std::io::Result<()> {
+    let metadata = match std::fs::symlink_metadata(directory) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if !metadata.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Namespace path is not a directory",
+        ));
+    }
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            remove_empty_directory_tree(&entry.path())?;
+        }
+    }
+    match std::fs::remove_dir(directory) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn durable_local_namespace_name(namespace: &Namespace) -> Option<&str> {
+    let [name] = &namespace[..] else {
+        return None;
+    };
+    let mut characters = name.chars();
+    let first = characters.next()?;
+    if (first.is_ascii_alphabetic() || first == '_')
+        && characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
+    {
+        Some(name)
+    } else {
+        None
     }
 }
 
@@ -997,6 +1068,64 @@ pub mod tests {
     // use testcontainers_modules::localstack::LocalStack;
 
     use crate::FileCatalog;
+
+    #[tokio::test]
+    async fn local_empty_directory_is_listed_as_namespace() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = format!("file://{}/catalog", temp.path().display());
+        std::fs::create_dir_all(temp.path().join("catalog/APP")).unwrap();
+        let catalog = FileCatalog::new(&path, ObjectStoreBuilder::filesystem("/"))
+            .await
+            .unwrap();
+        let namespace = Namespace::try_new(&["APP".to_owned()]).unwrap();
+        assert!(catalog
+            .list_namespaces(None)
+            .await
+            .unwrap()
+            .contains(&namespace));
+    }
+
+    #[tokio::test]
+    async fn empty_namespace_drop_removes_local_filesystem_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = format!("file://{}/catalog", temp.path().display());
+        let store = ObjectStoreBuilder::filesystem("/");
+        let catalog = FileCatalog::new(&path, store.clone()).await.unwrap();
+        let namespace = Namespace::try_new(&["EMPTY".to_owned()]).unwrap();
+
+        catalog.create_namespace(&namespace, None).await.unwrap();
+        catalog.create_namespace(&namespace, None).await.unwrap();
+        let reopened = Arc::new(FileCatalog::new(&path, store.clone()).await.unwrap());
+        assert!(reopened.namespace_exists(&namespace).await.unwrap());
+        assert!(reopened.list_tabulars(&namespace).await.unwrap().is_empty());
+
+        let schema = Schema::builder()
+            .with_struct_field(StructField {
+                id: 1,
+                name: "id".to_owned(),
+                required: true,
+                field_type: Type::Primitive(PrimitiveType::Long),
+                doc: None,
+                initial_default: None,
+                write_default: None,
+            })
+            .build()
+            .unwrap();
+        let mut builder = CreateTableBuilder::default();
+        builder
+            .with_name("ITEMS")
+            .with_schema(schema)
+            .build(&namespace, reopened.clone())
+            .await
+            .unwrap();
+        let identifier = iceberg_rust::catalog::identifier::Identifier::new(&namespace, "ITEMS");
+        reopened.drop_table(&identifier).await.unwrap();
+
+        reopened.drop_namespace(&namespace).await.unwrap();
+        let reopened = FileCatalog::new(&path, store).await.unwrap();
+        assert!(!reopened.namespace_exists(&namespace).await.unwrap());
+        assert!(!temp.path().join("catalog/EMPTY").exists());
+    }
 
     #[tokio::test]
     async fn fresh_catalog_loads_encoded_metadata_paths() {

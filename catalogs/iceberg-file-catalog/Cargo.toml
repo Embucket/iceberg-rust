@@ -17,6 +17,7 @@ object_store.workspace = true
 percent-encoding = "2.3"
 serde_json.workspace = true
 thiserror.workspace = true
+tokio = { version = "1", features = ["rt"] }
 url.workspace = true
 uuid = { version = "1.23.1", features = ["v4"] }
 
@@ -24,6 +25,7 @@ uuid = { version = "1.23.1", features = ["v4"] }
 datafusion.workspace = true
 datafusion_iceberg = { path = "../../datafusion_iceberg", version = "0.10.0" }
 iceberg-rust = { path = "../../iceberg-rust", version = "0.10.0", features = ["test-utils"] }
+tempfile = "3"
 testcontainers = "0.26"
 testcontainers-modules = { version = "0.14", features = ["localstack"] }
 tokio = "1"
