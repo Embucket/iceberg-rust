@@ -1,8 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
-    convert::identity,
     path::Path,
-    sync::{Arc, RwLock},
+    sync::{Arc, Mutex as StdMutex, OnceLock, RwLock, Weak},
 };
 
 use async_trait::async_trait;
@@ -11,7 +10,7 @@ use iceberg_rust::{
     catalog::{
         commit::{
             apply_table_updates, apply_view_updates, check_table_requirements,
-            check_view_requirements, CommitTable, CommitView, TableRequirement,
+            check_view_requirements, CommitTable, CommitView,
         },
         create::{CreateMaterializedView, CreateTable, CreateView},
         identifier::Identifier,
@@ -25,14 +24,14 @@ use iceberg_rust::{
     spec::{
         materialized_view_metadata::MaterializedViewMetadata,
         table_metadata::{new_metadata_location, TableMetadata},
-        tabular::TabularMetadata,
+        tabular::{TabularMetadata, TabularMetadataRef},
         util::strip_prefix,
         view_metadata::ViewMetadata,
     },
     table::Table,
     view::View,
 };
-use object_store::{path::Path as ObjectPath, ObjectStore, ObjectStoreExt};
+use object_store::{path::Path as ObjectPath, ObjectStore, ObjectStoreExt, PutMode, PutOptions};
 use percent_encoding::percent_decode_str;
 
 use crate::error::Error;
@@ -43,17 +42,149 @@ pub struct FileCatalog {
     object_store: ObjectStoreBuilder,
     cache: Arc<RwLock<HashMap<Identifier, (String, TabularMetadata)>>>,
     renamed_tables: Arc<RwLock<HashMap<Identifier, Identifier>>>,
+    #[cfg(test)]
+    update_before_publish_pause: StdMutex<
+        Option<(
+            futures::channel::oneshot::Sender<()>,
+            futures::channel::oneshot::Receiver<()>,
+        )>,
+    >,
+    #[cfg(test)]
+    create_after_write_pause: StdMutex<
+        Option<(
+            futures::channel::oneshot::Sender<()>,
+            futures::channel::oneshot::Receiver<()>,
+        )>,
+    >,
+    #[cfg(test)]
+    drop_lock_reached: std::sync::atomic::AtomicBool,
+}
+
+type MutationLock = tokio::sync::Mutex<()>;
+type MutationLockKey = (String, Identifier);
+static TABLE_MUTATION_LOCKS: OnceLock<StdMutex<HashMap<MutationLockKey, Weak<MutationLock>>>> =
+    OnceLock::new();
+type CatalogMutationLock = tokio::sync::RwLock<()>;
+static CATALOG_MUTATION_LOCKS: OnceLock<StdMutex<HashMap<String, Weak<CatalogMutationLock>>>> =
+    OnceLock::new();
+
+enum MutationScopeGuard {
+    Read {
+        _guard: tokio::sync::OwnedRwLockReadGuard<()>,
+    },
+    Write {
+        _guard: tokio::sync::OwnedRwLockWriteGuard<()>,
+    },
+}
+
+async fn create_metadata(
+    store: &dyn ObjectStore,
+    location: &str,
+    metadata: TabularMetadataRef<'_>,
+) -> Result<(), IcebergError> {
+    store
+        .put_opts(
+            &strip_prefix(location).into(),
+            serde_json::to_vec(&metadata)?.into(),
+            PutOptions {
+                mode: PutMode::Create,
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|error| match error {
+            object_store::Error::AlreadyExists { .. } => {
+                IcebergError::CommitConflict(location.to_owned())
+            }
+            error => IcebergError::from(error),
+        })?;
+    Ok(())
+}
+
+async fn create_table_metadata(
+    store: &dyn ObjectStore,
+    metadata_location: &str,
+    metadata: &TableMetadata,
+) -> Result<(), IcebergError> {
+    create_metadata(store, metadata_location, metadata.as_ref()).await?;
+    if let Err(error) = store
+        .put(
+            &table_identity_path(&metadata.location),
+            metadata.table_uuid.as_bytes().to_vec().into(),
+        )
+        .await
+    {
+        let _ = store.delete(&strip_prefix(metadata_location).into()).await;
+        return Err(error.into());
+    }
+    Ok(())
+}
+
+fn table_identity_path(location: &str) -> ObjectPath {
+    ObjectPath::from(strip_prefix(&format!("{location}/metadata/table-uuid")))
 }
 
 pub mod error;
 
 impl FileCatalog {
+    fn catalog_mutation_lock(&self) -> Arc<CatalogMutationLock> {
+        let registry = CATALOG_MUTATION_LOCKS.get_or_init(|| StdMutex::new(HashMap::new()));
+        let mut locks = registry.lock().unwrap();
+        if locks.len() > 4096 {
+            locks.retain(|_, lock| lock.strong_count() > 0);
+        }
+        let key = self.path.trim_end_matches('/').to_owned();
+        if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(CatalogMutationLock::new(()));
+        locks.insert(key, Arc::downgrade(&lock));
+        lock
+    }
+
+    async fn mutation_scope(&self) -> MutationScopeGuard {
+        let lock = self.catalog_mutation_lock();
+        if matches!(self.object_store, ObjectStoreBuilder::Memory(_)) {
+            MutationScopeGuard::Write {
+                _guard: lock.write_owned().await,
+            }
+        } else {
+            MutationScopeGuard::Read {
+                _guard: lock.read_owned().await,
+            }
+        }
+    }
+
+    fn mutation_lock(&self, identifier: &Identifier) -> Arc<MutationLock> {
+        let registry = TABLE_MUTATION_LOCKS.get_or_init(|| StdMutex::new(HashMap::new()));
+        let mut locks = registry.lock().unwrap();
+        if locks.len() > 4096 {
+            locks.retain(|_, lock| lock.strong_count() > 0);
+        }
+        let key = (
+            self.path.trim_end_matches('/').to_owned(),
+            identifier.clone(),
+        );
+        if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(MutationLock::new(()));
+        locks.insert(key, Arc::downgrade(&lock));
+        lock
+    }
+
     pub async fn new(path: &str, object_store: ObjectStoreBuilder) -> Result<Self, Error> {
         Ok(FileCatalog {
             path: path.to_owned(),
             object_store,
             cache: Arc::new(RwLock::new(HashMap::new())),
             renamed_tables: Arc::new(RwLock::new(HashMap::new())),
+            #[cfg(test)]
+            update_before_publish_pause: StdMutex::new(None),
+            #[cfg(test)]
+            create_after_write_pause: StdMutex::new(None),
+            #[cfg(test)]
+            drop_lock_reached: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -92,6 +223,8 @@ impl Catalog for FileCatalog {
     }
     /// Drop a namespace in the catalog
     async fn drop_namespace(&self, namespace: &Namespace) -> Result<(), IcebergError> {
+        let catalog_lock = self.catalog_mutation_lock();
+        let _catalog_guard = catalog_lock.write().await;
         let bucket = Bucket::from_path(&self.path)?;
         let object_store = self.object_store.build(bucket)?;
 
@@ -221,10 +354,15 @@ impl Catalog for FileCatalog {
             .collect::<Result<_, IcebergError>>()
     }
     async fn tabular_exists(&self, identifier: &Identifier) -> Result<bool, IcebergError> {
-        self.metadata_location(identifier)
-            .await
-            .map(|_| true)
-            .or(Ok(false))
+        match self.metadata_location(identifier).await {
+            Ok(_) => Ok(true),
+            Err(
+                IcebergError::CatalogNotFound
+                | IcebergError::NotFound(_)
+                | IcebergError::ObjectStore(object_store::Error::NotFound { .. }),
+            ) => Ok(false),
+            Err(error) => Err(error),
+        }
     }
     async fn drop_table(&self, identifier: &Identifier) -> Result<(), IcebergError> {
         self.drop_tabular(identifier).await
@@ -242,6 +380,7 @@ impl Catalog for FileCatalog {
         if source == destination {
             return Ok(());
         }
+        let _catalog_guard = self.mutation_scope().await;
         if self.tabular_exists(destination).await? {
             return Err(IcebergError::InvalidFormat(format!(
                 "Destination table {destination} already exists"
@@ -349,7 +488,10 @@ impl Catalog for FileCatalog {
         identifier: Identifier,
         mut create_table: CreateTable,
     ) -> Result<Table, IcebergError> {
-        if self.tabular_exists(&identifier).await.is_ok_and(identity) {
+        let _catalog_guard = self.mutation_scope().await;
+        let mutation_lock = self.mutation_lock(&identifier);
+        let _mutation_guard = mutation_lock.lock().await;
+        if self.tabular_exists(&identifier).await? {
             return Err(IcebergError::InvalidFormat(
                 "Table already exists. Path".to_owned(),
             ));
@@ -364,11 +506,17 @@ impl Catalog for FileCatalog {
         let bucket = Bucket::from_path(&location)?;
         let object_store = self.default_object_store(bucket);
 
-        let metadata_location = location + "/metadata/v0.metadata.json";
+        let metadata_location = format!("{location}/metadata/v0.metadata.json");
 
-        object_store
-            .put_metadata(&metadata_location, metadata.as_ref())
-            .await?;
+        create_table_metadata(object_store.as_ref(), &metadata_location, &metadata).await?;
+
+        #[cfg(test)]
+        let pause = { self.create_after_write_pause.lock().unwrap().take() };
+        #[cfg(test)]
+        if let Some((reached, release)) = pause {
+            let _ = reached.send(());
+            let _ = release.await;
+        }
 
         object_store.put_version_hint(&metadata_location).await.ok();
 
@@ -390,7 +538,10 @@ impl Catalog for FileCatalog {
         identifier: Identifier,
         mut create_view: CreateView<Option<()>>,
     ) -> Result<View, IcebergError> {
-        if self.tabular_exists(&identifier).await.is_ok_and(identity) {
+        let _catalog_guard = self.mutation_scope().await;
+        let mutation_lock = self.mutation_lock(&identifier);
+        let _mutation_guard = mutation_lock.lock().await;
+        if self.tabular_exists(&identifier).await? {
             return Err(IcebergError::InvalidFormat(
                 "View already exists. Path".to_owned(),
             ));
@@ -408,9 +559,7 @@ impl Catalog for FileCatalog {
 
         let metadata_location = location + "/metadata/v0.metadata.json";
 
-        object_store
-            .put_metadata(&metadata_location, metadata.as_ref())
-            .await?;
+        create_metadata(object_store.as_ref(), &metadata_location, metadata.as_ref()).await?;
 
         object_store.put_version_hint(&metadata_location).await.ok();
 
@@ -426,7 +575,11 @@ impl Catalog for FileCatalog {
         identifier: Identifier,
         create_view: CreateMaterializedView,
     ) -> Result<MaterializedView, IcebergError> {
-        if self.tabular_exists(&identifier).await.is_ok_and(identity) {
+        let catalog_lock = self.catalog_mutation_lock();
+        let _catalog_guard = catalog_lock.write().await;
+        let mutation_lock = self.mutation_lock(&identifier);
+        let _mutation_guard = mutation_lock.lock().await;
+        if self.tabular_exists(&identifier).await? {
             return Err(IcebergError::InvalidFormat(
                 "View already exists. Path".to_owned(),
             ));
@@ -454,15 +607,28 @@ impl Catalog for FileCatalog {
         let table_metadata_location =
             table_metadata.location.clone() + "/metadata/v0.metadata.json";
 
+        create_table_metadata(
+            object_store.as_ref(),
+            &table_metadata_location,
+            &table_metadata,
+        )
+        .await?;
+        if let Err(error) =
+            create_metadata(object_store.as_ref(), &metadata_location, metadata.as_ref()).await
+        {
+            let _ = object_store
+                .delete(&table_identity_path(&table_metadata.location))
+                .await;
+            let _ = object_store
+                .delete(&strip_prefix(&table_metadata_location).into())
+                .await;
+            return Err(error);
+        }
         object_store
-            .put_metadata(&metadata_location, metadata.as_ref())
-            .await?;
-
+            .put_version_hint(&table_metadata_location)
+            .await
+            .ok();
         object_store.put_version_hint(&metadata_location).await.ok();
-
-        object_store
-            .put_metadata(&table_metadata_location, table_metadata.as_ref())
-            .await?;
 
         self.cache.write().unwrap().insert(
             identifier.clone(),
@@ -472,21 +638,15 @@ impl Catalog for FileCatalog {
     }
 
     async fn update_table(self: Arc<Self>, commit: CommitTable) -> Result<Table, IcebergError> {
+        let _catalog_guard = self.mutation_scope().await;
+        let mutation_lock = self.mutation_lock(&commit.identifier);
+        let _mutation_guard = mutation_lock.lock().await;
         let bucket = Bucket::from_path(&self.path)?;
         let object_store = self.object_store.build(bucket)?;
 
         let identifier = commit.identifier;
         let Some(entry) = self.cache.read().unwrap().get(&identifier).cloned() else {
-            #[allow(clippy::if_same_then_else)]
-            if !matches!(commit.requirements[0], TableRequirement::AssertCreate) {
-                return Err(IcebergError::InvalidFormat(
-                    "Create table assertion".to_owned(),
-                ));
-            } else {
-                return Err(IcebergError::InvalidFormat(
-                    "Create table assertion".to_owned(),
-                ));
-            }
+            return Err(IcebergError::CommitConflict(identifier.to_string()));
         };
         let (previous_metadata_location, metadata) = entry;
 
@@ -495,8 +655,43 @@ impl Catalog for FileCatalog {
                 "Table update on entity that is not a table".to_owned(),
             ));
         };
+        // The marker fences a dropped/recreated table without re-reading a
+        // potentially large metadata JSON on every local commit. Legacy
+        // tables without the marker still verify their metadata UUID.
+        let identity = match object_store
+            .get(&table_identity_path(&metadata.location))
+            .await
+        {
+            Ok(identity) => Some(identity.bytes().await?),
+            Err(object_store::Error::NotFound { .. }) => None,
+            Err(error) => return Err(error.into()),
+        };
+        let same_table = if let Some(identity) = identity {
+            identity.as_ref() == metadata.table_uuid.as_bytes()
+        } else {
+            match object_store.get_metadata(&previous_metadata_location).await {
+                Ok(TabularMetadata::Table(current)) => current.table_uuid == metadata.table_uuid,
+                Err(
+                    IcebergError::ObjectStore(object_store::Error::NotFound { .. })
+                    | IcebergError::NotFound(_)
+                    | IcebergError::CatalogNotFound,
+                ) => false,
+                Err(error) => return Err(error),
+                Ok(_) => false,
+            }
+        };
+        if !same_table {
+            return Err(IcebergError::CommitConflict(identifier.to_string()));
+        }
         if !check_table_requirements(&commit.requirements, &metadata) {
             return Err(IcebergError::CommitConflict(identifier.to_string()));
+        }
+        #[cfg(test)]
+        let pause = { self.update_before_publish_pause.lock().unwrap().take() };
+        #[cfg(test)]
+        if let Some((reached, release)) = pause {
+            let _ = reached.send(());
+            let _ = release.await;
         }
         apply_table_updates(&mut metadata, commit.updates)?;
         let temp_metadata_location = new_metadata_location(&metadata);
@@ -544,6 +739,9 @@ impl Catalog for FileCatalog {
         self: Arc<Self>,
         commit: CommitView<Option<()>>,
     ) -> Result<View, IcebergError> {
+        let _catalog_guard = self.mutation_scope().await;
+        let mutation_lock = self.mutation_lock(&commit.identifier);
+        let _mutation_guard = mutation_lock.lock().await;
         let bucket = Bucket::from_path(&self.path)?;
         let object_store = self.object_store.build(bucket)?;
 
@@ -606,6 +804,9 @@ impl Catalog for FileCatalog {
         self: Arc<Self>,
         commit: CommitView<Identifier>,
     ) -> Result<MaterializedView, IcebergError> {
+        let _catalog_guard = self.mutation_scope().await;
+        let mutation_lock = self.mutation_lock(&commit.identifier);
+        let _mutation_guard = mutation_lock.lock().await;
         let bucket = Bucket::from_path(&self.path)?;
         let object_store = self.object_store.build(bucket)?;
 
@@ -691,6 +892,12 @@ impl FileCatalog {
     }
 
     async fn drop_tabular(&self, identifier: &Identifier) -> Result<(), IcebergError> {
+        let _catalog_guard = self.mutation_scope().await;
+        let mutation_lock = self.mutation_lock(identifier);
+        let _mutation_guard = mutation_lock.lock().await;
+        #[cfg(test)]
+        self.drop_lock_reached
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         let bucket = Bucket::from_path(&self.path)?;
         let object_store = self.object_store.build(bucket)?;
 
@@ -713,7 +920,18 @@ impl FileCatalog {
             .await
             .map_err(IcebergError::from)?;
 
+        let identity_path = table_identity_path(&tabular_path);
+        if paths.contains(&identity_path) {
+            object_store
+                .delete(&identity_path)
+                .await
+                .map_err(IcebergError::from)?;
+        }
+
         for path in paths {
+            if path == identity_path {
+                continue;
+            }
             object_store
                 .delete(&path)
                 .await
@@ -1008,6 +1226,12 @@ impl CatalogList for FileCatalogList {
             object_store: self.object_store.clone(),
             cache: Arc::new(RwLock::new(HashMap::new())),
             renamed_tables: Arc::new(RwLock::new(HashMap::new())),
+            #[cfg(test)]
+            update_before_publish_pause: StdMutex::new(None),
+            #[cfg(test)]
+            create_after_write_pause: StdMutex::new(None),
+            #[cfg(test)]
+            drop_lock_reached: std::sync::atomic::AtomicBool::new(false),
         }))
     }
     async fn list_catalogs(&self) -> Vec<String> {
@@ -1045,22 +1269,24 @@ pub mod tests {
     use futures::StreamExt;
     use iceberg_rust::{
         catalog::{
-            commit::{CommitTable, TableRequirement},
+            commit::{CommitTable, TableRequirement, TableUpdate},
             create::CreateTableBuilder,
             namespace::Namespace,
             tabular::Tabular,
             Catalog,
         },
         error::Error as IcebergError,
+        materialized_view::MaterializedView,
         object_store::{Bucket, ObjectStoreBuilder},
         spec::{
             schema::Schema,
             types::{PrimitiveType, StructField, Type},
             util::strip_prefix,
+            view_metadata::{Version, ViewRepresentation},
         },
     };
     use object_store::{path::Path as ObjectPath, ObjectStoreExt};
-    use std::{sync::Arc, time::Duration};
+    use std::{collections::HashMap, sync::Arc, time::Duration};
     use testcontainers::{core::ExecCommand, runners::AsyncRunner, ImageExt};
     use testcontainers_modules::localstack::LocalStack;
     use tokio::time::sleep;
@@ -1068,6 +1294,21 @@ pub mod tests {
     // use testcontainers_modules::localstack::LocalStack;
 
     use crate::FileCatalog;
+
+    fn simple_table_schema() -> Schema {
+        Schema::builder()
+            .with_struct_field(StructField {
+                id: 1,
+                name: "id".to_owned(),
+                required: true,
+                field_type: Type::Primitive(PrimitiveType::Long),
+                doc: None,
+                initial_default: None,
+                write_default: None,
+            })
+            .build()
+            .unwrap()
+    }
 
     #[tokio::test]
     async fn local_empty_directory_is_listed_as_namespace() {
@@ -1186,6 +1427,523 @@ pub mod tests {
             };
             assert_eq!(table.identifier(), &identifier);
         }
+    }
+
+    #[tokio::test]
+    async fn stale_handle_cannot_commit_after_drop_and_recreate() {
+        let store = ObjectStoreBuilder::memory();
+        let writer = Arc::new(
+            FileCatalog::new("/dev/recreated", store.clone())
+                .await
+                .unwrap(),
+        );
+        let stale_catalog = Arc::new(FileCatalog::new("/dev/recreated", store).await.unwrap());
+        let namespace = Namespace::try_new(&["public".to_owned()]).unwrap();
+        let identifier = iceberg_rust::catalog::identifier::Identifier::new(&namespace, "items");
+        let schema = Schema::builder()
+            .with_struct_field(StructField {
+                id: 1,
+                name: "id".to_owned(),
+                required: true,
+                field_type: Type::Primitive(PrimitiveType::Long),
+                doc: None,
+                initial_default: None,
+                write_default: None,
+            })
+            .build()
+            .unwrap();
+        let mut builder = CreateTableBuilder::default();
+        let original = builder
+            .with_name(identifier.name())
+            .with_schema(schema.clone())
+            .build(&namespace, writer.clone())
+            .await
+            .unwrap();
+        let Tabular::Table(mut stale) = stale_catalog
+            .clone()
+            .load_tabular(&identifier)
+            .await
+            .unwrap()
+        else {
+            panic!("expected original table");
+        };
+        writer.drop_table(&identifier).await.unwrap();
+        let missing_result = stale
+            .new_transaction(None)
+            .update_properties(vec![("stale".to_owned(), "true".to_owned())])
+            .commit()
+            .await;
+        assert!(
+            matches!(missing_result, Err(IcebergError::CommitConflict(_))),
+            "{missing_result:?}"
+        );
+        let mut builder = CreateTableBuilder::default();
+        let replacement = builder
+            .with_name(identifier.name())
+            .with_schema(schema)
+            .build(&namespace, writer.clone())
+            .await
+            .unwrap();
+        assert_ne!(
+            original.metadata().table_uuid,
+            replacement.metadata().table_uuid
+        );
+
+        let direct_result = stale_catalog
+            .clone()
+            .update_table(CommitTable {
+                identifier: identifier.clone(),
+                requirements: vec![],
+                updates: vec![TableUpdate::SetProperties {
+                    updates: HashMap::from([("stale".to_owned(), "true".to_owned())]),
+                }],
+            })
+            .await;
+        assert!(
+            matches!(direct_result, Err(IcebergError::CommitConflict(_))),
+            "{direct_result:?}"
+        );
+
+        let result = stale
+            .new_transaction(None)
+            .update_properties(vec![("stale".to_owned(), "true".to_owned())])
+            .commit()
+            .await;
+        assert!(
+            matches!(result, Err(IcebergError::CommitConflict(_))),
+            "{result:?}"
+        );
+        let Tabular::Table(current) = writer.clone().load_tabular(&identifier).await.unwrap()
+        else {
+            panic!("expected replacement table");
+        };
+        assert_eq!(
+            current.metadata().table_uuid,
+            replacement.metadata().table_uuid
+        );
+        assert!(!current.metadata().properties.contains_key("stale"));
+    }
+
+    #[tokio::test]
+    async fn legacy_table_without_identity_marker_keeps_writes_and_missing_cache_conflicts() {
+        let store = ObjectStoreBuilder::memory();
+        let catalog = Arc::new(
+            FileCatalog::new("/dev/legacy", store.clone())
+                .await
+                .unwrap(),
+        );
+        let namespace = Namespace::try_new(&["public".to_owned()]).unwrap();
+        let identifier = iceberg_rust::catalog::identifier::Identifier::new(&namespace, "items");
+        let mut builder = CreateTableBuilder::default();
+        let mut table = builder
+            .with_name(identifier.name())
+            .with_schema(simple_table_schema())
+            .build(&namespace, catalog.clone())
+            .await
+            .unwrap();
+        let object_store = store
+            .build(Bucket::from_path("/dev/legacy").unwrap())
+            .unwrap();
+        object_store
+            .delete(&super::table_identity_path(&table.metadata().location))
+            .await
+            .unwrap();
+
+        table
+            .new_transaction(None)
+            .update_properties(vec![("legacy".to_owned(), "ok".to_owned())])
+            .commit()
+            .await
+            .unwrap();
+        let Tabular::Table(reloaded) = catalog.clone().load_tabular(&identifier).await.unwrap()
+        else {
+            panic!("expected legacy table");
+        };
+        assert_eq!(
+            reloaded
+                .metadata()
+                .properties
+                .get("legacy")
+                .map(String::as_str),
+            Some("ok")
+        );
+
+        catalog.drop_table(&identifier).await.unwrap();
+        let result = catalog
+            .update_table(CommitTable {
+                identifier,
+                requirements: vec![],
+                updates: vec![],
+            })
+            .await;
+        assert!(
+            matches!(result, Err(IcebergError::CommitConflict(_))),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn drop_waits_for_an_inflight_table_update_across_catalog_instances() {
+        let store = ObjectStoreBuilder::memory();
+        let writer = Arc::new(
+            FileCatalog::new("/dev/update_drop", store.clone())
+                .await
+                .unwrap(),
+        );
+        let dropper = Arc::new(
+            FileCatalog::new("/dev/update_drop/", store.clone())
+                .await
+                .unwrap(),
+        );
+        let namespace = Namespace::try_new(&["public".to_owned()]).unwrap();
+        let identifier = iceberg_rust::catalog::identifier::Identifier::new(&namespace, "items");
+        let mut builder = CreateTableBuilder::default();
+        builder
+            .with_name(identifier.name())
+            .with_schema(simple_table_schema())
+            .build(&namespace, writer.clone())
+            .await
+            .unwrap();
+        let Tabular::Table(mut table) = writer.clone().load_tabular(&identifier).await.unwrap()
+        else {
+            panic!("expected table");
+        };
+        let (reached, reached_rx) = futures::channel::oneshot::channel();
+        let (release_tx, release) = futures::channel::oneshot::channel();
+        *writer.update_before_publish_pause.lock().unwrap() = Some((reached, release));
+        let update = tokio::spawn(async move {
+            table
+                .new_transaction(None)
+                .update_properties(vec![("raced".to_owned(), "true".to_owned())])
+                .commit()
+                .await
+        });
+        reached_rx.await.unwrap();
+
+        let mut drop = Box::pin(dropper.drop_table(&identifier));
+        assert!(matches!(
+            futures::poll!(drop.as_mut()),
+            std::task::Poll::Pending
+        ));
+        assert!(!dropper
+            .drop_lock_reached
+            .load(std::sync::atomic::Ordering::SeqCst));
+        release_tx.send(()).unwrap();
+        update.await.unwrap().unwrap();
+        drop.await.unwrap();
+        assert!(dropper
+            .drop_lock_reached
+            .load(std::sync::atomic::Ordering::SeqCst));
+
+        let mut builder = CreateTableBuilder::default();
+        let replacement = builder
+            .with_name(identifier.name())
+            .with_schema(simple_table_schema())
+            .build(&namespace, dropper)
+            .await
+            .unwrap();
+        let fresh = Arc::new(FileCatalog::new("/dev/update_drop", store).await.unwrap());
+        let Tabular::Table(current) = fresh.load_tabular(&identifier).await.unwrap() else {
+            panic!("expected replacement table");
+        };
+        assert_eq!(
+            current.metadata().table_uuid,
+            replacement.metadata().table_uuid
+        );
+        assert!(!current.metadata().properties.contains_key("raced"));
+    }
+
+    #[tokio::test]
+    async fn drop_waits_for_an_inflight_table_create_across_catalog_instances() {
+        let store = ObjectStoreBuilder::memory();
+        let creator = Arc::new(
+            FileCatalog::new("/dev/create_drop", store.clone())
+                .await
+                .unwrap(),
+        );
+        let dropper = Arc::new(
+            FileCatalog::new("/dev/create_drop", store.clone())
+                .await
+                .unwrap(),
+        );
+        let namespace = Namespace::try_new(&["public".to_owned()]).unwrap();
+        let identifier = iceberg_rust::catalog::identifier::Identifier::new(&namespace, "items");
+        let (reached, reached_rx) = futures::channel::oneshot::channel();
+        let (release_tx, release) = futures::channel::oneshot::channel();
+        *creator.create_after_write_pause.lock().unwrap() = Some((reached, release));
+        let create = {
+            let creator = Arc::clone(&creator);
+            let namespace = namespace.clone();
+            let identifier = identifier.clone();
+            tokio::spawn(async move {
+                let mut builder = CreateTableBuilder::default();
+                builder
+                    .with_name(identifier.name())
+                    .with_schema(simple_table_schema())
+                    .build(&namespace, creator)
+                    .await
+            })
+        };
+        reached_rx.await.unwrap();
+
+        let mut drop = Box::pin(dropper.drop_table(&identifier));
+        assert!(matches!(
+            futures::poll!(drop.as_mut()),
+            std::task::Poll::Pending
+        ));
+        assert!(!dropper
+            .drop_lock_reached
+            .load(std::sync::atomic::Ordering::SeqCst));
+        release_tx.send(()).unwrap();
+        create.await.unwrap().unwrap();
+        drop.await.unwrap();
+        assert!(dropper
+            .drop_lock_reached
+            .load(std::sync::atomic::Ordering::SeqCst));
+
+        let fresh = Arc::new(FileCatalog::new("/dev/create_drop", store).await.unwrap());
+        assert!(!fresh.tabular_exists(&identifier).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn namespace_drop_waits_for_an_inflight_table_update() {
+        let store = ObjectStoreBuilder::memory();
+        let writer = Arc::new(
+            FileCatalog::new("/dev/namespace_drop", store.clone())
+                .await
+                .unwrap(),
+        );
+        let dropper = Arc::new(
+            FileCatalog::new("/dev/namespace_drop", store.clone())
+                .await
+                .unwrap(),
+        );
+        let namespace = Namespace::try_new(&["public".to_owned()]).unwrap();
+        let identifier = iceberg_rust::catalog::identifier::Identifier::new(&namespace, "items");
+        let mut builder = CreateTableBuilder::default();
+        let mut table = builder
+            .with_name(identifier.name())
+            .with_schema(simple_table_schema())
+            .build(&namespace, writer.clone())
+            .await
+            .unwrap();
+        let (reached, reached_rx) = futures::channel::oneshot::channel();
+        let (release_tx, release) = futures::channel::oneshot::channel();
+        *writer.update_before_publish_pause.lock().unwrap() = Some((reached, release));
+        let update = tokio::spawn(async move {
+            table
+                .new_transaction(None)
+                .update_properties(vec![("raced".to_owned(), "true".to_owned())])
+                .commit()
+                .await
+        });
+        reached_rx.await.unwrap();
+
+        let mut drop = Box::pin(dropper.drop_namespace(&namespace));
+        assert!(matches!(
+            futures::poll!(drop.as_mut()),
+            std::task::Poll::Pending
+        ));
+        release_tx.send(()).unwrap();
+        update.await.unwrap().unwrap();
+        drop.await.unwrap();
+
+        let fresh = Arc::new(
+            FileCatalog::new("/dev/namespace_drop", store)
+                .await
+                .unwrap(),
+        );
+        assert!(!fresh.tabular_exists(&identifier).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn renamed_table_update_serializes_with_drop_by_original_name() {
+        let store = ObjectStoreBuilder::memory();
+        let writer = Arc::new(
+            FileCatalog::new("/dev/rename_drop", store.clone())
+                .await
+                .unwrap(),
+        );
+        let dropper = Arc::new(
+            FileCatalog::new("/dev/rename_drop", store.clone())
+                .await
+                .unwrap(),
+        );
+        let namespace = Namespace::try_new(&["public".to_owned()]).unwrap();
+        let source = iceberg_rust::catalog::identifier::Identifier::new(&namespace, "original");
+        let destination = iceberg_rust::catalog::identifier::Identifier::new(&namespace, "renamed");
+        let mut builder = CreateTableBuilder::default();
+        builder
+            .with_name(source.name())
+            .with_schema(simple_table_schema())
+            .build(&namespace, writer.clone())
+            .await
+            .unwrap();
+        writer.rename_table(&source, &destination).await.unwrap();
+        let Tabular::Table(mut table) = writer.clone().load_tabular(&destination).await.unwrap()
+        else {
+            panic!("expected renamed table");
+        };
+        let (reached, reached_rx) = futures::channel::oneshot::channel();
+        let (release_tx, release) = futures::channel::oneshot::channel();
+        *writer.update_before_publish_pause.lock().unwrap() = Some((reached, release));
+        let update = tokio::spawn(async move {
+            table
+                .new_transaction(None)
+                .update_properties(vec![("raced".to_owned(), "true".to_owned())])
+                .commit()
+                .await
+        });
+        reached_rx.await.unwrap();
+
+        let mut drop = Box::pin(dropper.drop_table(&source));
+        assert!(matches!(
+            futures::poll!(drop.as_mut()),
+            std::task::Poll::Pending
+        ));
+        release_tx.send(()).unwrap();
+        update.await.unwrap().unwrap();
+        drop.await.unwrap();
+
+        let fresh = Arc::new(FileCatalog::new("/dev/rename_drop", store).await.unwrap());
+        assert!(!fresh.tabular_exists(&source).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn materialized_view_storage_collision_does_not_publish_view() {
+        let store = ObjectStoreBuilder::memory();
+        let catalog = Arc::new(
+            FileCatalog::new("/dev/mv_collision", store.clone())
+                .await
+                .unwrap(),
+        );
+        let namespace = Namespace::try_new(&["public".to_owned()]).unwrap();
+        let view_identifier =
+            iceberg_rust::catalog::identifier::Identifier::new(&namespace, "items");
+        let storage_identifier =
+            iceberg_rust::catalog::identifier::Identifier::new(&namespace, "items__storage");
+        let mut builder = CreateTableBuilder::default();
+        builder
+            .with_name(storage_identifier.name())
+            .with_schema(simple_table_schema())
+            .build(&namespace, catalog.clone())
+            .await
+            .unwrap();
+
+        let mut view_builder = MaterializedView::builder();
+        let result = view_builder
+            .with_name(view_identifier.name())
+            .with_schema(simple_table_schema())
+            .with_view_version(
+                Version::builder()
+                    .with_representation(ViewRepresentation::sql("select id from items", None))
+                    .build()
+                    .unwrap(),
+            )
+            .build(&namespace, catalog.clone())
+            .await;
+        assert!(result.is_err(), "storage-table collision must fail");
+        assert!(!catalog.tabular_exists(&view_identifier).await.unwrap());
+        assert!(catalog.tabular_exists(&storage_identifier).await.unwrap());
+
+        catalog.drop_table(&storage_identifier).await.unwrap();
+        let mut view_builder = MaterializedView::builder();
+        view_builder
+            .with_name(view_identifier.name())
+            .with_schema(simple_table_schema())
+            .with_view_version(
+                Version::builder()
+                    .with_representation(ViewRepresentation::sql("select id from items", None))
+                    .build()
+                    .unwrap(),
+            )
+            .build(&namespace, catalog.clone())
+            .await
+            .unwrap();
+        assert!(catalog.tabular_exists(&view_identifier).await.unwrap());
+        let Tabular::Table(storage_table) = catalog
+            .clone()
+            .load_tabular(&storage_identifier)
+            .await
+            .unwrap()
+        else {
+            panic!("expected storage table");
+        };
+        let object_store = store
+            .build(Bucket::from_path("/dev/mv_collision").unwrap())
+            .unwrap();
+        let marker = object_store
+            .get(&super::table_identity_path(
+                &storage_table.metadata().location,
+            ))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(
+            marker.as_ref(),
+            storage_table.metadata().table_uuid.as_bytes()
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "run manually when changing the file-catalog commit path"]
+    async fn bench_local_file_catalog_metadata_commits() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = format!("file://{}/catalog", temp.path().display());
+        let catalog = Arc::new(
+            FileCatalog::new(&path, ObjectStoreBuilder::filesystem("/"))
+                .await
+                .unwrap(),
+        );
+        let namespace = Namespace::try_new(&["public".to_owned()]).unwrap();
+        let schema = Schema::builder()
+            .with_struct_field(StructField {
+                id: 1,
+                name: "id".to_owned(),
+                required: true,
+                field_type: Type::Primitive(PrimitiveType::Long),
+                doc: None,
+                initial_default: None,
+                write_default: None,
+            })
+            .build()
+            .unwrap();
+        let mut builder = CreateTableBuilder::default();
+        let mut table = builder
+            .with_name("items")
+            .with_schema(schema)
+            .build(&namespace, catalog)
+            .await
+            .unwrap();
+
+        let property_count = std::env::var("ICEBERG_BENCH_PROPERTY_COUNT")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(0);
+        if property_count > 0 {
+            let properties = (0..property_count)
+                .map(|index| (format!("property_{index}"), "x".repeat(512)))
+                .collect();
+            table
+                .new_transaction(None)
+                .update_properties(properties)
+                .commit()
+                .await
+                .unwrap();
+        }
+
+        let start = std::time::Instant::now();
+        for value in 0..100 {
+            table
+                .new_transaction(None)
+                .update_properties(vec![("iteration".to_owned(), value.to_string())])
+                .commit()
+                .await
+                .unwrap();
+        }
+        eprintln!("100 local metadata commits: {:?}", start.elapsed());
     }
 
     #[tokio::test]

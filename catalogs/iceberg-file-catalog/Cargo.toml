@@ -17,7 +17,7 @@ object_store.workspace = true
 percent-encoding = "2.3"
 serde_json.workspace = true
 thiserror.workspace = true
-tokio = { version = "1", features = ["rt"] }
+tokio = { version = "1", features = ["rt", "sync"] }
 url.workspace = true
 uuid = { version = "1.23.1", features = ["v4"] }
 
