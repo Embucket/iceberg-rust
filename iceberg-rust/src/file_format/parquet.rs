@@ -3,7 +3,9 @@
 */
 
 use std::{
+    cmp::Ordering,
     collections::{hash_map::Entry, HashMap, HashSet},
+    mem::discriminant,
     ops::Sub,
 };
 
@@ -170,6 +172,9 @@ fn parquet_to_datafile_impl(
     let mut distinct_counts = write_distinct_counts.then(|| AvroMap(HashMap::new()));
     let mut lower_bounds: HashMap<i32, Value> = HashMap::new();
     let mut upper_bounds: HashMap<i32, Value> = HashMap::new();
+    // Columns whose row-group bounds could not be compared; they carry no bound.
+    let mut unmergeable_lower_bounds: HashSet<i32> = HashSet::new();
+    let mut unmergeable_upper_bounds: HashSet<i32> = HashSet::new();
     // Which mode produced each column's bounds, so truncation can be applied
     // once at the end rather than per row group.
     let mut column_metrics_modes: HashMap<i32, MetricsMode> = HashMap::new();
@@ -334,65 +339,13 @@ fn parquet_to_datafile_impl(
                             data_type,
                             physical_type_hint,
                         )?;
-                        match lower_bounds.entry(id) {
-                            Entry::Occupied(mut entry) => {
-                                let entry = entry.get_mut();
-                                match (&entry, &new) {
-                                    (Value::Int(current), Value::Int(new_val))
-                                        if *current > *new_val =>
-                                    {
-                                        *entry = new
-                                    }
-                                    (Value::LongInt(current), Value::LongInt(new_val))
-                                        if *current > *new_val =>
-                                    {
-                                        *entry = new
-                                    }
-                                    (Value::Float(current), Value::Float(new_val))
-                                        if *current > *new_val =>
-                                    {
-                                        *entry = new
-                                    }
-                                    (Value::Double(current), Value::Double(new_val))
-                                        if *current > *new_val =>
-                                    {
-                                        *entry = new
-                                    }
-                                    (Value::Date(current), Value::Date(new_val))
-                                        if *current > *new_val =>
-                                    {
-                                        *entry = new
-                                    }
-                                    (Value::Time(current), Value::Time(new_val))
-                                        if *current > *new_val =>
-                                    {
-                                        *entry = new
-                                    }
-                                    (Value::Timestamp(current), Value::Timestamp(new_val))
-                                        if *current > *new_val =>
-                                    {
-                                        *entry = new
-                                    }
-                                    (Value::TimestampTZ(current), Value::TimestampTZ(new_val))
-                                        if *current > *new_val =>
-                                    {
-                                        *entry = new
-                                    }
-                                    (
-                                        Value::TimestampNano(current),
-                                        Value::TimestampNano(new_val),
-                                    ) if *current > *new_val => *entry = new,
-                                    (
-                                        Value::TimestampTZNano(current),
-                                        Value::TimestampTZNano(new_val),
-                                    ) if *current > *new_val => *entry = new,
-                                    _ => (),
-                                }
-                            }
-                            Entry::Vacant(entry) => {
-                                entry.insert(new);
-                            }
-                        }
+                        widen_bound(
+                            &mut lower_bounds,
+                            &mut unmergeable_lower_bounds,
+                            id,
+                            new,
+                            Ordering::Less,
+                        );
                     }
                 }
                 if let Some(max_bytes) = statistics
@@ -406,65 +359,13 @@ fn parquet_to_datafile_impl(
                             data_type,
                             physical_type_hint,
                         )?;
-                        match upper_bounds.entry(id) {
-                            Entry::Occupied(mut entry) => {
-                                let entry = entry.get_mut();
-                                match (&entry, &new) {
-                                    (Value::Int(current), Value::Int(new_val))
-                                        if *current < *new_val =>
-                                    {
-                                        *entry = new
-                                    }
-                                    (Value::LongInt(current), Value::LongInt(new_val))
-                                        if *current < *new_val =>
-                                    {
-                                        *entry = new
-                                    }
-                                    (Value::Float(current), Value::Float(new_val))
-                                        if *current < *new_val =>
-                                    {
-                                        *entry = new
-                                    }
-                                    (Value::Double(current), Value::Double(new_val))
-                                        if *current < *new_val =>
-                                    {
-                                        *entry = new
-                                    }
-                                    (Value::Date(current), Value::Date(new_val))
-                                        if *current < *new_val =>
-                                    {
-                                        *entry = new
-                                    }
-                                    (Value::Time(current), Value::Time(new_val))
-                                        if *current < *new_val =>
-                                    {
-                                        *entry = new
-                                    }
-                                    (Value::Timestamp(current), Value::Timestamp(new_val))
-                                        if *current < *new_val =>
-                                    {
-                                        *entry = new
-                                    }
-                                    (Value::TimestampTZ(current), Value::TimestampTZ(new_val))
-                                        if *current < *new_val =>
-                                    {
-                                        *entry = new
-                                    }
-                                    (
-                                        Value::TimestampNano(current),
-                                        Value::TimestampNano(new_val),
-                                    ) if *current < *new_val => *entry = new,
-                                    (
-                                        Value::TimestampTZNano(current),
-                                        Value::TimestampTZNano(new_val),
-                                    ) if *current < *new_val => *entry = new,
-                                    _ => (),
-                                }
-                            }
-                            Entry::Vacant(entry) => {
-                                entry.insert(new);
-                            }
-                        }
+                        widen_bound(
+                            &mut upper_bounds,
+                            &mut unmergeable_upper_bounds,
+                            id,
+                            new,
+                            Ordering::Greater,
+                        );
                     }
                 }
 
@@ -566,6 +467,41 @@ fn parquet_to_datafile_impl(
 
     let content = builder.build()?;
     Ok(content)
+}
+
+/// Widens a column's running file-level bound with one row group's bound.
+///
+/// `keep` is the ordering a new value must have against the current bound to
+/// replace it: `Less` for lower bounds, `Greater` for upper bounds. Every
+/// primitive [`Value`] variant compares in its Iceberg sort order (numbers and
+/// decimals numerically, strings and binaries bytewise, `false < true`), so the
+/// result covers every row group rather than only the first. Two values of
+/// different variants cannot be compared; the column then gets no bound at
+/// all, because an understated bound would prune files that hold matching
+/// rows.
+fn widen_bound(
+    bounds: &mut HashMap<i32, Value>,
+    unmergeable: &mut HashSet<i32>,
+    id: i32,
+    new: Value,
+    keep: Ordering,
+) {
+    if unmergeable.contains(&id) {
+        return;
+    }
+    match bounds.entry(id) {
+        Entry::Vacant(entry) => {
+            entry.insert(new);
+        }
+        Entry::Occupied(mut entry) => {
+            if discriminant(entry.get()) != discriminant(&new) {
+                entry.remove();
+                unmergeable.insert(id);
+            } else if new.cmp(entry.get()) == keep {
+                entry.insert(new);
+            }
+        }
+    }
 }
 
 /// Get parquet metadata size
@@ -964,6 +900,323 @@ mod metrics_mode_tests {
         assert!(datafile.column_sizes().as_ref().unwrap().get(&2).is_some());
         assert_eq!(datafile.lower_bounds().as_ref().unwrap().get(&2), None);
         assert_eq!(datafile.upper_bounds().as_ref().unwrap().get(&2), None);
+    }
+}
+
+#[cfg(test)]
+mod row_group_bound_tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use arrow::array::{
+        ArrayRef, BinaryArray, BooleanArray, Decimal128Array, FixedSizeBinaryArray, StringArray,
+    };
+    use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+    use arrow::record_batch::RecordBatch;
+    use iceberg_rust_spec::spec::decimal::decimal_from_i128_with_scale;
+    use iceberg_rust_spec::spec::schema::Schema;
+    use iceberg_rust_spec::spec::types::{PrimitiveType, StructField, Type};
+    use iceberg_rust_spec::spec::values::Value;
+    use iceberg_rust_spec::table_metadata::WRITE_METADATA_METRICS_DEFAULT;
+    use parquet::arrow::ArrowWriter;
+    use parquet::basic::Type as PhysicalType;
+    use parquet::file::metadata::ParquetMetaData;
+    use parquet::file::properties::WriterProperties;
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+    use uuid::Uuid;
+
+    use super::{parquet_to_datafile, widen_bound};
+
+    /// Values of different variants have no common order: the column loses
+    /// its bound for the whole file instead of keeping whichever came first.
+    #[test]
+    fn incomparable_row_group_bounds_drop_the_column_bound() {
+        let mut bounds = HashMap::new();
+        let mut unmergeable = std::collections::HashSet::new();
+        widen_bound(
+            &mut bounds,
+            &mut unmergeable,
+            7,
+            Value::Int(5),
+            std::cmp::Ordering::Less,
+        );
+        widen_bound(
+            &mut bounds,
+            &mut unmergeable,
+            7,
+            Value::Int(3),
+            std::cmp::Ordering::Less,
+        );
+        assert_eq!(bounds.get(&7), Some(&Value::Int(3)));
+        widen_bound(
+            &mut bounds,
+            &mut unmergeable,
+            7,
+            Value::LongInt(1),
+            std::cmp::Ordering::Less,
+        );
+        assert_eq!(bounds.get(&7), None);
+        widen_bound(
+            &mut bounds,
+            &mut unmergeable,
+            7,
+            Value::Int(0),
+            std::cmp::Ordering::Less,
+        );
+        assert_eq!(bounds.get(&7), None, "a dropped bound must stay dropped");
+    }
+
+    fn field(id: i32, name: &str, field_type: PrimitiveType) -> StructField {
+        StructField {
+            id,
+            name: name.to_string(),
+            required: false,
+            field_type: Type::Primitive(field_type),
+            doc: None,
+            initial_default: None,
+            write_default: None,
+        }
+    }
+
+    fn decimal(precision: u8, scale: i8, values: [i128; 4]) -> ArrayRef {
+        Arc::new(
+            Decimal128Array::from(values.to_vec())
+                .with_precision_and_scale(precision, scale)
+                .unwrap(),
+        )
+    }
+
+    /// Writes `columns` as a Parquet file of two-row row groups and returns
+    /// its footer and size.
+    fn two_row_group_file(
+        arrow_schema: Arc<ArrowSchema>,
+        columns: Vec<ArrayRef>,
+    ) -> (ParquetMetaData, u64) {
+        let batch = RecordBatch::try_new(Arc::clone(&arrow_schema), columns).unwrap();
+        let properties = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(2))
+            .build();
+        let mut buffer = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut buffer, arrow_schema, Some(properties)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let file_size = buffer.len() as u64;
+        let reader = SerializedFileReader::new(bytes::Bytes::from(buffer)).unwrap();
+        let metadata = reader.metadata().clone();
+        assert_eq!(metadata.num_row_groups(), 2);
+        (metadata, file_size)
+    }
+
+    /// The file-level bound is the min/max over every row group, not the first
+    /// row group's. A multi-row-group file whose extremes sit in a later row
+    /// group (any large COPY/INSERT/CTAS output) must not understate its range:
+    /// manifest pruning and statistics-answered `MIN`/`MAX` trust these bounds.
+    #[test]
+    fn bounds_cover_every_row_group_for_every_primitive_type() {
+        let schema = Schema::builder()
+            .with_struct_field(field(
+                1,
+                "dec38",
+                PrimitiveType::Decimal {
+                    precision: 38,
+                    scale: 0,
+                },
+            ))
+            .with_struct_field(field(
+                2,
+                "dec8",
+                PrimitiveType::Decimal {
+                    precision: 8,
+                    scale: 0,
+                },
+            ))
+            .with_struct_field(field(
+                3,
+                "dec18",
+                PrimitiveType::Decimal {
+                    precision: 18,
+                    scale: 2,
+                },
+            ))
+            .with_struct_field(field(4, "text", PrimitiveType::String))
+            .with_struct_field(field(5, "flag", PrimitiveType::Boolean))
+            .with_struct_field(field(6, "bytes", PrimitiveType::Binary))
+            .with_struct_field(field(7, "fixed", PrimitiveType::Fixed(3)))
+            .with_struct_field(field(8, "uuid_fixed", PrimitiveType::Uuid))
+            .with_struct_field(field(9, "uuid_text", PrimitiveType::Uuid))
+            .build()
+            .unwrap();
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("dec38", DataType::Decimal128(38, 0), true),
+            Field::new("dec8", DataType::Decimal128(8, 0), true),
+            Field::new("dec18", DataType::Decimal128(18, 2), true),
+            Field::new("text", DataType::Utf8, true),
+            Field::new("flag", DataType::Boolean, true),
+            Field::new("bytes", DataType::Binary, true),
+            Field::new("fixed", DataType::FixedSizeBinary(3), true),
+            Field::new("uuid_fixed", DataType::FixedSizeBinary(16), true),
+            Field::new("uuid_text", DataType::Utf8, true),
+        ]));
+        let uuids = [
+            "6d000000-0000-4000-8000-000000000000",
+            "6e000000-0000-4000-8000-000000000000",
+            "00000000-0000-4000-8000-000000000001",
+            "ffffffff-ffff-4fff-bfff-ffffffffffff",
+        ]
+        .map(|text| Uuid::parse_str(text).unwrap());
+        // Row group 1 = rows 0..2, row group 2 = rows 2..4; the second row
+        // group holds both extremes of every column.
+        let columns: Vec<ArrayRef> = vec![
+            decimal(38, 0, [2_965_378, 3_000_000, -1, 9_577_668]),
+            decimal(8, 0, [2_965_378, 3_000_000, 1, 9_577_668]),
+            decimal(18, 2, [500, 600, -12_345, 99_999]),
+            Arc::new(StringArray::from(vec![
+                "mango",
+                "nectarine",
+                "apple",
+                "zucchini",
+            ])),
+            Arc::new(BooleanArray::from(vec![true, true, false, true])),
+            Arc::new(BinaryArray::from(vec![
+                &b"m"[..],
+                &b"n"[..],
+                &b"\x00"[..],
+                &b"\xff"[..],
+            ])),
+            Arc::new(
+                FixedSizeBinaryArray::try_from_iter(
+                    [b"mmm", b"nnn", b"\x00\x00\x01", b"\xff\xff\xfe"].into_iter(),
+                )
+                .unwrap(),
+            ),
+            Arc::new(
+                FixedSizeBinaryArray::try_from_iter(uuids.iter().map(Uuid::as_bytes)).unwrap(),
+            ),
+            Arc::new(StringArray::from(
+                uuids.iter().map(Uuid::to_string).collect::<Vec<_>>(),
+            )),
+        ];
+        let (metadata, file_size) = two_row_group_file(arrow_schema, columns);
+        // The three decimals cover the three Parquet decimal encodings, and the
+        // two UUID columns both UUID decodings (16-byte FLBA, UTF-8 string).
+        let physical = |index: usize| metadata.row_group(0).column(index).column_type();
+        assert_eq!(physical(0), PhysicalType::FIXED_LEN_BYTE_ARRAY);
+        assert_eq!(physical(1), PhysicalType::INT32);
+        assert_eq!(physical(2), PhysicalType::INT64);
+        assert_eq!(physical(7), PhysicalType::FIXED_LEN_BYTE_ARRAY);
+        assert_eq!(physical(8), PhysicalType::BYTE_ARRAY);
+
+        let datafile = parquet_to_datafile(
+            "/t/data/row-groups.parquet",
+            file_size,
+            &metadata,
+            &schema,
+            &[],
+            None,
+            // Untruncated bounds, so string and binary bounds compare exactly.
+            &HashMap::from([(
+                WRITE_METADATA_METRICS_DEFAULT.to_string(),
+                "full".to_string(),
+            )]),
+        )
+        .unwrap();
+        let lower = datafile.lower_bounds().as_ref().unwrap();
+        let upper = datafile.upper_bounds().as_ref().unwrap();
+        let dec = |mantissa, scale| {
+            Value::Decimal(decimal_from_i128_with_scale(mantissa, scale).unwrap())
+        };
+
+        assert_eq!(lower.get(&1), Some(&dec(-1, 0)), "dec38 lower");
+        assert_eq!(upper.get(&1), Some(&dec(9_577_668, 0)), "dec38 upper");
+        assert_eq!(lower.get(&2), Some(&dec(1, 0)), "dec8 lower");
+        assert_eq!(upper.get(&2), Some(&dec(9_577_668, 0)), "dec8 upper");
+        assert_eq!(lower.get(&3), Some(&dec(-12_345, 2)), "dec18 lower");
+        assert_eq!(upper.get(&3), Some(&dec(99_999, 2)), "dec18 upper");
+        assert_eq!(lower.get(&4), Some(&Value::String("apple".to_string())));
+        assert_eq!(upper.get(&4), Some(&Value::String("zucchini".to_string())));
+        assert_eq!(lower.get(&5), Some(&Value::Boolean(false)));
+        assert_eq!(upper.get(&5), Some(&Value::Boolean(true)));
+        assert_eq!(lower.get(&6), Some(&Value::Binary(vec![0x00])));
+        assert_eq!(upper.get(&6), Some(&Value::Binary(vec![0xff])));
+        assert_eq!(
+            lower.get(&7),
+            Some(&Value::Fixed(3, vec![0x00, 0x00, 0x01]))
+        );
+        assert_eq!(
+            upper.get(&7),
+            Some(&Value::Fixed(3, vec![0xff, 0xff, 0xfe]))
+        );
+        assert_eq!(
+            lower.get(&8),
+            Some(&Value::UUID(uuids[2])),
+            "uuid_fixed lower"
+        );
+        assert_eq!(
+            upper.get(&8),
+            Some(&Value::UUID(uuids[3])),
+            "uuid_fixed upper"
+        );
+        assert_eq!(
+            lower.get(&9),
+            Some(&Value::UUID(uuids[2])),
+            "uuid_text lower"
+        );
+        assert_eq!(
+            upper.get(&9),
+            Some(&Value::UUID(uuids[3])),
+            "uuid_text upper"
+        );
+    }
+
+    /// Under the default `truncate(16)` mode the merged string bound is
+    /// truncated once, after the merge: the lower bound is the global minimum's
+    /// prefix and the upper bound is raised from the global maximum's prefix,
+    /// so both still cover every row group.
+    #[test]
+    fn default_truncated_string_bounds_cover_every_row_group() {
+        let schema = Schema::builder()
+            .with_struct_field(field(1, "text", PrimitiveType::String))
+            .build()
+            .unwrap();
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "text",
+            DataType::Utf8,
+            true,
+        )]));
+        let minimum = "apple-pie-with-custard-and-cream";
+        let maximum = "zucchini-bread-with-walnuts";
+        let values = [
+            "mango-lassi-with-cardamom",
+            "nectarine-tart-with-almonds",
+            minimum,
+            maximum,
+        ];
+        let (metadata, file_size) = two_row_group_file(
+            arrow_schema,
+            vec![Arc::new(StringArray::from(values.to_vec()))],
+        );
+
+        let datafile = parquet_to_datafile(
+            "/t/data/truncated.parquet",
+            file_size,
+            &metadata,
+            &schema,
+            &[],
+            None,
+            &HashMap::new(),
+        )
+        .unwrap();
+        let string_bound = |bounds: &Option<HashMap<i32, Value>>| match bounds.as_ref()?.get(&1)? {
+            Value::String(string) => Some(string.clone()),
+            other => panic!("expected a string bound, got {other:?}"),
+        };
+        let lower = string_bound(datafile.lower_bounds()).expect("a lower bound");
+        assert_eq!(lower, "apple-pie-with-c");
+        assert!(values.iter().all(|value| lower.as_str() <= *value));
+        // An upper bound that cannot be raised is dropped, never understated.
+        let upper = string_bound(datafile.upper_bounds()).expect("an upper bound");
+        assert_eq!(upper, "zucchini-bread-x");
+        assert!(values.iter().all(|value| upper.as_str() >= *value));
     }
 }
 
