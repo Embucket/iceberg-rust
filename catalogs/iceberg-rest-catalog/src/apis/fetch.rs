@@ -2,7 +2,9 @@ use crate::apis::{configuration, ResponseContent};
 
 use super::{Conditional, Error};
 
+use reqwest::header::HeaderMap;
 use std::collections::HashMap;
+use std::time::{Duration, SystemTime};
 
 pub(crate) async fn fetch_inner<R, E>(
     configuration: &configuration::Configuration,
@@ -95,17 +97,13 @@ where
     )
     .await?;
     let status = resp.status();
+    let resp_headers = resp.headers().clone();
     let content = resp.text().await?;
     if !status.is_client_error() && !status.is_server_error() {
         let body = if content.is_empty() { "null" } else { &content };
         serde_json::from_str(body).map_err(Error::from)
     } else {
-        let entity: Option<E> = serde_json::from_str(&content).ok();
-        Err(Error::ResponseError(ResponseContent {
-            status,
-            content,
-            entity,
-        }))
+        Err(response_error(status, &resp_headers, content))
     }
 }
 
@@ -133,23 +131,81 @@ where
     )
     .await?;
     let status = response.status();
+    let resp_headers = response.headers().clone();
     let content = response.text().await?;
-    unit_response(status, content)
+    unit_response(status, &resp_headers, content)
 }
 
-fn unit_response<E>(status: reqwest::StatusCode, content: String) -> Result<(), Error<E>>
+fn unit_response<E>(
+    status: reqwest::StatusCode,
+    headers: &HeaderMap,
+    content: String,
+) -> Result<(), Error<E>>
 where
     E: serde::de::DeserializeOwned,
 {
     if status.is_success() {
         return Ok(());
     }
+    Err(response_error(status, headers, content))
+}
+
+/// Build the [`Error::ResponseError`] for a non-success response, keeping its status, body,
+/// decoded error entity (when the body parses as `E`) and `Retry-After` hint.
+pub(crate) fn response_error<E>(
+    status: reqwest::StatusCode,
+    headers: &HeaderMap,
+    content: String,
+) -> Error<E>
+where
+    E: serde::de::DeserializeOwned,
+{
     let entity = serde_json::from_str(&content).ok();
-    Err(Error::ResponseError(ResponseContent {
+    Error::ResponseError(ResponseContent {
         status,
         content,
         entity,
-    }))
+        retry_after: retry_after(headers, SystemTime::now()),
+    })
+}
+
+/// Parse the `Retry-After` response header (RFC 9110 section 10.2.3) relative to `now`.
+///
+/// Accepts delta-seconds and the three HTTP-date formats (IMF-fixdate, RFC 850, asctime).
+/// An HTTP-date at or before `now` yields [`Duration::ZERO`]; a missing or malformed header
+/// yields `None`.
+fn retry_after(headers: &HeaderMap, now: SystemTime) -> Option<Duration> {
+    let value = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim();
+    if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return value.parse().ok().map(Duration::from_secs);
+    }
+    let retry_at = parse_http_date(value)?;
+    let retry_at =
+        SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(u64::try_from(retry_at).ok()?))?;
+    Some(retry_at.duration_since(now).unwrap_or(Duration::ZERO))
+}
+
+/// Parse an HTTP-date (RFC 9110 section 5.6.7) into seconds since the Unix epoch.
+fn parse_http_date(value: &str) -> Option<i64> {
+    use chrono::NaiveDateTime;
+
+    const FORMATS: [&str; 3] = [
+        // IMF-fixdate: Sun, 06 Nov 1994 08:49:37 GMT
+        "%a, %d %b %Y %H:%M:%S GMT",
+        // obsolete RFC 850: Sunday, 06-Nov-94 08:49:37 GMT
+        "%A, %d-%b-%y %H:%M:%S GMT",
+        // obsolete asctime: Sun Nov  6 08:49:37 1994
+        "%a %b %e %H:%M:%S %Y",
+    ];
+    FORMATS.iter().find_map(|format| {
+        NaiveDateTime::parse_from_str(value, format)
+            .ok()
+            .map(|date| date.and_utc().timestamp())
+    })
 }
 
 pub(crate) async fn fetch_conditional<R, T, E>(
@@ -190,12 +246,7 @@ where
             headers: resp_headers,
         })
     } else {
-        let entity: Option<E> = serde_json::from_str(&content).ok();
-        Err(Error::ResponseError(ResponseContent {
-            status,
-            content,
-            entity,
-        }))
+        Err(response_error(status, &resp_headers, content))
     }
 }
 
@@ -231,15 +282,23 @@ mod tests {
             (reqwest::StatusCode::OK, "null"),
             (reqwest::StatusCode::OK, "\"NO_CONTENT\""),
         ] {
-            assert!(unit_response::<serde_json::Value>(status, body.to_string()).is_ok());
+            assert!(unit_response::<serde_json::Value>(
+                status,
+                &HeaderMap::new(),
+                body.to_string()
+            )
+            .is_ok());
         }
     }
 
     #[test]
     fn unit_response_keeps_error_status_and_body() {
         let body = r#"{"error":"invalid rename"}"#;
-        let result =
-            unit_response::<serde_json::Value>(reqwest::StatusCode::BAD_REQUEST, body.to_string());
+        let result = unit_response::<serde_json::Value>(
+            reqwest::StatusCode::BAD_REQUEST,
+            &HeaderMap::new(),
+            body.to_string(),
+        );
         match result {
             Err(Error::ResponseError(response)) => {
                 assert_eq!(response.status, reqwest::StatusCode::BAD_REQUEST);
@@ -248,5 +307,86 @@ mod tests {
             }
             _ => panic!("expected REST response error"),
         }
+    }
+
+    fn headers_with_retry_after(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            reqwest::header::HeaderValue::from_str(value).unwrap(),
+        );
+        headers
+    }
+
+    // 2015-10-21T07:28:00Z
+    const DATE_EPOCH_SECS: u64 = 1_445_412_480;
+
+    #[test]
+    fn retry_after_parses_delta_seconds() {
+        let now = SystemTime::now();
+        assert_eq!(
+            retry_after(&headers_with_retry_after("2"), now),
+            Some(Duration::from_secs(2))
+        );
+        assert_eq!(
+            retry_after(&headers_with_retry_after(" 120 "), now),
+            Some(Duration::from_secs(120))
+        );
+        assert_eq!(
+            retry_after(&headers_with_retry_after("0"), now),
+            Some(Duration::ZERO)
+        );
+        for invalid in ["", "-1", "1.5", "soon", "2 seconds"] {
+            assert_eq!(
+                retry_after(&headers_with_retry_after(invalid), now),
+                None,
+                "{invalid:?}"
+            );
+        }
+        assert_eq!(retry_after(&HeaderMap::new(), now), None);
+    }
+
+    #[test]
+    fn retry_after_parses_http_dates_relative_to_now() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(DATE_EPOCH_SECS - 30);
+        for date in [
+            // IMF-fixdate, obsolete RFC 850 and asctime formats (RFC 9110 section 5.6.7).
+            "Wed, 21 Oct 2015 07:28:00 GMT",
+            "Wednesday, 21-Oct-15 07:28:00 GMT",
+            "Wed Oct 21 07:28:00 2015",
+        ] {
+            assert_eq!(
+                retry_after(&headers_with_retry_after(date), now),
+                Some(Duration::from_secs(30)),
+                "{date:?}"
+            );
+        }
+        let later = SystemTime::UNIX_EPOCH + Duration::from_secs(DATE_EPOCH_SECS + 30);
+        assert_eq!(
+            retry_after(
+                &headers_with_retry_after("Wed, 21 Oct 2015 07:28:00 GMT"),
+                later
+            ),
+            Some(Duration::ZERO),
+            "an HTTP-date in the past means retry now"
+        );
+        assert_eq!(
+            retry_after(
+                &headers_with_retry_after("Wed, 32 Oct 2015 07:28:00 GMT"),
+                now
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn response_error_keeps_retry_after() {
+        let error = response_error::<serde_json::Value>(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            &headers_with_retry_after("2"),
+            "slow down".to_string(),
+        );
+        assert_eq!(error.status(), Some(reqwest::StatusCode::TOO_MANY_REQUESTS));
+        assert_eq!(error.retry_after(), Some(Duration::from_secs(2)));
     }
 }

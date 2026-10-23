@@ -200,3 +200,21 @@ cargo doc --open
 
 
 
+
+## Error responses
+
+Non-success HTTP responses are returned as `apis::Error::ResponseError`, whose `ResponseContent`
+keeps the status code, body, decoded error entity and the parsed `Retry-After` header
+(`retry_after: Option<Duration>`, from delta-seconds or an HTTP-date; an HTTP-date in the past is
+`Duration::ZERO`). `apis::Error::status()` and `apis::Error::retry_after()` expose them.
+
+Converted to `iceberg_rust::error::Error` (as returned by the `Catalog` methods, e.g.
+`load_tabular`):
+
+- 404 becomes `Error::NotFound` (`load_tabular` reports `Error::CatalogNotFound` when neither a
+  table nor a view exists) and 409 becomes `Error::CommitConflict`, as before.
+- Every other error status becomes `Error::HttpResponse`, whose `Display` text is unchanged
+  (`Response status: ..., Response content: ... doesn't have the right format`).
+  `Error::http_status()` and `Error::retry_after()` return the typed status and delay so
+  callers can tell authentication failures (401/403) from throttling or server errors
+  (429/5xx) without parsing the message.

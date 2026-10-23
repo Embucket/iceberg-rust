@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 
 use super::{configuration, fetch, Error};
-use crate::{apis::ResponseContent, models};
+use crate::models;
 use iceberg_rust::{
     catalog::{
         commit::{CommitTable, CommitView},
@@ -755,13 +755,9 @@ pub async fn load_credentials(
         let content = resp.text().await?;
         serde_json::from_str(&content).map_err(Error::from)
     } else {
+        let resp_headers = resp.headers().clone();
         let content = resp.text().await?;
-        let entity: Option<LoadCredentialsError> = serde_json::from_str(&content).ok();
-        Err(Error::ResponseError(ResponseContent {
-            status,
-            content,
-            entity,
-        }))
+        Err(super::fetch::response_error(status, &resp_headers, content))
     }
 }
 

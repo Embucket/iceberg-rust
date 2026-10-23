@@ -2,12 +2,16 @@ use aws_sigv4;
 use iceberg_rust::error::Error as IcebergError;
 use std::error;
 use std::fmt;
+use std::time::Duration;
 
 #[derive(Debug, Clone)]
 pub struct ResponseContent<T> {
     pub status: reqwest::StatusCode,
     pub content: String,
     pub entity: Option<T>,
+    /// Delay requested by the response's `Retry-After` header (delta-seconds or HTTP-date,
+    /// relative to when the response was received). `None` when absent or unparseable.
+    pub retry_after: Option<Duration>,
 }
 
 /// Outcome of a conditional (ETag-validated) request.
@@ -43,6 +47,25 @@ impl<T> fmt::Display for Error<T> {
             Error::OAuthToken(e) => ("oauth token", e.to_string()),
         };
         write!(f, "error in {}: {}", module, e)
+    }
+}
+
+impl<T> Error<T> {
+    /// HTTP status code of an error response, if the server answered at all.
+    pub fn status(&self) -> Option<reqwest::StatusCode> {
+        match self {
+            Error::ResponseError(response) => Some(response.status),
+            Error::Reqwest(error) => error.status(),
+            _ => None,
+        }
+    }
+
+    /// Delay requested by an error response's `Retry-After` header, if any.
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Error::ResponseError(response) => response.retry_after,
+            _ => None,
+        }
     }
 }
 

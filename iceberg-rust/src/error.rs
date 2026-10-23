@@ -2,8 +2,58 @@
 Error type for iceberg
 */
 
+use std::{fmt, time::Duration};
+
 use arrow::error::ArrowError;
 use thiserror::Error;
+
+/// Error response returned by a remote (e.g. REST) catalog over HTTP.
+///
+/// Carries the HTTP status code and the parsed `Retry-After` hint so callers can classify
+/// failures (authentication vs. throttling vs. server errors) without parsing message text.
+/// Its `Display` output matches the legacy [`Error::InvalidFormat`] text that these errors
+/// were reported with before, so existing log and error messages are unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpResponseError {
+    status: u16,
+    retry_after: Option<Duration>,
+    message: String,
+}
+
+impl HttpResponseError {
+    /// Create a response error from its HTTP status, optional `Retry-After` delay and
+    /// human-readable message (status line and response body).
+    pub fn new(status: u16, retry_after: Option<Duration>, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            retry_after,
+            message: message.into(),
+        }
+    }
+
+    /// HTTP status code of the response.
+    pub fn status(&self) -> u16 {
+        self.status
+    }
+
+    /// Delay requested by the server's `Retry-After` header, if present and valid.
+    /// An HTTP-date in the past is reported as [`Duration::ZERO`].
+    pub fn retry_after(&self) -> Option<Duration> {
+        self.retry_after
+    }
+
+    /// Human-readable message (status line and response body).
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl fmt::Display for HttpResponseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Same text as `Error::InvalidFormat(message)`, which carried these errors before.
+        write!(f, "{} doesn't have the right format", self.message)
+    }
+}
 
 #[derive(Error, Debug)]
 /// Iceberg error
@@ -37,6 +87,10 @@ pub enum Error {
         "Commit to {0} conflicted with a concurrent commit; the base metadata is no longer current"
     )]
     CommitConflict(String),
+    /// HTTP error response from a remote catalog (status codes other than those mapped to
+    /// [`Error::NotFound`] and [`Error::CommitConflict`])
+    #[error("{0}")]
+    HttpResponse(HttpResponseError),
     /// External error
     #[error(transparent)]
     External(Box<dyn std::error::Error + Send + Sync>),
@@ -97,6 +151,28 @@ pub enum Error {
     /// derive builder
     #[error(transparent)]
     DeriveBuilder(#[from] derive_builder::UninitializedFieldError),
+}
+
+impl Error {
+    /// HTTP status code of a remote catalog error response, if this error carries one.
+    ///
+    /// Only [`Error::HttpResponse`] carries a status; responses mapped to
+    /// [`Error::NotFound`] (404) or [`Error::CommitConflict`] (409) keep those variants and
+    /// return `None` here.
+    pub fn http_status(&self) -> Option<u16> {
+        match self {
+            Error::HttpResponse(error) => Some(error.status()),
+            _ => None,
+        }
+    }
+
+    /// Delay requested by a remote catalog's `Retry-After` response header, if any.
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Error::HttpResponse(error) => error.retry_after(),
+            _ => None,
+        }
+    }
 }
 
 impl From<apache_avro::Error> for Error {
