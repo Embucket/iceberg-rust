@@ -18,6 +18,7 @@ use crate::error::Error;
 
 pub mod parse;
 pub mod store;
+pub mod vended;
 
 /// Parse an Iceberg metadata location without percent-encoding it a second time.
 pub fn object_store_path_from_metadata(

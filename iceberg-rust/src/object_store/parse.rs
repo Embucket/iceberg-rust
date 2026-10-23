@@ -2,6 +2,7 @@
 */
 
 use crate::error::Error;
+use crate::object_store::vended::StoreClientConfig;
 use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey};
 use object_store::azure::{AzureConfigKey, MicrosoftAzureBuilder};
 use object_store::gcp::{GcpCredential, GoogleCloudStorageBuilder, GoogleConfigKey};
@@ -11,13 +12,13 @@ use std::sync::Arc;
 use url::Url;
 
 /// AWS configs
-const CLIENT_REGION: &str = "client.region";
-const AWS_ACCESS_KEY_ID: &str = "s3.access-key-id";
-const AWS_SECRET_ACCESS_KEY: &str = "s3.secret-access-key";
-const AWS_SESSION_TOKEN: &str = "s3.session-token";
-const AWS_REGION: &str = "s3.region";
-const AWS_ENDPOINT: &str = "s3.endpoint";
-const AWS_ALLOW_ANONYMOUS: &str = "s3.allow-anonymous";
+pub(crate) const CLIENT_REGION: &str = "client.region";
+pub(crate) const AWS_ACCESS_KEY_ID: &str = "s3.access-key-id";
+pub(crate) const AWS_SECRET_ACCESS_KEY: &str = "s3.secret-access-key";
+pub(crate) const AWS_SESSION_TOKEN: &str = "s3.session-token";
+pub(crate) const AWS_REGION: &str = "s3.region";
+pub(crate) const AWS_ENDPOINT: &str = "s3.endpoint";
+pub(crate) const AWS_ALLOW_ANONYMOUS: &str = "s3.allow-anonymous";
 
 /// GCP configs
 const GCS_BUCKET: &str = "gcs.bucket";
@@ -36,32 +37,26 @@ pub fn object_store_from_config(
     url: Url,
     config: HashMap<String, String>,
 ) -> Result<Arc<dyn ObjectStore>, Error> {
+    object_store_from_config_with_client(url, config, &StoreClientConfig::default())
+}
+
+/// Like [`object_store_from_config`], but applies the embedder-supplied HTTP client settings
+/// (`ClientOptions`, `RetryConfig`, `HttpConnector`) to S3, GCS and Azure stores.
+///
+/// With a default [`StoreClientConfig`] this builds exactly what [`object_store_from_config`]
+/// always built: object_store's default client options and one new HTTP client per store.
+pub fn object_store_from_config_with_client(
+    url: Url,
+    config: HashMap<String, String>,
+    client: &StoreClientConfig,
+) -> Result<Arc<dyn ObjectStore>, Error> {
     let store = match ObjectStoreScheme::parse(&url).map_err(object_store::Error::from)? {
         (ObjectStoreScheme::AmazonS3, _) => {
-            let mut builder = AmazonS3Builder::new().with_url(url);
-            for (key, option) in config {
-                let s3_key = match key.as_str() {
-                    AWS_ACCESS_KEY_ID => AmazonS3ConfigKey::AccessKeyId,
-                    AWS_SECRET_ACCESS_KEY => AmazonS3ConfigKey::SecretAccessKey,
-                    AWS_SESSION_TOKEN => AmazonS3ConfigKey::Token,
-                    CLIENT_REGION | AWS_REGION => AmazonS3ConfigKey::Region,
-                    AWS_ENDPOINT => {
-                        if option.starts_with("http://") {
-                            // This is mainly used for testing, e.g. against MinIO
-                            builder = builder.with_allow_http(true);
-                        }
-                        AmazonS3ConfigKey::Endpoint
-                    }
-                    AWS_ALLOW_ANONYMOUS => AmazonS3ConfigKey::SkipSignature,
-                    _ => continue,
-                };
-                builder = builder.with_config(s3_key, option);
-            }
-            Arc::new(builder.build()?) as Arc<dyn ObjectStore>
+            Arc::new(s3_builder_from_config(url, &config, client).build()?) as Arc<dyn ObjectStore>
         }
 
         (ObjectStoreScheme::GoogleCloudStorage, _) => {
-            let mut builder = GoogleCloudStorageBuilder::new().with_url(url);
+            let mut builder = client.apply_gcs(GoogleCloudStorageBuilder::new().with_url(url));
             for (key, option) in config {
                 let gcs_key = match key.as_str() {
                     GCS_CREDENTIALS_JSON => GoogleConfigKey::ServiceAccountKey,
@@ -81,7 +76,7 @@ pub fn object_store_from_config(
         }
 
         (ObjectStoreScheme::MicrosoftAzure, _) => {
-            let mut builder = MicrosoftAzureBuilder::new().with_url(url);
+            let mut builder = client.apply_azure(MicrosoftAzureBuilder::new().with_url(url));
             for (key, option) in config {
                 let azure_key = match key.as_str() {
                     AZURE_CONTAINER_NAME => AzureConfigKey::ContainerName,
@@ -108,6 +103,37 @@ pub fn object_store_from_config(
     };
 
     Ok(store)
+}
+
+/// An [`AmazonS3Builder`] for an Iceberg S3 `config` at `url`, with `client` settings applied.
+///
+/// Client settings are applied first so that config-derived client options (`allow_http` for an
+/// `http://` endpoint) are layered on top of the embedder's `ClientOptions`, not replaced by them.
+pub(crate) fn s3_builder_from_config(
+    url: Url,
+    config: &HashMap<String, String>,
+    client: &StoreClientConfig,
+) -> AmazonS3Builder {
+    let mut builder = client.apply_s3(AmazonS3Builder::new().with_url(url));
+    for (key, option) in config {
+        let s3_key = match key.as_str() {
+            AWS_ACCESS_KEY_ID => AmazonS3ConfigKey::AccessKeyId,
+            AWS_SECRET_ACCESS_KEY => AmazonS3ConfigKey::SecretAccessKey,
+            AWS_SESSION_TOKEN => AmazonS3ConfigKey::Token,
+            CLIENT_REGION | AWS_REGION => AmazonS3ConfigKey::Region,
+            AWS_ENDPOINT => {
+                if option.starts_with("http://") {
+                    // This is mainly used for testing, e.g. against MinIO
+                    builder = builder.with_allow_http(true);
+                }
+                AmazonS3ConfigKey::Endpoint
+            }
+            AWS_ALLOW_ANONYMOUS => AmazonS3ConfigKey::SkipSignature,
+            _ => continue,
+        };
+        builder = builder.with_config(s3_key, option);
+    }
+    builder
 }
 
 #[cfg(test)]
@@ -161,6 +187,45 @@ mod tests {
         assert!(store_repr.contains("bucket_endpoint: \"http://localhost:9000/test-bucket\""));
         assert!(store_repr.contains("allow_http: Parsed(true)"));
         assert!(store_repr.contains("skip_signature: true"));
+    }
+
+    #[test]
+    fn client_options_are_applied_to_vended_store() {
+        use object_store::ClientOptions;
+        use std::time::Duration;
+
+        let client = StoreClientConfig::new().with_client_options(
+            ClientOptions::new()
+                .with_timeout(Duration::from_secs(10))
+                .with_connect_timeout(Duration::from_secs(3)),
+        );
+        let mut config = HashMap::new();
+        config.insert(
+            AWS_ENDPOINT.to_string(),
+            "http://localhost:9000".to_string(),
+        );
+        config.insert(AWS_ACCESS_KEY_ID.to_string(), "test-key".to_string());
+        config.insert(AWS_SECRET_ACCESS_KEY.to_string(), "test-secret".to_string());
+        let url = Url::parse("s3://test-bucket/").unwrap();
+        let store = format!(
+            "{:?}",
+            object_store_from_config_with_client(url.clone(), config.clone(), &client).unwrap()
+        );
+        assert!(store.contains("timeout: Some(Parsed(10s))"), "{store}");
+        assert!(
+            store.contains("connect_timeout: Some(Parsed(3s))"),
+            "{store}"
+        );
+        // The vended http:// endpoint is layered on top of the embedder's options.
+        assert!(store.contains("allow_http: Parsed(true)"), "{store}");
+
+        // Without client settings the vended store keeps object_store's defaults.
+        let store = format!("{:?}", object_store_from_config(url, config).unwrap());
+        assert!(store.contains("timeout: Some(Parsed(30s))"), "{store}");
+        assert!(
+            store.contains("connect_timeout: Some(Parsed(5s))"),
+            "{store}"
+        );
     }
 
     #[test]
