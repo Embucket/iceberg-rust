@@ -908,7 +908,9 @@ mod row_group_bound_tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use arrow::array::{ArrayRef, BinaryArray, BooleanArray, Decimal128Array, StringArray};
+    use arrow::array::{
+        ArrayRef, BinaryArray, BooleanArray, Decimal128Array, FixedSizeBinaryArray, StringArray,
+    };
     use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use arrow::record_batch::RecordBatch;
     use iceberg_rust_spec::spec::decimal::decimal_from_i128_with_scale;
@@ -918,8 +920,10 @@ mod row_group_bound_tests {
     use iceberg_rust_spec::table_metadata::WRITE_METADATA_METRICS_DEFAULT;
     use parquet::arrow::ArrowWriter;
     use parquet::basic::Type as PhysicalType;
+    use parquet::file::metadata::ParquetMetaData;
     use parquet::file::properties::WriterProperties;
     use parquet::file::reader::{FileReader, SerializedFileReader};
+    use uuid::Uuid;
 
     use super::{parquet_to_datafile, widen_bound};
 
@@ -982,6 +986,27 @@ mod row_group_bound_tests {
         )
     }
 
+    /// Writes `columns` as a Parquet file of two-row row groups and returns
+    /// its footer and size.
+    fn two_row_group_file(
+        arrow_schema: Arc<ArrowSchema>,
+        columns: Vec<ArrayRef>,
+    ) -> (ParquetMetaData, u64) {
+        let batch = RecordBatch::try_new(Arc::clone(&arrow_schema), columns).unwrap();
+        let properties = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(2))
+            .build();
+        let mut buffer = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut buffer, arrow_schema, Some(properties)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let file_size = buffer.len() as u64;
+        let reader = SerializedFileReader::new(bytes::Bytes::from(buffer)).unwrap();
+        let metadata = reader.metadata().clone();
+        assert_eq!(metadata.num_row_groups(), 2);
+        (metadata, file_size)
+    }
+
     /// The file-level bound is the min/max over every row group, not the first
     /// row group's. A multi-row-group file whose extremes sit in a later row
     /// group (any large COPY/INSERT/CTAS output) must not understate its range:
@@ -1016,6 +1041,9 @@ mod row_group_bound_tests {
             .with_struct_field(field(4, "text", PrimitiveType::String))
             .with_struct_field(field(5, "flag", PrimitiveType::Boolean))
             .with_struct_field(field(6, "bytes", PrimitiveType::Binary))
+            .with_struct_field(field(7, "fixed", PrimitiveType::Fixed(3)))
+            .with_struct_field(field(8, "uuid_fixed", PrimitiveType::Uuid))
+            .with_struct_field(field(9, "uuid_text", PrimitiveType::Uuid))
             .build()
             .unwrap();
         let arrow_schema = Arc::new(ArrowSchema::new(vec![
@@ -1025,7 +1053,17 @@ mod row_group_bound_tests {
             Field::new("text", DataType::Utf8, true),
             Field::new("flag", DataType::Boolean, true),
             Field::new("bytes", DataType::Binary, true),
+            Field::new("fixed", DataType::FixedSizeBinary(3), true),
+            Field::new("uuid_fixed", DataType::FixedSizeBinary(16), true),
+            Field::new("uuid_text", DataType::Utf8, true),
         ]));
+        let uuids = [
+            "6d000000-0000-4000-8000-000000000000",
+            "6e000000-0000-4000-8000-000000000000",
+            "00000000-0000-4000-8000-000000000001",
+            "ffffffff-ffff-4fff-bfff-ffffffffffff",
+        ]
+        .map(|text| Uuid::parse_str(text).unwrap());
         // Row group 1 = rows 0..2, row group 2 = rows 2..4; the second row
         // group holds both extremes of every column.
         let columns: Vec<ArrayRef> = vec![
@@ -1045,29 +1083,33 @@ mod row_group_bound_tests {
                 &b"\x00"[..],
                 &b"\xff"[..],
             ])),
+            Arc::new(
+                FixedSizeBinaryArray::try_from_iter(
+                    [b"mmm", b"nnn", b"\x00\x00\x01", b"\xff\xff\xfe"].into_iter(),
+                )
+                .unwrap(),
+            ),
+            Arc::new(
+                FixedSizeBinaryArray::try_from_iter(uuids.iter().map(Uuid::as_bytes)).unwrap(),
+            ),
+            Arc::new(StringArray::from(
+                uuids.iter().map(Uuid::to_string).collect::<Vec<_>>(),
+            )),
         ];
-        let batch = RecordBatch::try_new(Arc::clone(&arrow_schema), columns).unwrap();
-        let properties = WriterProperties::builder()
-            .set_max_row_group_row_count(Some(2))
-            .build();
-        let mut buffer = Vec::new();
-        let mut writer = ArrowWriter::try_new(&mut buffer, arrow_schema, Some(properties)).unwrap();
-        writer.write(&batch).unwrap();
-        writer.close().unwrap();
-        let file_size = buffer.len() as u64;
-        let reader = SerializedFileReader::new(bytes::Bytes::from(buffer)).unwrap();
-        let metadata = reader.metadata();
-        assert_eq!(metadata.num_row_groups(), 2);
-        // The three decimals cover the three Parquet decimal encodings.
+        let (metadata, file_size) = two_row_group_file(arrow_schema, columns);
+        // The three decimals cover the three Parquet decimal encodings, and the
+        // two UUID columns both UUID decodings (16-byte FLBA, UTF-8 string).
         let physical = |index: usize| metadata.row_group(0).column(index).column_type();
         assert_eq!(physical(0), PhysicalType::FIXED_LEN_BYTE_ARRAY);
         assert_eq!(physical(1), PhysicalType::INT32);
         assert_eq!(physical(2), PhysicalType::INT64);
+        assert_eq!(physical(7), PhysicalType::FIXED_LEN_BYTE_ARRAY);
+        assert_eq!(physical(8), PhysicalType::BYTE_ARRAY);
 
         let datafile = parquet_to_datafile(
             "/t/data/row-groups.parquet",
             file_size,
-            metadata,
+            &metadata,
             &schema,
             &[],
             None,
@@ -1096,6 +1138,85 @@ mod row_group_bound_tests {
         assert_eq!(upper.get(&5), Some(&Value::Boolean(true)));
         assert_eq!(lower.get(&6), Some(&Value::Binary(vec![0x00])));
         assert_eq!(upper.get(&6), Some(&Value::Binary(vec![0xff])));
+        assert_eq!(
+            lower.get(&7),
+            Some(&Value::Fixed(3, vec![0x00, 0x00, 0x01]))
+        );
+        assert_eq!(
+            upper.get(&7),
+            Some(&Value::Fixed(3, vec![0xff, 0xff, 0xfe]))
+        );
+        assert_eq!(
+            lower.get(&8),
+            Some(&Value::UUID(uuids[2])),
+            "uuid_fixed lower"
+        );
+        assert_eq!(
+            upper.get(&8),
+            Some(&Value::UUID(uuids[3])),
+            "uuid_fixed upper"
+        );
+        assert_eq!(
+            lower.get(&9),
+            Some(&Value::UUID(uuids[2])),
+            "uuid_text lower"
+        );
+        assert_eq!(
+            upper.get(&9),
+            Some(&Value::UUID(uuids[3])),
+            "uuid_text upper"
+        );
+    }
+
+    /// Under the default `truncate(16)` mode the merged string bound is
+    /// truncated once, after the merge: the lower bound is the global minimum's
+    /// prefix and the upper bound is raised from the global maximum's prefix,
+    /// so both still cover every row group.
+    #[test]
+    fn default_truncated_string_bounds_cover_every_row_group() {
+        let schema = Schema::builder()
+            .with_struct_field(field(1, "text", PrimitiveType::String))
+            .build()
+            .unwrap();
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "text",
+            DataType::Utf8,
+            true,
+        )]));
+        let minimum = "apple-pie-with-custard-and-cream";
+        let maximum = "zucchini-bread-with-walnuts";
+        let values = [
+            "mango-lassi-with-cardamom",
+            "nectarine-tart-with-almonds",
+            minimum,
+            maximum,
+        ];
+        let (metadata, file_size) = two_row_group_file(
+            arrow_schema,
+            vec![Arc::new(StringArray::from(values.to_vec()))],
+        );
+
+        let datafile = parquet_to_datafile(
+            "/t/data/truncated.parquet",
+            file_size,
+            &metadata,
+            &schema,
+            &[],
+            None,
+            &HashMap::new(),
+        )
+        .unwrap();
+        let string_bound = |bounds: &Option<HashMap<i32, Value>>| match bounds.as_ref()?.get(&1)? {
+            Value::String(string) => Some(string.clone()),
+            other => panic!("expected a string bound, got {other:?}"),
+        };
+        let lower = string_bound(datafile.lower_bounds()).expect("a lower bound");
+        assert_eq!(lower, "apple-pie-with-c");
+        assert!(values.iter().all(|value| lower.as_str() <= *value));
+        // An upper bound that cannot be raised is dropped, never understated.
+        let upper = string_bound(datafile.upper_bounds()).expect("an upper bound");
+        assert_eq!(upper, "zucchini-bread-x");
+        assert!(values.iter().all(|value| upper.as_str() >= *value));
     }
 }
 
