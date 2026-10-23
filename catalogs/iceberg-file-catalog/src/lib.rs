@@ -61,7 +61,7 @@ pub struct FileCatalog {
 }
 
 type MutationLock = tokio::sync::Mutex<()>;
-type MutationLockKey = (String, Identifier);
+type MutationLockKey = (String, ObjectPath);
 static TABLE_MUTATION_LOCKS: OnceLock<StdMutex<HashMap<MutationLockKey, Weak<MutationLock>>>> =
     OnceLock::new();
 type CatalogMutationLock = tokio::sync::RwLock<()>;
@@ -160,9 +160,14 @@ impl FileCatalog {
         if locks.len() > 4096 {
             locks.retain(|_, lock| lock.strong_count() > 0);
         }
+        let physical_identifier = self.physical_identifier(identifier);
+        let table_path = self.tabular_path(
+            &physical_identifier.namespace()[0],
+            physical_identifier.name(),
+        );
         let key = (
             self.mutation_root_key(),
-            self.physical_identifier(identifier),
+            ObjectPath::from(strip_prefix(&table_path)),
         );
         if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
             return lock;
@@ -1694,6 +1699,10 @@ pub mod tests {
         );
         let namespace = Namespace::try_new(&["public".to_owned()]).unwrap();
         let identifier = iceberg_rust::catalog::identifier::Identifier::new(&namespace, "items");
+        let physical_alias = iceberg_rust::catalog::identifier::Identifier::new(
+            &["public".to_owned(), "nested".to_owned()],
+            "items",
+        );
         let mut builder = CreateTableBuilder::default();
         builder
             .with_name(identifier.name())
@@ -1717,7 +1726,7 @@ pub mod tests {
         });
         reached_rx.await.unwrap();
 
-        let mut drop = Box::pin(dropper.drop_table(&identifier));
+        let mut drop = Box::pin(dropper.drop_table(&physical_alias));
         assert!(matches!(
             futures::poll!(drop.as_mut()),
             std::task::Poll::Pending
