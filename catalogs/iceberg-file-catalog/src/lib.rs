@@ -118,13 +118,21 @@ fn table_identity_path(location: &str) -> ObjectPath {
 pub mod error;
 
 impl FileCatalog {
+    fn mutation_root_key(&self) -> String {
+        let bucket = Bucket::from_path(&self.path)
+            .map(|bucket| bucket.to_string())
+            .unwrap_or_default();
+        let path = ObjectPath::from(strip_prefix(&self.path));
+        format!("{bucket}/{path}").trim_end_matches('/').to_owned()
+    }
+
     fn catalog_mutation_lock(&self) -> Arc<CatalogMutationLock> {
         let registry = CATALOG_MUTATION_LOCKS.get_or_init(|| StdMutex::new(HashMap::new()));
         let mut locks = registry.lock().unwrap();
         if locks.len() > 4096 {
             locks.retain(|_, lock| lock.strong_count() > 0);
         }
-        let key = self.path.trim_end_matches('/').to_owned();
+        let key = self.mutation_root_key();
         if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
             return lock;
         }
@@ -153,7 +161,7 @@ impl FileCatalog {
             locks.retain(|_, lock| lock.strong_count() > 0);
         }
         let key = (
-            self.path.trim_end_matches('/').to_owned(),
+            self.mutation_root_key(),
             self.physical_identifier(identifier),
         );
         if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
@@ -1680,7 +1688,7 @@ pub mod tests {
                 .unwrap(),
         );
         let dropper = Arc::new(
-            FileCatalog::new("/dev/update_drop/", store.clone())
+            FileCatalog::new("file:///dev/update_drop/", store.clone())
                 .await
                 .unwrap(),
         );
