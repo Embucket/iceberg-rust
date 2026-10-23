@@ -7,7 +7,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use futures::{FutureExt, TryFutureExt};
-use iceberg_rust::object_store::parse::object_store_from_config;
+use iceberg_rust::object_store::vended::{StoreClientConfig, VendedStoreCache};
 /**
 Iceberg rest catalog implementation
 */
@@ -41,6 +41,9 @@ use std::{
 };
 use url::Url;
 
+/// Identity of the table a vended store serves: catalog name plus table identifier.
+type VendedStoreKey = (Option<String>, Identifier);
+
 #[derive(Debug)]
 pub struct RestCatalog {
     name: Option<String>,
@@ -48,6 +51,7 @@ pub struct RestCatalog {
     default_object_store_builder: Option<ObjectStoreBuilder>,
     ignore_storage_credentials: bool,
     cache: Arc<RwLock<HashMap<Identifier, Arc<dyn ObjectStore>>>>,
+    vended_stores: Arc<VendedStoreCache<VendedStoreKey>>,
 }
 
 impl RestCatalog {
@@ -63,35 +67,63 @@ impl RestCatalog {
             default_object_store_builder,
             ignore_storage_credentials,
             cache: Arc::new(RwLock::new(HashMap::new())),
+            vended_stores: Arc::default(),
         }
+    }
+
+    /// Build stores from vended storage credentials with `client` (client options, retry policy,
+    /// HTTP connector) instead of object_store's defaults.
+    ///
+    /// Without this call vended stores use object_store's default client settings. In both
+    /// cases a reload of the same table at the same location keeps its store and only swaps the
+    /// vended credentials.
+    pub fn with_store_client_config(mut self, client: StoreClientConfig) -> Self {
+        self.vended_stores = Arc::new(VendedStoreCache::new(client));
+        self
+    }
+
+    /// How many object stores this catalog has built from vended storage configuration.
+    /// Reloads that reuse a store and swap its credentials do not count.
+    pub fn vended_store_builds(&self) -> u64 {
+        self.vended_stores.builds()
+    }
+
+    fn with_vended_stores(mut self, vended_stores: Arc<VendedStoreCache<VendedStoreKey>>) -> Self {
+        self.vended_stores = vended_stores;
+        self
+    }
+
+    fn vended_store_key(&self, identifier: &Identifier) -> VendedStoreKey {
+        (self.name.clone(), identifier.clone())
     }
 
     fn get_object_store(
         &self,
+        identifier: &Identifier,
         response: &models::LoadTableResult,
     ) -> Result<Arc<dyn ObjectStore>, Error> {
-        if self.ignore_storage_credentials {
-            return self
-                .default_object_store_builder
+        let default_store = || {
+            self.default_object_store_builder
                 .as_ref()
                 .ok_or(Error::NotFound("Default object store".to_string()))
                 .and_then(|x| {
                     let bucket = Bucket::from_path(&response.metadata.location)?;
                     x.build(bucket)
-                });
+                })
+        };
+        if self.ignore_storage_credentials {
+            return default_store();
         }
 
-        object_store_from_response(response)?
-            .ok_or(Error::NotFound("Object store credentials".to_string()))
-            .or_else(|_| {
-                self.default_object_store_builder
-                    .as_ref()
-                    .ok_or(Error::NotFound("Default object store".to_string()))
-                    .and_then(|x| {
-                        let bucket = Bucket::from_path(&response.metadata.location)?;
-                        x.build(bucket)
-                    })
-            })
+        match vended_storage_config(response) {
+            Some((config, credential_prefix)) => self.vended_stores.get_or_build(
+                self.vended_store_key(identifier),
+                Url::parse(&response.metadata.location)?,
+                config,
+                credential_prefix,
+            ),
+            None => default_store(),
+        }
     }
 }
 
@@ -290,7 +322,9 @@ impl Catalog for RestCatalog {
             None,
         )
         .await
-        .map_err(Into::<Error>::into)
+        .map_err(Into::<Error>::into)?;
+        self.vended_stores.evict(&self.vended_store_key(identifier));
+        Ok(())
     }
     /// Rename a table through the Iceberg REST catalog's atomic endpoint.
     async fn rename_table(
@@ -304,7 +338,9 @@ impl Catalog for RestCatalog {
             models::RenameTableRequest::new(source.clone(), destination.clone()),
         )
         .await
-        .map_err(Into::<Error>::into)
+        .map_err(Into::<Error>::into)?;
+        self.vended_stores.evict(&self.vended_store_key(source));
+        Ok(())
     }
     /// Drop a table and delete all data and metadata files.
     async fn drop_view(&self, identifier: &Identifier) -> Result<(), Error> {
@@ -352,7 +388,7 @@ impl Catalog for RestCatalog {
         .await;
         match table_response {
             Ok(response) => {
-                let object_store = self.get_object_store(&response)?;
+                let object_store = self.get_object_store(identifier, &response)?;
 
                 self.cache
                     .write()
@@ -419,7 +455,7 @@ impl Catalog for RestCatalog {
         .map_err(Into::<Error>::into)
         .await?;
 
-        let object_store = self.get_object_store(&response)?;
+        let object_store = self.get_object_store(&identifier, &response)?;
 
         self.cache
             .write()
@@ -596,7 +632,7 @@ impl Catalog for RestCatalog {
         )
         .map_err(Into::<Error>::into)
         .await?;
-        let object_store = self.get_object_store(&response)?;
+        let object_store = self.get_object_store(&identifier, &response)?;
 
         Table::new(identifier.clone(), self, object_store, response.metadata).await
     }
@@ -607,6 +643,7 @@ pub struct RestCatalogList {
     configuration: Configuration,
     object_store_builder: Option<ObjectStoreBuilder>,
     ignore_storage_credentials: bool,
+    vended_stores: Arc<VendedStoreCache<VendedStoreKey>>,
 }
 
 impl RestCatalogList {
@@ -619,19 +656,30 @@ impl RestCatalogList {
             configuration,
             object_store_builder,
             ignore_storage_credentials,
+            vended_stores: Arc::default(),
         }
+    }
+
+    /// See [`RestCatalog::with_store_client_config`]. Catalogs returned by this list share one
+    /// vended-store cache, keyed by catalog name and table identifier.
+    pub fn with_store_client_config(mut self, client: StoreClientConfig) -> Self {
+        self.vended_stores = Arc::new(VendedStoreCache::new(client));
+        self
     }
 }
 
 #[async_trait]
 impl CatalogList for RestCatalogList {
     fn catalog(&self, name: &str) -> Option<Arc<dyn Catalog>> {
-        Some(Arc::new(RestCatalog::new(
-            Some(name),
-            self.configuration.clone(),
-            self.object_store_builder.clone(),
-            self.ignore_storage_credentials,
-        )))
+        Some(Arc::new(
+            RestCatalog::new(
+                Some(name),
+                self.configuration.clone(),
+                self.object_store_builder.clone(),
+                self.ignore_storage_credentials,
+            )
+            .with_vended_stores(self.vended_stores.clone()),
+        ))
     }
     async fn list_catalogs(&self) -> Vec<String> {
         Vec::new()
@@ -644,6 +692,7 @@ pub struct RestNoPrefixCatalogList {
     configuration: Configuration,
     object_store_builder: Option<ObjectStoreBuilder>,
     ignore_storage_credentials: bool,
+    vended_stores: Arc<VendedStoreCache<VendedStoreKey>>,
 }
 
 impl RestNoPrefixCatalogList {
@@ -658,7 +707,15 @@ impl RestNoPrefixCatalogList {
             configuration,
             object_store_builder,
             ignore_storage_credentials,
+            vended_stores: Arc::default(),
         }
+    }
+
+    /// See [`RestCatalog::with_store_client_config`]. Catalogs returned by this list share one
+    /// vended-store cache.
+    pub fn with_store_client_config(mut self, client: StoreClientConfig) -> Self {
+        self.vended_stores = Arc::new(VendedStoreCache::new(client));
+        self
     }
 }
 
@@ -666,12 +723,15 @@ impl RestNoPrefixCatalogList {
 impl CatalogList for RestNoPrefixCatalogList {
     fn catalog(&self, name: &str) -> Option<Arc<dyn Catalog>> {
         if self.name == name {
-            Some(Arc::new(RestCatalog::new(
-                None,
-                self.configuration.clone(),
-                self.object_store_builder.clone(),
-                self.ignore_storage_credentials,
-            )))
+            Some(Arc::new(
+                RestCatalog::new(
+                    None,
+                    self.configuration.clone(),
+                    self.object_store_builder.clone(),
+                    self.ignore_storage_credentials,
+                )
+                .with_vended_stores(self.vended_stores.clone()),
+            ))
         } else {
             None
         }
@@ -681,24 +741,29 @@ impl CatalogList for RestNoPrefixCatalogList {
     }
 }
 
-fn object_store_from_response(
+/// The storage options a `LoadTableResult` vends, with the prefix its credentials are scoped to.
+/// `None` when the response vends nothing and the default object store applies.
+fn vended_storage_config(
     response: &models::LoadTableResult,
-) -> Result<Option<Arc<dyn ObjectStore>>, Error> {
-    let config = match (&response.storage_credentials, &response.config) {
-        (Some(credentials), Some(config)) if !credentials.is_empty() => {
+) -> Option<(HashMap<String, String>, &str)> {
+    let credential = response
+        .storage_credentials
+        .as_ref()
+        .and_then(|credentials| credentials.first());
+    let config = match (credential, &response.config) {
+        (Some(credential), Some(config)) => {
             // Enrich credentials with other options that might only be found in the config (e.g.
             // a custom endpoint)
-            let mut options = credentials[0].config.clone();
+            let mut options = credential.config.clone();
             options.extend(config.clone());
             options
         }
-        (Some(credentials), None) => credentials[0].config.clone(),
-        (_, Some(config)) => config.clone(),
-        (None, None) => return Ok(None),
+        (Some(credential), None) => credential.config.clone(),
+        (None, Some(config)) => config.clone(),
+        (None, None) => return None,
     };
-
-    let url = Url::parse(&response.metadata.location)?;
-    Ok(Some(object_store_from_config(url, config)?))
+    let prefix = credential.map_or("", |credential| credential.prefix.as_str());
+    Some((config, prefix))
 }
 
 #[cfg(test)]
@@ -723,7 +788,7 @@ pub mod tests {
         table::Table,
         test_utils::is_podman,
     };
-    use object_store::{memory::InMemory, ObjectStore};
+    use object_store::{memory::InMemory, ObjectStore, ObjectStoreExt};
     use std::{convert::TryFrom, sync::Arc, time::Duration};
     use testcontainers::{
         core::{wait::LogWaitStrategy, ExecCommand, WaitFor},
@@ -809,6 +874,22 @@ pub mod tests {
     fn serve_responses(
         responses: Vec<String>,
     ) -> (std::net::SocketAddr, std::thread::JoinHandle<Vec<String>>) {
+        let (address, server) = serve_requests(responses);
+        let server = std::thread::spawn(move || {
+            server
+                .join()
+                .unwrap()
+                .into_iter()
+                .map(|request| request.lines().next().unwrap_or_default().to_string())
+                .collect()
+        });
+        (address, server)
+    }
+
+    /// Like [`serve_responses`], but returns each full request head (request line and headers).
+    fn serve_requests(
+        responses: Vec<String>,
+    ) -> (std::net::SocketAddr, std::thread::JoinHandle<Vec<String>>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().unwrap();
@@ -841,8 +922,7 @@ pub mod tests {
                     assert!(size > 0, "client closed before sending a request");
                     request.extend_from_slice(&buffer[..size]);
                 }
-                let request = String::from_utf8_lossy(&request);
-                request_lines.push(request.lines().next().unwrap_or_default().to_string());
+                request_lines.push(String::from_utf8_lossy(&request).into_owned());
                 stream.write_all(response.as_bytes()).unwrap();
             }
             request_lines
@@ -975,6 +1055,299 @@ pub mod tests {
         assert_eq!(error.retry_after(), Some(Duration::from_secs(7)));
         let error: iceberg_rust::error::Error = error.into();
         assert!(matches!(error, iceberg_rust::error::Error::NotFound(_)));
+    }
+
+    /// A `LoadTableResult` body for an S3 table at `location` whose vended credentials are
+    /// `key_id` / `token`, served by the S3 endpoint at `endpoint`.
+    fn vended_load_table_body(location: &str, endpoint: &str, key_id: &str, token: &str) -> String {
+        use iceberg_rust::spec::{
+            schema::SchemaBuilder,
+            table_metadata::{FormatVersion, TableMetadataBuilder},
+        };
+        let schema = SchemaBuilder::default()
+            .with_schema_id(0)
+            .with_struct_field(StructField {
+                id: 1,
+                name: "id".to_string(),
+                required: true,
+                field_type: Type::Primitive(PrimitiveType::Long),
+                doc: None,
+                initial_default: None,
+                write_default: None,
+            })
+            .build()
+            .unwrap();
+        let metadata = TableMetadataBuilder::default()
+            .format_version(FormatVersion::V2)
+            .location(location.to_string())
+            .current_schema_id(0)
+            .schemas(std::collections::HashMap::from_iter([(0, schema)]))
+            .build()
+            .unwrap();
+        let owned = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect::<std::collections::HashMap<_, _>>()
+        };
+        let result = crate::models::LoadTableResult {
+            metadata_location: Some(format!("{location}/metadata/v1.metadata.json")),
+            metadata,
+            config: Some(owned(&[
+                ("s3.endpoint", endpoint),
+                ("client.region", "us-east-1"),
+            ])),
+            storage_credentials: Some(vec![crate::models::StorageCredential::new(
+                location.to_string(),
+                owned(&[
+                    ("s3.access-key-id", key_id),
+                    ("s3.secret-access-key", "vended-secret"),
+                    ("s3.session-token", token),
+                    // Expiry changes on every vend and must not force a new store.
+                    (
+                        "s3.session-token-expires-at-ms",
+                        &format!("{}", token.len()),
+                    ),
+                ]),
+            )]),
+        };
+        http_response("200 OK", "", &serde_json::to_string(&result).unwrap())
+    }
+
+    fn s3_not_found() -> String {
+        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+    }
+
+    async fn load_table(catalog: &Arc<RestCatalog>, name: &str) -> Table {
+        let identifier = Identifier::new(&["PUBLIC".to_string()], name);
+        match catalog.clone().load_tabular(&identifier).await.unwrap() {
+            iceberg_rust::catalog::tabular::Tabular::Table(table) => table,
+            _ => panic!("expected a table"),
+        }
+    }
+
+    fn same_store(left: &Arc<dyn ObjectStore>, right: &Arc<dyn ObjectStore>) -> bool {
+        std::ptr::eq(
+            Arc::as_ptr(left) as *const (),
+            Arc::as_ptr(right) as *const (),
+        )
+    }
+
+    /// Issue one GET through `store` and return the signed request head the S3 mock received.
+    async fn signed_get(
+        store: &Arc<dyn ObjectStore>,
+        s3: std::thread::JoinHandle<Vec<String>>,
+    ) -> String {
+        let result = store
+            .get(&object_store::path::Path::from("t/data/file.parquet"))
+            .await;
+        assert!(
+            matches!(result, Err(object_store::Error::NotFound { .. })),
+            "{result:?}"
+        );
+        let requests = s3.join().unwrap();
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        requests[0].to_ascii_lowercase()
+    }
+
+    #[tokio::test]
+    async fn reload_same_location_reuses_store() {
+        let (s3, _s3_server) = serve_requests(vec![]);
+        let endpoint = format!("http://{s3}");
+        let (rest, rest_server) = serve_responses(vec![
+            vended_load_table_body("s3://bucket/t", &endpoint, "KEY1", "token-1"),
+            vended_load_table_body("s3://bucket/t", &endpoint, "KEY2", "token-2"),
+        ]);
+        let catalog = Arc::new(RestCatalog::new(
+            Some("catalog"),
+            configuration(&format!("http://{rest}")),
+            None,
+            false,
+        ));
+        let first = load_table(&catalog, "T").await;
+        let second = load_table(&catalog, "T").await;
+        rest_server.join().unwrap();
+        assert!(same_store(&first.object_store(), &second.object_store()));
+    }
+
+    #[tokio::test]
+    async fn reload_swaps_credentials() {
+        let (s3, s3_server) = serve_requests(vec![s3_not_found()]);
+        let endpoint = format!("http://{s3}");
+        let (rest, rest_server) = serve_responses(vec![
+            vended_load_table_body("s3://bucket/t", &endpoint, "KEY1", "token-1"),
+            vended_load_table_body("s3://bucket/t", &endpoint, "KEY2", "token-2"),
+        ]);
+        let catalog = Arc::new(RestCatalog::new(
+            Some("catalog"),
+            configuration(&format!("http://{rest}")),
+            None,
+            false,
+        ));
+        let first = load_table(&catalog, "T").await;
+        let _second = load_table(&catalog, "T").await;
+        rest_server.join().unwrap();
+        // The table loaded first signs its next request with the credentials vended last.
+        let request = signed_get(&first.object_store(), s3_server).await;
+        assert!(
+            request.starts_with("get /bucket/t/data/file.parquet "),
+            "{request}"
+        );
+        assert!(request.contains("credential=key2/"), "{request}");
+        assert!(
+            request.contains("x-amz-security-token: token-2"),
+            "{request}"
+        );
+    }
+
+    #[tokio::test]
+    async fn different_locations_do_not_share_store() {
+        let (s3, s3_server) = serve_requests(vec![s3_not_found(), s3_not_found()]);
+        let endpoint = format!("http://{s3}");
+        // Two tables, even at the same location, never share a store or its credentials.
+        let (rest, rest_server) = serve_responses(vec![
+            vended_load_table_body("s3://bucket/t", &endpoint, "KEY_A", "token-a"),
+            vended_load_table_body("s3://bucket/t", &endpoint, "KEY_B", "token-b"),
+            vended_load_table_body("s3://bucket/u", &endpoint, "KEY_A", "token-a"),
+        ]);
+        let catalog = Arc::new(RestCatalog::new(
+            Some("catalog"),
+            configuration(&format!("http://{rest}")),
+            None,
+            false,
+        ));
+        let a = load_table(&catalog, "A").await;
+        let b = load_table(&catalog, "B").await;
+        // A moves to a new location: its store is rebuilt, not reused.
+        let a_moved = load_table(&catalog, "A").await;
+        rest_server.join().unwrap();
+        assert!(!same_store(&a.object_store(), &b.object_store()));
+        assert!(!same_store(&a.object_store(), &a_moved.object_store()));
+
+        let a_store = a.object_store();
+        let b_store = b.object_store();
+        a_store
+            .get(&object_store::path::Path::from("t/data/file.parquet"))
+            .await
+            .unwrap_err();
+        b_store
+            .get(&object_store::path::Path::from("t/data/file.parquet"))
+            .await
+            .unwrap_err();
+        let requests: Vec<String> = s3_server
+            .join()
+            .unwrap()
+            .into_iter()
+            .map(|request| request.to_ascii_lowercase())
+            .collect();
+        assert!(requests[0].contains("credential=key_a/"), "{requests:?}");
+        assert!(requests[0].contains("x-amz-security-token: token-a"));
+        assert!(requests[1].contains("credential=key_b/"), "{requests:?}");
+        assert!(requests[1].contains("x-amz-security-token: token-b"));
+    }
+
+    #[tokio::test]
+    async fn vended_stores_share_one_http_client() {
+        use iceberg_rust::object_store::vended::{SharedHttpConnector, StoreClientConfig};
+
+        let (s3, _s3_server) = serve_requests(vec![]);
+        let endpoint = format!("http://{s3}");
+        let (rest, rest_server) = serve_responses(vec![
+            vended_load_table_body("s3://bucket/t", &endpoint, "KEY1", "token-1"),
+            vended_load_table_body("s3://bucket/u", &endpoint, "KEY2", "token-2"),
+            vended_load_table_body("s3://bucket/t", &endpoint, "KEY3", "token-3"),
+        ]);
+        let connector = Arc::new(SharedHttpConnector::new());
+        let catalog = Arc::new(
+            RestCatalog::new(
+                Some("catalog"),
+                configuration(&format!("http://{rest}")),
+                None,
+                false,
+            )
+            .with_store_client_config(
+                StoreClientConfig::new()
+                    .with_client_options(
+                        object_store::ClientOptions::new()
+                            .with_timeout(Duration::from_secs(10))
+                            .with_connect_timeout(Duration::from_secs(3)),
+                    )
+                    .with_http_connector(connector.clone()),
+            ),
+        );
+        let t = load_table(&catalog, "T").await;
+        let u = load_table(&catalog, "U").await;
+        let t_reloaded = load_table(&catalog, "T").await;
+        rest_server.join().unwrap();
+
+        assert!(!same_store(&t.object_store(), &u.object_store()));
+        assert!(same_store(&t.object_store(), &t_reloaded.object_store()));
+        // Two tables -> two stores; the reload swapped credentials instead of building.
+        assert_eq!(catalog.vended_store_builds(), 2);
+        // Both stores came from one HTTP client (one connection pool).
+        assert_eq!(connector.clients_created(), 1);
+        let store = format!("{:?}", t.object_store());
+        assert!(store.contains("timeout: Some(Parsed(10s))"), "{store}");
+        assert!(
+            store.contains("connect_timeout: Some(Parsed(3s))"),
+            "{store}"
+        );
+    }
+
+    #[tokio::test]
+    async fn vended_store_requests_use_embedder_timeout() {
+        use iceberg_rust::object_store::vended::StoreClientConfig;
+
+        // An S3 endpoint that accepts connections and never answers.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let s3 = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let held: Vec<_> = listener.incoming().take(4).collect();
+            std::thread::sleep(Duration::from_secs(10));
+            drop(held);
+        });
+        let endpoint = format!("http://{s3}");
+        let (rest, rest_server) = serve_responses(vec![vended_load_table_body(
+            "s3://bucket/t",
+            &endpoint,
+            "KEY1",
+            "token-1",
+        )]);
+        let catalog = Arc::new(
+            RestCatalog::new(
+                Some("catalog"),
+                configuration(&format!("http://{rest}")),
+                None,
+                false,
+            )
+            .with_store_client_config(
+                StoreClientConfig::new()
+                    .with_client_options(
+                        object_store::ClientOptions::new().with_timeout(Duration::from_millis(200)),
+                    )
+                    .with_retry_config(object_store::RetryConfig {
+                        max_retries: 1,
+                        retry_timeout: Duration::from_secs(2),
+                        backoff: object_store::BackoffConfig {
+                            init_backoff: Duration::from_millis(10),
+                            max_backoff: Duration::from_millis(10),
+                            base: 2.,
+                        },
+                    }),
+            ),
+        );
+        let table = load_table(&catalog, "T").await;
+        rest_server.join().unwrap();
+
+        let started = std::time::Instant::now();
+        let result = table
+            .object_store()
+            .get(&object_store::path::Path::from("t/data/file.parquet"))
+            .await;
+        let elapsed = started.elapsed();
+        assert!(result.is_err(), "{result:?}");
+        // object_store's default 30 s request timeout would hold this request far longer.
+        assert!(elapsed < Duration::from_secs(5), "{elapsed:?} {result:?}");
     }
 
     #[tokio::test]
