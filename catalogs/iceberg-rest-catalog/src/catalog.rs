@@ -804,6 +804,179 @@ pub mod tests {
         }
     }
 
+    /// Serve one canned HTTP response per connection, in order, on a local port. Each response
+    /// closes its connection, so every client request lands on the next response.
+    fn serve_responses(
+        responses: Vec<String>,
+    ) -> (std::net::SocketAddr, std::thread::JoinHandle<Vec<String>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+
+            let mut request_lines = Vec::new();
+            for response in responses {
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                let (mut stream, _) = loop {
+                    match listener.accept() {
+                        Ok(connection) => break connection,
+                        Err(error)
+                            if error.kind() == std::io::ErrorKind::WouldBlock
+                                && std::time::Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => panic!("local REST test server did not accept: {error}"),
+                    }
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let size = stream.read(&mut buffer).unwrap();
+                    assert!(size > 0, "client closed before sending a request");
+                    request.extend_from_slice(&buffer[..size]);
+                }
+                let request = String::from_utf8_lossy(&request);
+                request_lines.push(request.lines().next().unwrap_or_default().to_string());
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+            request_lines
+        });
+        (address, server)
+    }
+
+    fn http_response(status_line: &str, extra_headers: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    async fn load_tabular_error(
+        responses: Vec<String>,
+    ) -> (iceberg_rust::error::Error, Vec<String>) {
+        let (address, server) = serve_responses(responses);
+        let catalog = Arc::new(RestCatalog::new(
+            Some("catalog"),
+            configuration(&format!("http://{address}")),
+            None,
+            false,
+        ));
+        let identifier = Identifier::new(&["PUBLIC".to_string()], "T");
+        let error = match catalog.load_tabular(&identifier).await {
+            Ok(_) => panic!("load_tabular unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        (error, server.join().unwrap())
+    }
+
+    const REST_ERROR_BODY: &str =
+        r#"{"error":{"message":"denied","type":"RESTException","code":0}}"#;
+
+    #[tokio::test]
+    async fn load_tabular_429_carries_status_and_retry_after_seconds() {
+        let (error, requests) = load_tabular_error(vec![http_response(
+            "429 Too Many Requests",
+            "Retry-After: 2\r\n",
+            REST_ERROR_BODY,
+        )])
+        .await;
+        assert_eq!(
+            requests,
+            ["GET /v1/catalog/namespaces/PUBLIC/tables/T HTTP/1.1"]
+        );
+        assert!(
+            matches!(error, iceberg_rust::error::Error::HttpResponse(_)),
+            "{error:?}"
+        );
+        assert_eq!(error.http_status(), Some(429));
+        assert_eq!(error.retry_after(), Some(Duration::from_secs(2)));
+        assert_eq!(
+            error.to_string(),
+            format!("Response status: 429 Too Many Requests, Response content: {REST_ERROR_BODY} doesn't have the right format")
+        );
+    }
+
+    #[tokio::test]
+    async fn load_tabular_503_carries_retry_after_http_date() {
+        let retry_at = chrono::Utc::now() + chrono::Duration::seconds(120);
+        let retry_after = format!(
+            "Retry-After: {}\r\n",
+            retry_at.format("%a, %d %b %Y %H:%M:%S GMT")
+        );
+        let (error, _) = load_tabular_error(vec![http_response(
+            "503 Service Unavailable",
+            &retry_after,
+            "",
+        )])
+        .await;
+        assert!(matches!(error, iceberg_rust::error::Error::HttpResponse(_)));
+        assert_eq!(error.http_status(), Some(503));
+        let delay = error
+            .retry_after()
+            .expect("Retry-After HTTP-date is parsed");
+        assert!(
+            delay > Duration::from_secs(100) && delay <= Duration::from_secs(120),
+            "{delay:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_tabular_401_carries_status_without_retry_after() {
+        let (error, _) =
+            load_tabular_error(vec![http_response("401 Unauthorized", "", REST_ERROR_BODY)]).await;
+        assert!(matches!(error, iceberg_rust::error::Error::HttpResponse(_)));
+        assert_eq!(error.http_status(), Some(401));
+        assert_eq!(error.retry_after(), None);
+    }
+
+    #[tokio::test]
+    async fn load_tabular_404_keeps_catalog_not_found() {
+        let not_found = http_response("404 Not Found", "", REST_ERROR_BODY);
+        let (error, requests) = load_tabular_error(vec![not_found.clone(), not_found]).await;
+        assert_eq!(
+            requests,
+            [
+                "GET /v1/catalog/namespaces/PUBLIC/tables/T HTTP/1.1",
+                "GET /v1/catalog/namespaces/PUBLIC/views/T HTTP/1.1",
+            ]
+        );
+        assert!(
+            matches!(error, iceberg_rust::error::Error::CatalogNotFound),
+            "{error:?}"
+        );
+        assert_eq!(error.http_status(), None);
+    }
+
+    #[tokio::test]
+    async fn load_table_api_404_exposes_status() {
+        let (address, server) = serve_responses(vec![http_response(
+            "404 Not Found",
+            "Retry-After: 7\r\n",
+            REST_ERROR_BODY,
+        )]);
+        let error = crate::apis::catalog_api_api::load_table(
+            &configuration(&format!("http://{address}")),
+            Some("catalog"),
+            "PUBLIC",
+            "T",
+            Default::default(),
+            None,
+        )
+        .await
+        .unwrap_err();
+        server.join().unwrap();
+        assert_eq!(error.status(), Some(reqwest::StatusCode::NOT_FOUND));
+        assert_eq!(error.retry_after(), Some(Duration::from_secs(7)));
+        let error: iceberg_rust::error::Error = error.into();
+        assert!(matches!(error, iceberg_rust::error::Error::NotFound(_)));
+    }
+
     #[tokio::test]
     async fn test_create_update_drop_table() {
         let container_host = if is_podman() {

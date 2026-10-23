@@ -10,6 +10,7 @@ edition = "2021"
 async-trait.workspace = true
 aws-credential-types = "1"
 aws-sigv4 = "1"
+chrono.workspace = true
 derive_builder = { workspace = true }
 futures.workspace = true
 iceberg-rust = { path = "../../iceberg-rust", version = "0.10.0" }

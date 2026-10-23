@@ -3409,6 +3409,7 @@ dependencies = [
  "async-trait",
  "aws-credential-types",
  "aws-sigv4",
+ "chrono",
  "datafusion",
  "datafusion_iceberg",
  "derive_builder",
