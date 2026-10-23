@@ -10,7 +10,8 @@ pub struct ResponseContent<T> {
     pub content: String,
     pub entity: Option<T>,
     /// Delay requested by the response's `Retry-After` header (delta-seconds or HTTP-date,
-    /// relative to when the response was received). `None` when absent or unparseable.
+    /// relative to when the response was received). `None` when absent or unparseable;
+    /// unclamped otherwise (oversized delta-seconds saturate to `u64::MAX` seconds).
     pub retry_after: Option<Duration>,
 }
 

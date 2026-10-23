@@ -172,8 +172,10 @@ where
 /// Parse the `Retry-After` response header (RFC 9110 section 10.2.3) relative to `now`.
 ///
 /// Accepts delta-seconds and the three HTTP-date formats (IMF-fixdate, RFC 850, asctime).
-/// An HTTP-date at or before `now` yields [`Duration::ZERO`]; a missing or malformed header
-/// yields `None`.
+/// An HTTP-date at or before `now` (including one before the Unix epoch) yields
+/// [`Duration::ZERO`]; delta-seconds too large for `u64` saturate to `u64::MAX` seconds
+/// (RFC 9111 section 1.2.2); a missing or malformed header yields `None`. The delay is not
+/// clamped, so callers must bound it (e.g. by a deadline) before adding it to an `Instant`.
 fn retry_after(headers: &HeaderMap, now: SystemTime) -> Option<Duration> {
     let value = headers
         .get(reqwest::header::RETRY_AFTER)?
@@ -181,11 +183,15 @@ fn retry_after(headers: &HeaderMap, now: SystemTime) -> Option<Duration> {
         .ok()?
         .trim();
     if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
-        return value.parse().ok().map(Duration::from_secs);
+        // All ASCII digits, so overflow is the only possible parse error.
+        return Some(Duration::from_secs(value.parse().unwrap_or(u64::MAX)));
     }
     let retry_at = parse_http_date(value)?;
-    let retry_at =
-        SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(u64::try_from(retry_at).ok()?))?;
+    let Ok(retry_at) = u64::try_from(retry_at) else {
+        // Before the Unix epoch: certainly in the past.
+        return Some(Duration::ZERO);
+    };
+    let retry_at = SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(retry_at))?;
     Some(retry_at.duration_since(now).unwrap_or(Duration::ZERO))
 }
 
@@ -344,6 +350,18 @@ mod tests {
             );
         }
         assert_eq!(retry_after(&HeaderMap::new(), now), None);
+        // delta-seconds too large for u64 saturate instead of being dropped (RFC 9111 1.2.2).
+        for huge in [
+            "18446744073709551615",
+            "18446744073709551616",
+            "99999999999999999999999",
+        ] {
+            assert_eq!(
+                retry_after(&headers_with_retry_after(huge), now),
+                Some(Duration::from_secs(u64::MAX)),
+                "{huge:?}"
+            );
+        }
     }
 
     #[test]
@@ -369,6 +387,22 @@ mod tests {
             ),
             Some(Duration::ZERO),
             "an HTTP-date in the past means retry now"
+        );
+        for before_epoch in ["Fri, 01 Jan 1960 00:00:00 GMT", "Fri Jan  1 00:00:00 1960"] {
+            assert_eq!(
+                retry_after(&headers_with_retry_after(before_epoch), now),
+                Some(Duration::ZERO),
+                "an HTTP-date before the Unix epoch is still in the past: {before_epoch:?}"
+            );
+        }
+        // asctime pads single-digit days with a space.
+        let before_1994 = SystemTime::UNIX_EPOCH + Duration::from_secs(784_111_777 - 5);
+        assert_eq!(
+            retry_after(
+                &headers_with_retry_after("Sun Nov  6 08:49:37 1994"),
+                before_1994
+            ),
+            Some(Duration::from_secs(5))
         );
         assert_eq!(
             retry_after(

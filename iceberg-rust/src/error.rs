@@ -37,7 +37,9 @@ impl HttpResponseError {
     }
 
     /// Delay requested by the server's `Retry-After` header, if present and valid.
-    /// An HTTP-date in the past is reported as [`Duration::ZERO`].
+    /// An HTTP-date in the past is reported as [`Duration::ZERO`]. The delay is the server's
+    /// value, unclamped (it may be up to `u64::MAX` seconds), so bound it before adding it
+    /// to an `Instant`.
     pub fn retry_after(&self) -> Option<Duration> {
         self.retry_after
     }

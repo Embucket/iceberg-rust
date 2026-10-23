@@ -206,7 +206,8 @@ cargo doc --open
 Non-success HTTP responses are returned as `apis::Error::ResponseError`, whose `ResponseContent`
 keeps the status code, body, decoded error entity and the parsed `Retry-After` header
 (`retry_after: Option<Duration>`, from delta-seconds or an HTTP-date; an HTTP-date in the past is
-`Duration::ZERO`). `apis::Error::status()` and `apis::Error::retry_after()` expose them.
+`Duration::ZERO`; the delay is not clamped, so bound it by your own deadline).
+`apis::Error::status()` and `apis::Error::retry_after()` expose them.
 
 Converted to `iceberg_rust::error::Error` (as returned by the `Catalog` methods, e.g.
 `load_tabular`):
