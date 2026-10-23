@@ -192,14 +192,14 @@ struct SwappableAwsCredential {
 }
 
 impl SwappableAwsCredential {
-    fn new(credential: AwsCredential) -> Self {
+    fn new(credential: Arc<AwsCredential>) -> Self {
         Self {
-            current: RwLock::new(Arc::new(credential)),
+            current: RwLock::new(credential),
         }
     }
 
-    fn swap(&self, credential: AwsCredential) {
-        *self.current.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(credential);
+    fn swap(&self, credential: Arc<AwsCredential>) {
+        *self.current.write().unwrap_or_else(PoisonError::into_inner) = credential;
     }
 }
 
@@ -218,6 +218,9 @@ impl CredentialProvider for SwappableAwsCredential {
 
 /// Everything except the credential itself that shapes a vended S3 store. A reload whose scope
 /// differs from the cached one rebuilds the store instead of swapping credentials into it.
+/// Cache size at which stores no live table references are dropped (see [`Entries::insert`]).
+const PRUNE_MIN_ENTRIES: usize = 128;
+
 #[derive(Debug, PartialEq, Eq)]
 struct S3StoreScope {
     location: String,
@@ -261,11 +264,44 @@ struct CachedS3Store {
 /// by the caller's table identity `K`, so two tables never share a store or its credentials, even
 /// at the same location. Other schemes, and S3 configs without static credentials, are rebuilt on
 /// every call, as before.
+///
+/// Concurrent first loads of one table all receive the same store. Once the cache holds
+/// `PRUNE_MIN_ENTRIES` (128) stores, inserting another drops the stores no caller references any
+/// more, so memory follows the live tables rather than every table ever loaded.
 #[derive(Debug)]
 pub struct VendedStoreCache<K> {
     client: StoreClientConfig,
-    entries: RwLock<HashMap<K, CachedS3Store>>,
+    entries: RwLock<Entries<K>>,
     builds: AtomicU64,
+}
+
+/// The cached stores, plus the size at which stores no table references any more are dropped.
+#[derive(Debug)]
+struct Entries<K> {
+    stores: HashMap<K, CachedS3Store>,
+    prune_at: usize,
+}
+
+impl<K: Hash + Eq> Entries<K> {
+    fn new() -> Self {
+        Self {
+            stores: HashMap::new(),
+            prune_at: PRUNE_MIN_ENTRIES,
+        }
+    }
+
+    /// Insert `entry` for `key`, first dropping the stores only this cache still holds once the
+    /// cache has grown to `prune_at`. A store a live `Table` holds is never dropped, so its next
+    /// reload still swaps credentials into it; the threshold doubles past the surviving count so
+    /// pruning stays amortised O(1) per insert.
+    fn insert(&mut self, key: K, entry: CachedS3Store) {
+        if !self.stores.contains_key(&key) && self.stores.len() >= self.prune_at {
+            self.stores
+                .retain(|_, cached| Arc::strong_count(&cached.store) > 1);
+            self.prune_at = PRUNE_MIN_ENTRIES.max(self.stores.len() * 2);
+        }
+        self.stores.insert(key, entry);
+    }
 }
 
 impl<K: Hash + Eq> Default for VendedStoreCache<K> {
@@ -279,7 +315,7 @@ impl<K: Hash + Eq> VendedStoreCache<K> {
     pub fn new(client: StoreClientConfig) -> Self {
         Self {
             client,
-            entries: RwLock::new(HashMap::new()),
+            entries: RwLock::new(Entries::new()),
             builds: AtomicU64::new(0),
         }
     }
@@ -315,7 +351,10 @@ impl<K: Hash + Eq> VendedStoreCache<K> {
             ObjectStoreScheme::parse(&url).map_err(object_store::Error::from)?,
             (ObjectStoreScheme::AmazonS3, _)
         );
-        let Some(credential) = is_s3.then(|| static_credential(&config)).flatten() else {
+        let Some(credential) = is_s3
+            .then(|| static_credential(&config).map(Arc::new))
+            .flatten()
+        else {
             self.evict(&key);
             self.builds.fetch_add(1, Ordering::Relaxed);
             return object_store_from_config_with_client(url, config, &self.client);
@@ -324,31 +363,60 @@ impl<K: Hash + Eq> VendedStoreCache<K> {
         let scope = S3StoreScope::new(&url, credential_prefix, &config);
         {
             let entries = self.entries.read().unwrap_or_else(PoisonError::into_inner);
-            if let Some(entry) = entries.get(&key).filter(|entry| entry.scope == scope) {
+            if let Some(entry) = entries
+                .stores
+                .get(&key)
+                .filter(|entry| entry.scope == scope)
+            {
                 entry.credentials.swap(credential);
                 return Ok(entry.store.clone());
             }
         }
 
-        let credentials = Arc::new(SwappableAwsCredential::new(credential));
+        // Built outside the lock: building an HTTP client can take milliseconds, and loads of
+        // other tables must not wait on it.
+        let credentials = Arc::new(SwappableAwsCredential::new(credential.clone()));
         let store: Arc<dyn ObjectStore> = Arc::new(
             s3_builder_from_config(url, &config, &self.client)
                 .with_credentials(credentials.clone())
                 .build()?,
         );
         self.builds.fetch_add(1, Ordering::Relaxed);
-        self.entries
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(
-                key,
-                CachedS3Store {
-                    scope,
-                    store: store.clone(),
-                    credentials,
-                },
-            );
+
+        let mut entries = self.entries.write().unwrap_or_else(PoisonError::into_inner);
+        // A concurrent first load of the same table may have cached a store meanwhile. Keep
+        // that one, so every loader holds the store later reloads swap credentials into.
+        if let Some(entry) = entries
+            .stores
+            .get(&key)
+            .filter(|entry| entry.scope == scope)
+        {
+            entry.credentials.swap(credential);
+            return Ok(entry.store.clone());
+        }
+        entries.insert(
+            key,
+            CachedS3Store {
+                scope,
+                store: store.clone(),
+                credentials,
+            },
+        );
         Ok(store)
+    }
+
+    /// How many table stores are cached.
+    pub fn len(&self) -> usize {
+        self.entries
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .stores
+            .len()
+    }
+
+    /// Whether no table store is cached.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     /// Forget the store cached for `key`, if any.
@@ -356,6 +424,7 @@ impl<K: Hash + Eq> VendedStoreCache<K> {
         self.entries
             .write()
             .unwrap_or_else(PoisonError::into_inner)
+            .stores
             .remove(key);
     }
 }
@@ -502,6 +571,81 @@ mod tests {
         assert!(!Arc::ptr_eq(&rescoped, &moved));
         assert_eq!(cache.builds(), 4);
         assert_eq!(connector.clients_created(), 1);
+    }
+
+    #[test]
+    fn concurrent_first_loads_share_one_store() {
+        let cache = Arc::new(VendedStoreCache::<&str>::default());
+        let url = Url::parse("s3://bucket/t").unwrap();
+        for _ in 0..20 {
+            cache.evict(&"t");
+            let barrier = Arc::new(std::sync::Barrier::new(8));
+            let stores: Vec<_> = (0..8)
+                .map(|i| {
+                    let (cache, barrier, url) = (cache.clone(), barrier.clone(), url.clone());
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        cache
+                            .get_or_build(
+                                "t",
+                                url,
+                                vended_config(&format!("K{i}"), "http://localhost:9000"),
+                                "p",
+                            )
+                            .unwrap()
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect();
+            // Every concurrent loader got the cached store, so a later swap reaches all of them.
+            let cached = cache
+                .get_or_build(
+                    "t",
+                    url.clone(),
+                    vended_config("K", "http://localhost:9000"),
+                    "p",
+                )
+                .unwrap();
+            for store in &stores {
+                assert!(Arc::ptr_eq(store, &cached));
+            }
+        }
+    }
+
+    #[test]
+    fn unreferenced_stores_are_pruned() {
+        let cache = VendedStoreCache::<String>::default();
+        let endpoint = "http://localhost:9000";
+        let held: Vec<_> = (0..10)
+            .map(|i| {
+                let url = Url::parse(&format!("s3://bucket/held{i}")).unwrap();
+                cache
+                    .get_or_build(format!("held{i}"), url, vended_config("K", endpoint), "")
+                    .unwrap()
+            })
+            .collect();
+        for i in 0..(4 * PRUNE_MIN_ENTRIES) {
+            let url = Url::parse(&format!("s3://bucket/t{i}")).unwrap();
+            // The returned store is dropped at once: nothing references it any more.
+            cache
+                .get_or_build(format!("t{i}"), url, vended_config("K", endpoint), "")
+                .unwrap();
+        }
+        assert!(
+            cache.len() <= PRUNE_MIN_ENTRIES + held.len(),
+            "{}",
+            cache.len()
+        );
+        // Stores still referenced by a live table survive pruning and are reused on reload.
+        for (i, store) in held.iter().enumerate() {
+            let url = Url::parse(&format!("s3://bucket/held{i}")).unwrap();
+            let reloaded = cache
+                .get_or_build(format!("held{i}"), url, vended_config("K2", endpoint), "")
+                .unwrap();
+            assert!(Arc::ptr_eq(store, &reloaded));
+        }
     }
 
     #[test]
