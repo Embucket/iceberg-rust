@@ -1035,6 +1035,7 @@ mod lock_bench {
     use datafusion::parquet::arrow::arrow_reader::ArrowReaderOptions;
     use datafusion::parquet::file::metadata::ParquetMetaData;
     use futures::{future::BoxFuture, FutureExt};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
     /// Bytes of one range; ranges are requested eight per call, like the
@@ -1139,7 +1140,7 @@ mod lock_bench {
         started.elapsed()
     }
 
-    /// `threads` readers pass `passes` times over a 32 MiB file through an
+    /// `threads` readers pass `passes` times over a 32 MiB file through a
     /// 4 MiB cache, so every read misses. `fresh` gives every call its own
     /// scan, so every miss is copied, inserted and evicts (the insert path's
     /// full cost); otherwise each pass is one shared scan, which the budget
@@ -1184,7 +1185,7 @@ mod lock_bench {
         for call in calls(HOT_RANGES, 1, 0) {
             read(&cache, &mut reader, &hot, call, &warm, &metrics());
         }
-        let done = std::sync::atomic::AtomicBool::new(false);
+        let done = AtomicBool::new(false);
         let hit_metrics: Vec<DataMetrics> = (0..threads).map(|_| metrics()).collect();
         let elapsed = std::thread::scope(|s| {
             for thread in 0..threads {
@@ -1235,36 +1236,66 @@ mod lock_bench {
         (elapsed, hits as f64 / (hits + misses) as f64)
     }
 
-    /// Prints median and min-max wall time of [`REPEATS`] runs per workload,
-    /// and nanoseconds per range read by one thread. Run on a release build,
-    /// pinned with `taskset`, e.g. `cargo test --release -p datafusion_iceberg
-    /// --lib parquet_data_cache::lock_bench -- --ignored --nocapture`.
+    /// Print one table row (after the header, for the first thread count):
+    /// the median and min-max wall time of `runs`, and nanoseconds per range
+    /// read by one thread (`ranges` per thread).
+    fn row(name: &str, threads: usize, ranges: u64, runs: &mut [Duration], ratio: &str) {
+        let (median, min, max) = summary(runs);
+        if threads == 1 {
+            println!("| workload | threads | ms | ms range | ns/range/thread | hot hit ratio |");
+            println!("|---|---|---|---|---|---|");
+        }
+        println!(
+            "| {name} | {threads} | {median:.1} | {min:.1}-{max:.1} | {:.0} | {ratio} |",
+            median * 1e6 / ranges as f64
+        );
+    }
+
+    // Each workload is its own ignored test, so one can be measured alone
+    // (for example under `perf stat`). Run them on a release build, one at a
+    // time and pinned with `taskset`: `cargo test --release -p
+    // datafusion_iceberg --lib parquet_data_cache::lock_bench -- --ignored
+    // --nocapture --test-threads=1`.
+
     #[test]
-    #[ignore = "data-cache lock benchmark that prints a table; run alone with \
-                `-- --ignored parquet_data_cache::lock_bench --nocapture`"]
-    fn data_cache_lock_bench() {
-        println!("| workload | threads | ms | ms range | ns/range/thread | hot hit ratio |");
-        println!("|---|---|---|---|---|---|");
-        let row = |name: &str, threads: usize, ranges: u64, runs: &mut [Duration], ratio: &str| {
-            let (median, min, max) = summary(runs);
-            println!(
-                "| {name} | {threads} | {median:.1} | {min:.1}-{max:.1} | {:.0} | {ratio} |",
-                median * 1e6 / ranges as f64
-            );
-        };
+    #[ignore = "data-cache lock benchmark; run with `--ignored --test-threads=1 --nocapture`"]
+    fn lock_bench_hits() {
         for threads in [1, 4] {
             let passes = 40;
             let per_thread = RANGES / threads as u64 * passes as u64;
             let mut runs: Vec<_> = (0..REPEATS).map(|_| hits(threads, passes)).collect();
             row("hits", threads, per_thread, &mut runs, "-");
+        }
+    }
+
+    #[test]
+    #[ignore = "data-cache lock benchmark; run with `--ignored --test-threads=1 --nocapture`"]
+    fn lock_bench_churn_scan_per_call() {
+        for threads in [1, 4] {
             let passes = 4;
             let per_thread = RANGES / threads as u64 * passes as u64;
             let mut runs: Vec<_> = (0..REPEATS).map(|_| churn(threads, passes, true)).collect();
             row("churn, scan per call", threads, per_thread, &mut runs, "-");
+        }
+    }
+
+    #[test]
+    #[ignore = "data-cache lock benchmark; run with `--ignored --test-threads=1 --nocapture`"]
+    fn lock_bench_churn_scan_per_pass() {
+        for threads in [1, 4] {
+            let passes = 4;
+            let per_thread = RANGES / threads as u64 * passes as u64;
             let mut runs: Vec<_> = (0..REPEATS)
                 .map(|_| churn(threads, passes, false))
                 .collect();
             row("churn, scan per pass", threads, per_thread, &mut runs, "-");
+        }
+    }
+
+    #[test]
+    #[ignore = "data-cache lock benchmark; run with `--ignored --test-threads=1 --nocapture`"]
+    fn lock_bench_hits_under_churn() {
+        for threads in [1, 4] {
             let passes = 400;
             let mut ratios = Vec::new();
             let mut runs: Vec<_> = (0..REPEATS)
@@ -1276,13 +1307,8 @@ mod lock_bench {
                 .collect();
             ratios.sort_by(f64::total_cmp);
             let ratio = format!("{:.3}", ratios[ratios.len() / 2]);
-            row(
-                "hits under churn",
-                threads,
-                HOT_RANGES * passes as u64,
-                &mut runs,
-                &ratio,
-            );
+            let ranges = HOT_RANGES * passes as u64;
+            row("hits under churn", threads, ranges, &mut runs, &ratio);
         }
     }
 }
