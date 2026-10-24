@@ -112,7 +112,7 @@ use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
-use crate::parquet_data_cache::{DataMetrics, ScanAdmission, DATA_CACHE};
+use crate::parquet_data_cache::{DataCache, DataMetrics, ScanAdmission, DATA_CACHE};
 use bytes::Bytes;
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::physical_plan::parquet::{
@@ -555,11 +555,15 @@ static CACHE: LazyLock<MetadataCache> = LazyLock::new(|| {
 /// One factory is built per scan; it carries the scan's object-store URL as a
 /// key prefix so cache keys are unique across stores and buckets even though
 /// the [`PartitionedFile`] locations it receives are only store-relative.
-/// Being per scan, it also carries that scan's data-cache admission budget.
+/// Being per scan, it also carries that scan's data-cache admission budget,
+/// which therefore lasts as long as the physical plan: executing the same
+/// plan again continues it rather than starting a fresh one.
 #[derive(Debug)]
 pub(crate) struct CachingParquetFileReaderFactory {
     inner: Arc<dyn ParquetFileReaderFactory>,
     key_prefix: Arc<str>,
+    /// The process-wide [`DATA_CACHE`] outside tests.
+    data_cache: &'static DataCache,
     /// Shared by every reader of this scan; `None` while the data cache is
     /// disabled, in which case data reads go straight to the inner reader.
     data_scan: Option<Arc<ScanAdmission>>,
@@ -569,10 +573,19 @@ impl CachingParquetFileReaderFactory {
     /// Build a caching factory over `store`, namespacing cache keys with
     /// `key_prefix` (the scan's object-store URL).
     pub(crate) fn new(store: Arc<dyn ObjectStore>, key_prefix: &str) -> Self {
+        Self::with_data_cache(store, key_prefix, &DATA_CACHE)
+    }
+
+    fn with_data_cache(
+        store: Arc<dyn ObjectStore>,
+        key_prefix: &str,
+        data_cache: &'static DataCache,
+    ) -> Self {
         Self {
             inner: Arc::new(DefaultParquetFileReaderFactory::new(store)),
             key_prefix: Arc::from(key_prefix),
-            data_scan: DATA_CACHE.enabled().then(Arc::default),
+            data_cache,
+            data_scan: data_cache.enabled().then(Arc::default),
         }
     }
 }
@@ -605,6 +618,7 @@ impl ParquetFileReaderFactory for CachingParquetFileReaderFactory {
             size,
             metrics: cache_metrics,
             data_metrics,
+            data_cache: self.data_cache,
             data_scan: self.data_scan.clone(),
         }))
     }
@@ -618,6 +632,7 @@ struct CachingMetadataReader {
     size: u64,
     metrics: CacheMetrics,
     data_metrics: DataMetrics,
+    data_cache: &'static DataCache,
     data_scan: Option<Arc<ScanAdmission>>,
 }
 
@@ -628,6 +643,7 @@ impl AsyncFileReader for CachingMetadataReader {
             key,
             size,
             data_metrics,
+            data_cache,
             data_scan,
             ..
         } = self;
@@ -635,7 +651,7 @@ impl AsyncFileReader for CachingMetadataReader {
             return inner.get_bytes(range);
         };
         async move {
-            let mut bytes = DATA_CACHE
+            let mut bytes = data_cache
                 .read(&mut **inner, key, *size, vec![range], scan, data_metrics)
                 .await?;
             bytes.pop().ok_or_else(|| {
@@ -654,7 +670,7 @@ impl AsyncFileReader for CachingMetadataReader {
         let Some(scan) = self.data_scan.as_deref() else {
             return self.inner.get_byte_ranges(ranges);
         };
-        DATA_CACHE
+        self.data_cache
             .read(
                 &mut *self.inner,
                 &self.key,
@@ -1589,6 +1605,7 @@ mod tests {
     /// predates the counter).
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     struct DataCacheCounts {
+        misses: Option<usize>,
         hit_bytes: Option<usize>,
         miss_bytes: Option<usize>,
         evictions: Option<usize>,
@@ -1600,6 +1617,7 @@ mod tests {
             let metrics = plan.metrics().unwrap_or_default();
             let sum = |name: &str| metrics.sum_by_name(name).map(|value| value.as_usize());
             Self {
+                misses: sum("parquet_data_cache_misses"),
                 hit_bytes: sum("parquet_data_cache_hit_bytes"),
                 miss_bytes: sum("parquet_data_cache_miss_bytes"),
                 evictions: sum("parquet_data_cache_evictions"),
@@ -1685,6 +1703,19 @@ mod tests {
             hint: Option<usize>,
             open_ahead: bool,
         ) -> ScanRun {
+            self.scan_through(url, partitions, hint, open_ahead, &DATA_CACHE)
+                .await
+        }
+
+        /// [`Self::scan`] with its data reads served by `data_cache`.
+        async fn scan_through(
+            &self,
+            url: &ObjectStoreUrl,
+            partitions: usize,
+            hint: Option<usize>,
+            open_ahead: bool,
+            data_cache: &'static DataCache,
+        ) -> ScanRun {
             let mut config = SessionConfig::new().with_target_partitions(partitions);
             if open_ahead {
                 config
@@ -1694,9 +1725,10 @@ mod tests {
             }
             let ctx = SessionContext::new_with_config(config);
             ctx.register_object_store(url.as_ref(), Arc::clone(&self.store));
-            let factory = Arc::new(CachingParquetFileReaderFactory::new(
+            let factory = Arc::new(CachingParquetFileReaderFactory::with_data_cache(
                 Arc::clone(&self.store),
                 url.as_str(),
+                data_cache,
             ));
             let mut source = ParquetSource::new(Arc::clone(&self.schema))
                 .with_parquet_file_reader_factory(factory);
@@ -1814,6 +1846,15 @@ mod tests {
             "every file reads its column chunks, saw {:?}",
             cold.gets
         );
+        // Hit and miss counters are always registered; the guard counters
+        // only while the data cache is on, and this small scan fits any
+        // enabled cap.
+        assert!(cold.data.hit_bytes.is_some() && cold.data.miss_bytes.is_some());
+        assert_eq!(cold.data.evictions.is_some(), DATA_CACHE.enabled());
+        assert_eq!(cold.data.admission_skips.is_some(), DATA_CACHE.enabled());
+        if DATA_CACHE.enabled() {
+            assert_eq!(cold.data.admission_skips, Some(0));
+        }
 
         let warm = fixture.scan(&url, 2, None, false).await;
         fixture.check(&warm.batches);
@@ -1828,6 +1869,49 @@ mod tests {
                 warm.gets.data, cold.gets.data,
                 "without the data cache warm data reads match cold ones"
             );
+        }
+    }
+
+    /// One admission budget per table scan, shared by every reader: the
+    /// caching factory is built once per scan and creates a reader per file
+    /// and partition, so a budget per reader would let each file (each well
+    /// under the cap here) be admitted in full and churn the cache like a
+    /// plain LRU. Uses its own small data cache, so it runs whatever
+    /// `ICEBERG_PARQUET_DATA_CACHE_MB` says.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn one_data_cache_budget_per_table_scan() {
+        let _shared = PROCESS_CACHE_LOCK.read().await;
+        let files = 8;
+        let fixture = ScanFixture::build(files, SMALL_FILES, None).await;
+        // A reference scan through a cache that holds everything measures
+        // the data bytes and admits them all.
+        let roomy: &'static DataCache = Box::leak(Box::new(DataCache::new(1 << 30)));
+        let reference = fixture
+            .scan_through(&fresh_store_url("budget-reference"), 4, None, false, roomy)
+            .await;
+        fixture.check(&reference.batches);
+        assert_eq!(reference.data.admission_skips, Some(0));
+        let data = reference.data.miss_bytes.unwrap();
+        // A cap of about three files' data: every file fits, the scan does not.
+        let cap = data * 3 / files;
+        let cache: &'static DataCache = Box::leak(Box::new(DataCache::new(cap)));
+        for tag in ["budget-first", "budget-second"] {
+            let run = fixture
+                .scan_through(&fresh_store_url(tag), 4, None, false, cache)
+                .await;
+            fixture.check(&run.batches);
+            let misses = run.data.misses.unwrap();
+            let skips = run.data.admission_skips.unwrap();
+            assert!(
+                skips > 0,
+                "{tag}: the scan's shared budget declined nothing"
+            );
+            assert!(
+                skips < misses,
+                "{tag}: a new scan admits again, saw {:?}",
+                run.data
+            );
+            assert!(cache.used_for_tests() <= cap);
         }
     }
 
@@ -1978,7 +2062,9 @@ mod tests {
     /// Data-cache instrument: cold and warm wall time, data-range GETs, hit
     /// and miss bytes, evictions and admission skips of full scans of 16
     /// [`DATA_CACHE_FILES`] (about 40 MiB of data ranges) through the caching
-    /// reader factory. Each configuration is measured [`DATA_CACHE_REPEATS`]
+    /// reader factory. Each repeat runs the scan four times: cold, warm, and
+    /// two steady-state repeats (`s3`, `s4`) that show whether hits hold
+    /// beyond the first warm scan or alternate. Each configuration is measured [`DATA_CACHE_REPEATS`]
     /// times and reports the median and the min-max range; byte and GET
     /// columns are the median too. Results are checked after the timer stops.
     ///
@@ -1989,7 +2075,7 @@ mod tests {
     /// `previous` (still holding the previous repeat's ranges, which its warm
     /// scan reused, so the cold scan must displace another working set).
     /// Every repeat empties the footer cache and scans under a fresh
-    /// object-store URL, so its first scan is cold and the second warm.
+    /// object-store URL, so its first scan is cold and the later ones warm.
     ///
     /// The data-cache capacity is a process-wide `LazyLock` read once from
     /// `ICEBERG_PARQUET_DATA_CACHE_MB`; run one process per value, e.g. `0`
@@ -2019,15 +2105,21 @@ mod tests {
         println!(
             "| GET delay | P | start | cold ms | cold ms range | cold data GETs | cold miss MiB \
              | cold evictions | cold skips | warm ms | warm ms range | warm data GETs \
-             | warm hit MiB | warm miss MiB | warm evictions | warm skips |"
+             | warm hit MiB | warm miss MiB | warm evictions | warm skips | s3 hit MiB \
+             | s4 ms | s4 ms range | s4 data GETs | s4 hit MiB | s4 evictions | s4 skips |"
         );
-        println!("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|");
+        println!(
+            "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\
+             ---|---|---|"
+        );
         for delay in [Some(Duration::from_millis(20)), None] {
             let fixture = ScanFixture::build(FILES, DATA_CACHE_FILES, delay).await;
             for partitions in [1, 4] {
                 for carry in [false, true] {
                     let mut cold = Vec::with_capacity(DATA_CACHE_REPEATS);
                     let mut warm = Vec::with_capacity(DATA_CACHE_REPEATS);
+                    let mut third = Vec::with_capacity(DATA_CACHE_REPEATS);
+                    let mut fourth = Vec::with_capacity(DATA_CACHE_REPEATS);
                     // The `previous` cells start from a primed working set.
                     DATA_CACHE.clear_for_tests();
                     if carry {
@@ -2043,10 +2135,15 @@ mod tests {
                         let url = fresh_store_url("data-cache-bench");
                         let cold_run = fixture.scan(&url, partitions, None, false).await;
                         let warm_run = fixture.scan(&url, partitions, None, false).await;
-                        fixture.check(&cold_run.batches);
-                        fixture.check(&warm_run.batches);
+                        let third_run = fixture.scan(&url, partitions, None, false).await;
+                        let fourth_run = fixture.scan(&url, partitions, None, false).await;
+                        for run in [&cold_run, &warm_run, &third_run, &fourth_run] {
+                            fixture.check(&run.batches);
+                        }
                         cold.push(cold_run);
                         warm.push(warm_run);
+                        third.push(third_run);
+                        fourth.push(fourth_run);
                     }
                     let ms = |runs: &[ScanRun]| {
                         let mut ms: Vec<f64> =
@@ -2065,9 +2162,11 @@ mod tests {
                     let data_gets = |r: &ScanRun| Some(r.gets.data);
                     let (cold_ms, cold_range) = ms(&cold);
                     let (warm_ms, warm_range) = ms(&warm);
+                    let (fourth_ms, fourth_range) = ms(&fourth);
                     println!(
                         "| {} | {partitions} | {} | {cold_ms} | {cold_range} | {} | {} | {} | {} \
-                         | {warm_ms} | {warm_range} | {} | {} | {} | {} | {} |",
+                         | {warm_ms} | {warm_range} | {} | {} | {} | {} | {} | {} \
+                         | {fourth_ms} | {fourth_range} | {} | {} | {} | {} |",
                         delay.map_or("none".to_string(), |d| format!("{} ms", d.as_millis())),
                         if carry { "previous" } else { "empty" },
                         count(median(&cold, &data_gets)),
@@ -2079,6 +2178,11 @@ mod tests {
                         mib(median(&warm, &|r| r.data.miss_bytes)),
                         count(median(&warm, &|r| r.data.evictions)),
                         count(median(&warm, &|r| r.data.admission_skips)),
+                        mib(median(&third, &|r| r.data.hit_bytes)),
+                        count(median(&fourth, &data_gets)),
+                        mib(median(&fourth, &|r| r.data.hit_bytes)),
+                        count(median(&fourth, &|r| r.data.evictions)),
+                        count(median(&fourth, &|r| r.data.admission_skips)),
                     );
                 }
             }

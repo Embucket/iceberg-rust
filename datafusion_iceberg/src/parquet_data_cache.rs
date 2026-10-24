@@ -1027,3 +1027,262 @@ mod tests {
     }
 }
 
+/// Hit- and insert-path cost of the shared cache under thread contention,
+/// measured directly on [`DataCache::read`] with no object store or decode.
+#[cfg(test)]
+mod lock_bench {
+    use super::*;
+    use datafusion::parquet::arrow::arrow_reader::ArrowReaderOptions;
+    use datafusion::parquet::file::metadata::ParquetMetaData;
+    use futures::{future::BoxFuture, FutureExt};
+    use std::time::{Duration, Instant};
+
+    /// Bytes of one range; ranges are requested eight per call, like the
+    /// column chunks of one row group.
+    const RANGE: u64 = 4096;
+    const PER_CALL: usize = 8;
+    /// Ranges of the scanned file (32 MiB).
+    const RANGES: u64 = 8192;
+    /// Ranges of the hot file the hit threads reuse (1 MiB).
+    const HOT_RANGES: u64 = 256;
+    const REPEATS: usize = 7;
+
+    struct Mem(Bytes);
+
+    impl AsyncFileReader for Mem {
+        fn get_bytes(&mut self, range: Range<u64>) -> BoxFuture<'_, Result<Bytes>> {
+            futures::future::ready(Ok(self.0.slice(range.start as usize..range.end as usize)))
+                .boxed()
+        }
+
+        fn get_metadata<'a>(
+            &'a mut self,
+            _: Option<&'a ArrowReaderOptions>,
+        ) -> BoxFuture<'a, Result<Arc<ParquetMetaData>>> {
+            futures::future::ready(Err(ParquetError::General("unused".into()))).boxed()
+        }
+    }
+
+    fn metrics() -> DataMetrics {
+        DataMetrics::new(&ExecutionPlanMetricsSet::new(), 0, true)
+    }
+
+    /// One `read` of `ranges` of `file` charged to `scan`.
+    fn read(
+        cache: &DataCache,
+        reader: &mut Mem,
+        file: &Arc<str>,
+        ranges: Vec<Range<u64>>,
+        scan: &ScanAdmission,
+        metrics: &DataMetrics,
+    ) {
+        let size = reader.0.len() as u64;
+        futures::executor::block_on(cache.read(reader, file, size, ranges, scan, metrics)).unwrap();
+    }
+
+    /// The calls one of `threads` threads issues for its share of `n` ranges.
+    fn calls(n: u64, threads: usize, thread: usize) -> Vec<Vec<Range<u64>>> {
+        let share = n / threads as u64;
+        let first = share * thread as u64;
+        (first..first + share)
+            .map(|i| i * RANGE..(i + 1) * RANGE)
+            .collect::<Vec<_>>()
+            .chunks(PER_CALL)
+            .map(<[_]>::to_vec)
+            .collect()
+    }
+
+    fn file(n: u64) -> Mem {
+        Mem(Bytes::from(vec![7; usize::try_from(n * RANGE).unwrap()]))
+    }
+
+    /// Median and min-max of `runs` in milliseconds.
+    fn summary(runs: &mut [Duration]) -> (f64, f64, f64) {
+        runs.sort();
+        let ms = |d: Duration| d.as_secs_f64() * 1e3;
+        (
+            ms(runs[runs.len() / 2]),
+            ms(runs[0]),
+            ms(runs[runs.len() - 1]),
+        )
+    }
+
+    /// `threads` readers pass `passes` times over a resident 32 MiB file;
+    /// every pass is one scan shared by all of them, as one table scan's
+    /// partitions share its budget.
+    fn hits(threads: usize, passes: usize) -> Duration {
+        let cache = DataCache::new(256 << 20);
+        let name: Arc<str> = Arc::from("s3://bench/hits");
+        let warm = ScanAdmission::default();
+        let mut reader = file(RANGES);
+        for call in calls(RANGES, 1, 0) {
+            read(&cache, &mut reader, &name, call, &warm, &metrics());
+        }
+        let scans: Vec<ScanAdmission> = (0..passes).map(|_| ScanAdmission::default()).collect();
+        let started = Instant::now();
+        std::thread::scope(|s| {
+            for thread in 0..threads {
+                let (cache, name, scans) = (&cache, &name, &scans);
+                s.spawn(move || {
+                    let mut reader = file(RANGES);
+                    let metrics = metrics();
+                    let calls = calls(RANGES, threads, thread);
+                    for scan in scans {
+                        for call in &calls {
+                            read(cache, &mut reader, name, call.clone(), scan, &metrics);
+                        }
+                    }
+                    assert_eq!(metrics.misses.value(), 0);
+                });
+            }
+        });
+        started.elapsed()
+    }
+
+    /// `threads` readers pass `passes` times over a 32 MiB file through an
+    /// 4 MiB cache, so every read misses. `fresh` gives every call its own
+    /// scan, so every miss is copied, inserted and evicts (the insert path's
+    /// full cost); otherwise each pass is one shared scan, which the budget
+    /// stops admitting after a cap's worth.
+    fn churn(threads: usize, passes: usize, fresh: bool) -> Duration {
+        let cache = DataCache::new(4 << 20);
+        let name: Arc<str> = Arc::from("s3://bench/churn");
+        let scans: Vec<ScanAdmission> = (0..passes).map(|_| ScanAdmission::default()).collect();
+        let started = Instant::now();
+        std::thread::scope(|s| {
+            for thread in 0..threads {
+                let (cache, name, scans) = (&cache, &name, &scans);
+                s.spawn(move || {
+                    let mut reader = file(RANGES);
+                    let metrics = metrics();
+                    let calls = calls(RANGES, threads, thread);
+                    for scan in scans {
+                        for call in &calls {
+                            if fresh {
+                                let own = ScanAdmission::default();
+                                read(cache, &mut reader, name, call.clone(), &own, &metrics);
+                            } else {
+                                read(cache, &mut reader, name, call.clone(), scan, &metrics);
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        started.elapsed()
+    }
+
+    /// `threads` hit threads reread a 1 MiB hot file while `threads` churn
+    /// threads insert misses (a fresh scan per call) through a 4 MiB cache.
+    /// Returns the hit threads' slowest elapsed time and their hit ratio.
+    fn hits_under_churn(threads: usize, passes: usize) -> (Duration, f64) {
+        let cache = DataCache::new(4 << 20);
+        let hot: Arc<str> = Arc::from("s3://bench/hot");
+        let cold: Arc<str> = Arc::from("s3://bench/cold");
+        let warm = ScanAdmission::default();
+        let mut reader = file(HOT_RANGES);
+        for call in calls(HOT_RANGES, 1, 0) {
+            read(&cache, &mut reader, &hot, call, &warm, &metrics());
+        }
+        let done = std::sync::atomic::AtomicBool::new(false);
+        let hit_metrics: Vec<DataMetrics> = (0..threads).map(|_| metrics()).collect();
+        let elapsed = std::thread::scope(|s| {
+            for thread in 0..threads {
+                let (cache, cold, done) = (&cache, &cold, &done);
+                s.spawn(move || {
+                    let mut reader = file(RANGES);
+                    let metrics = metrics();
+                    let calls = calls(RANGES, threads, thread);
+                    while !done.load(Ordering::Relaxed) {
+                        for call in &calls {
+                            let own = ScanAdmission::default();
+                            read(cache, &mut reader, cold, call.clone(), &own, &metrics);
+                            if done.load(Ordering::Relaxed) {
+                                break;
+                            }
+                        }
+                    }
+                });
+            }
+            let hitters: Vec<_> = hit_metrics
+                .iter()
+                .map(|metrics| {
+                    let (cache, hot) = (&cache, &hot);
+                    s.spawn(move || {
+                        let mut reader = file(HOT_RANGES);
+                        let calls = calls(HOT_RANGES, 1, 0);
+                        let started = Instant::now();
+                        for _ in 0..passes {
+                            let scan = ScanAdmission::default();
+                            for call in &calls {
+                                read(cache, &mut reader, hot, call.clone(), &scan, metrics);
+                            }
+                        }
+                        started.elapsed()
+                    })
+                })
+                .collect();
+            let slowest = hitters
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .max()
+                .unwrap();
+            done.store(true, Ordering::Relaxed);
+            slowest
+        });
+        let hits: usize = hit_metrics.iter().map(|m| m.hits.value()).sum();
+        let misses: usize = hit_metrics.iter().map(|m| m.misses.value()).sum();
+        (elapsed, hits as f64 / (hits + misses) as f64)
+    }
+
+    /// Prints median and min-max wall time of [`REPEATS`] runs per workload,
+    /// and nanoseconds per range read by one thread. Run on a release build,
+    /// pinned with `taskset`, e.g. `cargo test --release -p datafusion_iceberg
+    /// --lib parquet_data_cache::lock_bench -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "data-cache lock benchmark that prints a table; run alone with \
+                `-- --ignored parquet_data_cache::lock_bench --nocapture`"]
+    fn data_cache_lock_bench() {
+        println!("| workload | threads | ms | ms range | ns/range/thread | hot hit ratio |");
+        println!("|---|---|---|---|---|---|");
+        let row = |name: &str, threads: usize, ranges: u64, runs: &mut [Duration], ratio: &str| {
+            let (median, min, max) = summary(runs);
+            println!(
+                "| {name} | {threads} | {median:.1} | {min:.1}-{max:.1} | {:.0} | {ratio} |",
+                median * 1e6 / ranges as f64
+            );
+        };
+        for threads in [1, 4] {
+            let passes = 40;
+            let per_thread = RANGES / threads as u64 * passes as u64;
+            let mut runs: Vec<_> = (0..REPEATS).map(|_| hits(threads, passes)).collect();
+            row("hits", threads, per_thread, &mut runs, "-");
+            let passes = 4;
+            let per_thread = RANGES / threads as u64 * passes as u64;
+            let mut runs: Vec<_> = (0..REPEATS).map(|_| churn(threads, passes, true)).collect();
+            row("churn, scan per call", threads, per_thread, &mut runs, "-");
+            let mut runs: Vec<_> = (0..REPEATS)
+                .map(|_| churn(threads, passes, false))
+                .collect();
+            row("churn, scan per pass", threads, per_thread, &mut runs, "-");
+            let passes = 400;
+            let mut ratios = Vec::new();
+            let mut runs: Vec<_> = (0..REPEATS)
+                .map(|_| {
+                    let (elapsed, ratio) = hits_under_churn(threads, passes);
+                    ratios.push(ratio);
+                    elapsed
+                })
+                .collect();
+            ratios.sort_by(f64::total_cmp);
+            let ratio = format!("{:.3}", ratios[ratios.len() / 2]);
+            row(
+                "hits under churn",
+                threads,
+                HOT_RANGES * passes as u64,
+                &mut runs,
+                &ratio,
+            );
+        }
+    }
+}
