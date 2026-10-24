@@ -11,7 +11,11 @@ misses, do not hold synchronous locks across awaits, and account for retained
 buffer ownership rather than only a shared slice's visible length. The data
 cache's per-scan admission budget lives on the reader factory, which is built
 once per table scan; keep it shared by every reader of that scan and absent
-when the cache is disabled, so cap `0` adds no work to the read path.
+when the cache is disabled, so cap `0` adds no work to the read path. The
+budget charges hits as well as misses (so repeats of a scan larger than the
+cap keep their hits) and lasts for one physical plan; re-executing a plan
+continues its budget. Hits keep the mutex scope of a plain LRU lookup, and
+one insert reprieves a bounded number of entries.
 
 Validate cache changes with focused unit tests for identities, memory limits,
 partial hits, error recovery, and representative Iceberg query result checks.

@@ -19,30 +19,43 @@
 //! than the cache just ahead of its next pass. Two rules bound that:
 //!
 //! - **Per-scan admission budget.** Every reader of one table scan shares a
-//!   [`ScanAdmission`]. A miss is admitted only while the scan's cumulative
-//!   miss weight (bytes plus the per-entry charge, the unit of the cap) stays
-//!   within the cap. A scan that fits is admitted in full, exactly as before;
-//!   one that does not stops copying and inserting once it has missed a cap's
-//!   worth, so it can evict at most a cap's worth of entries and its repeat
-//!   reuses the ranges it admitted first. The threshold is the cap itself: any
-//!   lower value would drop warm hits for scans that fit, and admitting more
-//!   than a cap's worth from one scan can only evict that scan's own ranges.
-//!   Every scan starts with a fresh budget, so admission resumes as soon as
-//!   the large scan ends; there is no global latch, clock or tunable.
+//!   [`ScanAdmission`]. It charges every range the scan touches, hits as well
+//!   as misses, by weight (bytes plus the per-entry charge, the unit of the
+//!   cap), and a miss is admitted only while that total, the miss included,
+//!   stays within the cap. A scan that fits is admitted in full, exactly as
+//!   before; one that does not stops copying and inserting once it has
+//!   touched a cap's worth, so it evicts about a cap's worth of entries at
+//!   most. Charging hits is what makes repeats stable: a repeat of a scan
+//!   larger than the cap spends its budget on the ranges an earlier run
+//!   admitted and keeps hitting them on every repeat, instead of admitting a
+//!   fresh cap's worth that would evict them and alternate between full and
+//!   no hits. The threshold is the cap itself: any lower value would drop
+//!   warm hits for scans that fit, and admitting more than a cap's worth from
+//!   one scan can only evict that scan's own ranges. Ranges that can never be
+//!   cached (empty, or heavier than the cap) are neither charged nor counted
+//!   as skips. Every scan starts with a fresh budget, so admission resumes as
+//!   soon as the large scan ends; there is no global latch, clock or tunable.
+//!   The budget lives as long as the reader factory, i.e. one physical plan:
+//!   executing the same plan again (a recursive query's working table, a
+//!   cached plan) continues its budget, so a re-execution that has spent it
+//!   still hits resident ranges but admits no new ones.
 //! - **Second chance for reused ranges, bounded to a quarter of the cap.** A
 //!   hit marks its entry. Eviction moves a marked least-recently-used entry to
 //!   the most-recent end and clears the mark instead of dropping it, as long
 //!   as entries reprieved this way (and not evicted since) total at most a
 //!   quarter of the cap; past that, marked entries are evicted in LRU order.
-//!   The cap's worth a large scan may still admit then recycles that scan's
-//!   own unreused ranges before it reaches up to a quarter of the cap of
-//!   ranges other queries actually reuse. The bound limits what reprieves can
-//!   cost a working-set change: reprieved older ranges outrank the new set's
-//!   unhit ones, so a new set keeps on its first pass only the cap minus the
-//!   reprieved share. Up to three quarters of the cap, a new working set
-//!   therefore displaces an older reused one in one pass, exactly like a plain
-//!   LRU; a larger one loses at most a quarter of the cap on that pass and
-//!   re-admits it on the next.
+//!   A reprieved entry that is hit again earns another reprieve. One insert
+//!   reprieves at most [`MAX_REPRIEVES_PER_INSERT`] entries before it evicts
+//!   in plain LRU order, which bounds the work an insert does under the
+//!   shared lock. The cap's worth a large scan may still admit then recycles
+//!   that scan's own unreused ranges before it reaches up to a quarter of the
+//!   cap of ranges other queries actually reuse. The bound limits what reprieves can cost a working-set change:
+//!   reprieved older ranges outrank the new set's unhit ones, so a new set
+//!   keeps on its first pass only the cap minus the reprieved share. Up to
+//!   three quarters of the cap, a new working set therefore displaces an
+//!   older reused one in one pass, exactly like a plain LRU; a larger one
+//!   loses at most a quarter of the cap on that pass and re-admits it on the
+//!   next.
 //!
 //! Neither rule affects results: a range that is not admitted is returned from
 //! the fetch exactly like an admitted one. The scan-local
@@ -51,6 +64,9 @@
 //! entries (and their data bytes) dropped to make room for a scan's inserts.
 //! A cache whose working set does not fit shows evictions; one whose scans
 //! outgrow it shows skips. Neither is registered while the cache is disabled.
+//! Like the hit and miss counters they are registered per reader, i.e. per
+//! file and partition, so an enabled cache registers seven data-cache entries
+//! per file in the scan's metrics set instead of four.
 //!
 //! Many concurrent or successive scans that each fit but together exceed the
 //! cap still churn the unreused ranges like a plain LRU; the second chance
@@ -102,6 +118,11 @@ struct State {
 /// Reprieved entries may hold at most `1 / SPARED_SHARE` of the cap.
 const SPARED_SHARE: usize = 4;
 
+/// Entries one insert may reprieve before it evicts in plain LRU order, so a
+/// run of marked entries at the LRU end cannot make one insert walk up to a
+/// quarter of the cap while every hit waits on the lock.
+const MAX_REPRIEVES_PER_INSERT: usize = 16;
+
 /// Entries (and their data bytes) one insert evicted.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Evicted {
@@ -111,22 +132,32 @@ struct Evicted {
 
 /// Data-cache admission budget shared by every reader of one table scan.
 ///
-/// Holds the scan's cumulative miss weight; see the module docs.
+/// Holds the cumulative weight of the ranges the scan touched, hits and
+/// misses alike; see the module docs.
 #[derive(Debug, Default)]
 pub(crate) struct ScanAdmission {
-    missed: AtomicUsize,
+    touched: AtomicUsize,
 }
 
 impl ScanAdmission {
+    /// Charge the scan's hits of total `weight` against its budget.
+    fn charge(&self, weight: usize, cap: usize) {
+        // Past the budget further charges change nothing; skip the shared
+        // read-modify-write so the scan's readers stop contending on it.
+        if weight != 0 && self.touched.load(Ordering::Relaxed) <= cap {
+            self.touched.fetch_add(weight, Ordering::Relaxed);
+        }
+    }
+
     /// Charge one missed range of `weight` and say whether it may be inserted:
-    /// only while the scan's misses, this one included, total at most `cap`.
+    /// only while the scan's charges, this one included, total at most `cap`.
     fn admit(&self, weight: usize, cap: usize) -> bool {
         // Once over budget the scan never admits again; skip the shared
         // read-modify-write so its readers stop contending on the counter.
-        if self.missed.load(Ordering::Relaxed) > cap {
+        if self.touched.load(Ordering::Relaxed) > cap {
             return false;
         }
-        self.missed
+        self.touched
             .fetch_add(weight, Ordering::Relaxed)
             .saturating_add(weight)
             <= cap
@@ -138,8 +169,16 @@ pub(crate) struct DataCache {
     state: Mutex<State>,
 }
 
+impl std::fmt::Debug for DataCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DataCache")
+            .field("cap", &self.cap)
+            .finish_non_exhaustive()
+    }
+}
+
 impl DataCache {
-    fn new(cap: usize) -> Self {
+    pub(crate) fn new(cap: usize) -> Self {
         Self {
             cap,
             state: Mutex::new(State {
@@ -161,6 +200,12 @@ impl DataCache {
         state.entries.clear();
         state.used = 0;
         state.spared = 0;
+    }
+
+    /// Resident weight, for tests that check the cap holds.
+    #[cfg(test)]
+    pub(crate) fn used_for_tests(&self) -> usize {
+        self.state.lock().unwrap().used
     }
 
     fn get(&self, key: &Key) -> Option<Bytes> {
@@ -194,16 +239,22 @@ impl DataCache {
             }
         }
         state.used = state.used.saturating_add(weight);
-        // Terminates: each pass either evicts or clears a mark, and the entry
-        // just inserted (unmarked, weight <= cap) fits once it is alone.
+        // Terminates: at most MAX_REPRIEVES_PER_INSERT passes clear a mark,
+        // every other pass evicts, and the entry just inserted (weight <= cap)
+        // fits once it is alone.
         let spared_cap = self.cap / SPARED_SHARE;
+        let mut reprieves = 0;
         while state.used > self.cap {
             let Some((lru, entry)) = state.entries.peek_lru() else {
                 break;
             };
             let lru_weight = lru.weight(entry.bytes.len());
-            if entry.hit && (entry.spared || state.spared + lru_weight <= spared_cap) {
+            if entry.hit
+                && reprieves < MAX_REPRIEVES_PER_INSERT
+                && (entry.spared || state.spared + lru_weight <= spared_cap)
+            {
                 // Second chance: refresh instead of evicting, once per hit.
+                reprieves += 1;
                 let newly_spared = !entry.spared;
                 let lru = lru.clone();
                 if let Some(entry) = state.entries.get_mut(&lru) {
@@ -240,6 +291,7 @@ impl DataCache {
         let mut output = Vec::with_capacity(ranges.len());
         let mut missing = Vec::new();
         let mut missing_keys = Vec::new();
+        let mut hit_weight = 0usize;
         for (index, range) in ranges.into_iter().enumerate() {
             if range.start > range.end || range.end > size {
                 return Err(ParquetError::General(
@@ -255,6 +307,7 @@ impl DataCache {
             if let Some(bytes) = self.get(&key) {
                 metrics.hits.add(1);
                 metrics.hit_bytes.add(bytes.len());
+                hit_weight = hit_weight.saturating_add(key.weight(bytes.len()));
                 output.push(Some(bytes));
             } else {
                 metrics.misses.add(1);
@@ -263,6 +316,9 @@ impl DataCache {
                 output.push(None);
             }
         }
+        // Hits are charged before this call's misses: they hold resident
+        // ranges the misses would otherwise evict.
+        scan.charge(hit_weight, self.cap);
         if !missing.is_empty() {
             let fetched = inner.get_byte_ranges(missing).await?;
             if fetched.len() != missing_keys.len() {
@@ -277,12 +333,17 @@ impl DataCache {
                     return Err(ParquetError::General("Truncated Parquet byte range".into()));
                 }
                 metrics.miss_bytes.add(bytes.len());
-                if scan.admit(key.weight(bytes.len()), self.cap) {
-                    let put = self.put(key, &bytes);
-                    evicted.entries += put.entries;
-                    evicted.bytes += put.bytes;
-                } else {
-                    skipped += 1;
+                let weight = key.weight(bytes.len());
+                // A range `put` would reject (empty, or heavier than the cap)
+                // must not spend the budget the scan's other ranges can use.
+                if weight <= self.cap && !bytes.is_empty() {
+                    if scan.admit(weight, self.cap) {
+                        let put = self.put(key, &bytes);
+                        evicted.entries += put.entries;
+                        evicted.bytes += put.bytes;
+                    } else {
+                        skipped += 1;
+                    }
                 }
                 output[index] = Some(bytes);
             }
@@ -815,7 +876,7 @@ mod tests {
     }
 
     #[test]
-    fn a_hit_range_gets_one_second_chance() {
+    fn a_hit_range_is_spared_once_per_hit() {
         let k = |name: &str| key(name, 20, 0, 4);
         let put = |cache: &DataCache, name: &str| {
             cache.put(k(name), &Bytes::from(name.repeat(4).into_bytes()))
@@ -862,4 +923,107 @@ mod tests {
         assert_eq!(cache.state.lock().unwrap().spared, 0);
         assert!(cache.state.lock().unwrap().used <= cache.cap);
     }
+
+    #[tokio::test]
+    async fn a_repeated_large_scan_keeps_its_hits() {
+        let file: Arc<str> = Arc::from("s3://bucket/file");
+        // Sixteen ranges fit; scans of four times and 1.25 times the cap.
+        for n in [64, 20] {
+            let cache = DataCache::new(16 * range_weight(&file));
+            let mut reader = file_of(n, b'x');
+            let mut hits = Vec::new();
+            for _ in 0..5 {
+                let scan = scan();
+                let metrics = DataMetrics::new(&ExecutionPlanMetricsSet::new(), 0, true);
+                // Row-group-sized calls, as a Parquet reader issues them.
+                for chunk in ranges(n).chunks(4) {
+                    let out = cache
+                        .read(
+                            &mut reader,
+                            &file,
+                            n * RANGE,
+                            chunk.to_vec(),
+                            &scan,
+                            &metrics,
+                        )
+                        .await
+                        .unwrap();
+                    assert!(out.iter().all(|bytes| bytes.len() == 64));
+                }
+                hits.push(metrics.hits.value());
+                assert!(cache.used_for_tests() <= cache.cap);
+            }
+            // Every repeat spends its budget on the cap's worth the first run
+            // admitted instead of admitting (and evicting) another one.
+            assert_eq!(hits, [0, 16, 16, 16, 16], "hits per repeat, {n} ranges");
+        }
+    }
+
+    #[tokio::test]
+    async fn uncacheable_ranges_do_not_spend_the_budget() {
+        let file: Arc<str> = Arc::from("s3://bucket/file");
+        let cache = DataCache::new(4 * range_weight(&file));
+        let mut reader = file_of(24, b'x');
+        let size = 24 * RANGE;
+        // Seventeen ranges' bytes alone outweigh the cap of four.
+        let oversized = 0..17 * RANGE;
+        assert!(key(&file, size, 0, 17 * RANGE).weight(17 * 64) > cache.cap);
+        let scan = scan();
+        let metrics = DataMetrics::new(&ExecutionPlanMetricsSet::new(), 0, true);
+        let small: Vec<_> = (17..21).map(|i| i * RANGE..(i + 1) * RANGE).collect();
+        let empty = 17 * RANGE..17 * RANGE;
+        for request in [vec![oversized], vec![empty], small.clone()] {
+            cache
+                .read(&mut reader, &file, size, request, &scan, &metrics)
+                .await
+                .unwrap();
+        }
+        assert_eq!(guard(&metrics).admission_skips.value(), 0);
+        reader.reads.clear();
+        let metrics = DataMetrics::new(&ExecutionPlanMetricsSet::new(), 0, true);
+        cache
+            .read(&mut reader, &file, size, small, &scan, &metrics)
+            .await
+            .unwrap();
+        assert!(reader.reads.is_empty(), "small ranges were not admitted");
+        assert_eq!(metrics.hits.value(), 4);
+        assert!(cache.used_for_tests() <= cache.cap);
+    }
+
+    #[test]
+    fn reprieves_per_insert_are_bounded() {
+        let k = |i: u64| key("f", 1 << 20, i * 4, i * 4 + 4);
+        let weight = k(0).weight(4);
+        let cache = DataCache::new(100 * weight);
+        // The spared share (25 entries) exceeds the per-insert bound.
+        assert!(cache.cap / SPARED_SHARE > MAX_REPRIEVES_PER_INSERT * weight);
+        let data = Bytes::from_static(b"data");
+        for i in 0..100 {
+            cache.put(k(i), &data);
+        }
+        for i in 0..100 {
+            assert!(cache.get(&k(i)).is_some());
+        }
+        // One insert meets a run of 100 marked entries at the LRU end.
+        assert_eq!(
+            cache.put(k(100), &data),
+            Evicted {
+                entries: 1,
+                bytes: 4
+            }
+        );
+        let bound = MAX_REPRIEVES_PER_INSERT as u64;
+        let resident = |i: u64| cache.state.lock().unwrap().entries.contains(&k(i));
+        assert!((0..bound).all(resident), "the first entries are reprieved");
+        assert!(
+            !resident(bound),
+            "past the bound the insert evicts in LRU order"
+        );
+        assert_eq!(
+            cache.state.lock().unwrap().spared,
+            MAX_REPRIEVES_PER_INSERT * weight
+        );
+        assert!(cache.used_for_tests() <= cache.cap);
+    }
 }
+

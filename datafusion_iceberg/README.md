@@ -34,14 +34,22 @@ Entries plus conservative key overhead count against the cap. The process's
 other memory users and in-flight reads still need their own budget.
 
 The cache resists scans larger than itself. All readers of one table scan
-share an admission budget: a miss is inserted only while that scan's misses,
-weighted like the cap, total at most the cap. A scan that fits is cached in
-full; a larger one stops copying and inserting after a cap's worth, so it can
-evict at most that much and its repeat reuses the ranges it admitted first.
-Each scan starts with a fresh budget. Eviction also gives a range that has been
-hit one second chance, for at most a quarter of the cap of such ranges, so a
-large scan's admitted share recycles its own unused ranges before the reused
-ranges in that share. A new working set up to three quarters of the cap still
+share an admission budget that charges every range the scan touches, hits as
+well as misses, weighted like the cap; a miss is inserted only while that
+total stays within the cap. A scan that fits is cached in full; a larger one
+stops copying and inserting after a cap's worth, so it evicts about that much
+at most, and every repeat spends its budget on the ranges an earlier run
+admitted and keeps hitting them instead of displacing them. Ranges that can
+never be cached (empty, or larger than the cap) do not spend the budget. Each
+scan starts with a fresh budget. The budget lasts as long as the physical
+plan: executing one plan again (a recursive query's working table, a cached
+plan) continues it, so a re-execution that has spent it still hits but
+admits nothing new. Eviction also spares a range that has been hit since it was
+inserted or last spared (so a spared range that is hit again is spared
+again), for at most a quarter of the cap of such ranges and at most 16
+reprieves per insert, so a large scan's
+admitted share recycles its own unused ranges before the reused ranges in
+that share. A new working set up to three quarters of the cap still
 displaces an older reused one in one pass, as with a plain LRU; a larger one
 can lose up to a quarter of the cap on its first pass. Neither rule changes
 query results.
@@ -53,7 +61,9 @@ Scan metrics expose `parquet_data_cache_hits`, `parquet_data_cache_misses`,
 and data bytes dropped to make room for the scan's inserts) and
 `parquet_data_cache_admission_skips` (misses the scan's budget declined).
 Evictions mean the working set does not fit; skips mean single scans outgrow
-the cap. Scans that each fit but together exceed the cap still churn unreused
+the cap. Like the hit and miss counters they are registered per file and
+partition, so an enabled cache registers seven data-cache metric entries per
+file instead of four. Scans that each fit but together exceed the cap still churn unreused
 ranges as in a plain LRU. This initial implementation does not reuse overlapping
 ranges or deduplicate concurrent misses. It is intended for immutable Iceberg
 files, not files overwritten in place at the same URI and size.
