@@ -9,23 +9,35 @@ manifest`) that otherwise repeat on every scan of the same snapshot.
 
 Keys are the original file URIs (scheme + bucket + path), NOT store-relative
 paths: the cache is process-wide, and two object stores can hold different
-bytes at the same relative path (`s3://a/x` vs `s3://b/x`).
+bytes at the same relative path (`s3://a/x` vs `s3://b/x`). The key carries no
+store identity or credentials, so bytes one caller fetched serve every other
+caller of the same URI, whether it hits the cache later or waits on the fill
+below. This assumes a URI names the same bytes for every reader in the
+process and that any reader of a URI may see them, as with one set of
+credentials per bucket. Mixing credential scopes for the same URIs (for
+example per-table vended credentials) would need the scope in the key.
 
 The cache is byte-capped LRU. Capacity comes from `ICEBERG_MANIFEST_CACHE_MB`
 (read once per process; default 128 MiB; `0` disables caching entirely).
 Entries larger than the cap are never inserted.
 
 Concurrent cold fills of one URI share a single fetch ([`get_or_fetch`]): the
-first caller fetches and inserts while later callers wait on a per-URI gate
-and then re-check the cache. If that fill fails or its bytes cannot be cached,
-the waiters fetch for themselves; if its caller is cancelled before inserting,
-one waiter takes over the fill. Either way one caller's error never reaches
-the others and is never cached. A gate exists only while a fill of its URI is
-in flight, and the number of gated URIs is capped; past the cap a fill runs
-ungated. Waiting is the right trade here because these reads
-happen during scan planning, where every caller needs the bytes before it can
-make progress. The Parquet footer cache in `datafusion_iceberg` makes the
-opposite choice: its contended loads bypass rather than wait.
+first caller starts the fetch on its own task, and later callers wait on a
+per-URI gate and then re-check the cache. Because the fill runs on its own
+task it finishes whether or not the caller that started it keeps polling, so
+a partly consumed or abandoned scan stream never holds up other readers of
+the same file, and a cancelled caller does not cancel the fill. If the fill
+fails or its bytes cannot be cached, the waiters fetch for themselves. If the
+fill ends without leaving bytes for a waiter to find (its task panicked or
+its runtime shut down, or the LRU evicted the bytes again before the waiter
+re-checked), the waiters elect one of them to fill again. One caller's error
+never reaches the others and is never cached. A gate exists only while a fill
+of its URI is in flight, and the number of gated URIs is capped; past the cap
+a fill runs ungated, as it does when caching is disabled or no Tokio runtime
+is available. Waiting is the right trade here because these reads happen
+during scan planning, where every caller needs the bytes before it can make
+progress. The Parquet footer cache in `datafusion_iceberg` makes the opposite
+choice: its contended loads bypass rather than wait.
 */
 
 use bytes::Bytes;
@@ -35,6 +47,7 @@ use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex, MutexGuard, PoisonError};
 use tokio::sync::watch;
+use tracing::Instrument;
 
 use crate::error::Error;
 
@@ -52,71 +65,62 @@ struct ByteCappedCache {
     cap_bytes: usize,
 }
 
-static CACHE: LazyLock<Option<Mutex<ByteCappedCache>>> = LazyLock::new(|| {
+impl ByteCappedCache {
+    fn new(cap_bytes: usize) -> Self {
+        Self {
+            entries: LruCache::unbounded(),
+            total_bytes: 0,
+            cap_bytes,
+        }
+    }
+
+    /// Insert `bytes` under `path`, evicting least-recently-used entries
+    /// until the byte cap holds. Oversized payloads are skipped. Returns
+    /// whether the bytes were inserted.
+    fn insert(&mut self, path: &str, bytes: &Bytes) -> bool {
+        let len = bytes.len();
+        if len > self.cap_bytes {
+            return false;
+        }
+        if let Some(previous) = self.entries.put(path.to_string(), bytes.clone()) {
+            self.total_bytes = self.total_bytes.saturating_sub(previous.len());
+        }
+        self.total_bytes += len;
+        while self.total_bytes > self.cap_bytes {
+            match self.entries.pop_lru() {
+                Some((_, evicted)) => {
+                    self.total_bytes = self.total_bytes.saturating_sub(evicted.len());
+                }
+                None => break,
+            }
+        }
+        true
+    }
+}
+
+static CACHE: LazyLock<ManifestCache> = LazyLock::new(|| {
     let cap_mb = std::env::var("ICEBERG_MANIFEST_CACHE_MB")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .unwrap_or(DEFAULT_CAP_MB);
-    if cap_mb == 0 {
-        return None;
-    }
-    Some(Mutex::new(ByteCappedCache {
-        entries: LruCache::unbounded(),
-        total_bytes: 0,
-        cap_bytes: cap_mb.saturating_mul(1024 * 1024),
-    }))
+    ManifestCache::new(cap_mb.saturating_mul(1024 * 1024), MAX_GATES)
 });
 
-static GATES: LazyLock<FillGates> = LazyLock::new(|| FillGates::new(MAX_GATES));
-
-/// Cached bytes for `path`, touching its LRU position.
-fn get(path: &str) -> Option<Bytes> {
-    let cache = CACHE.as_ref()?;
-    let mut guard = cache.lock().ok()?;
-    guard.entries.get(path).cloned()
-}
-
-/// Insert `bytes` under `path`, evicting least-recently-used entries until
-/// the byte cap holds. Oversized payloads are skipped. Returns whether the
-/// bytes were inserted.
-fn put(path: &str, bytes: &Bytes) -> bool {
-    let Some(cache) = CACHE.as_ref() else {
-        return false;
-    };
-    let Ok(mut guard) = cache.lock() else {
-        return false;
-    };
-    let len = bytes.len();
-    if len > guard.cap_bytes {
-        return false;
-    }
-    if let Some(previous) = guard.entries.put(path.to_string(), bytes.clone()) {
-        guard.total_bytes = guard.total_bytes.saturating_sub(previous.len());
-    }
-    guard.total_bytes += len;
-    while guard.total_bytes > guard.cap_bytes {
-        match guard.entries.pop_lru() {
-            Some((_, evicted)) => {
-                guard.total_bytes = guard.total_bytes.saturating_sub(evicted.len());
-            }
-            None => break,
-        }
-    }
-    true
-}
-
-/// Bytes for `path` from the cache, or from `fetch` on a miss, inserting them
-/// on success. Concurrent misses for the same `path` share one `fetch`: later
-/// callers wait for the first caller's fill and use its cached bytes. If that
-/// fill fails or its bytes cannot be cached, the waiters fetch for themselves,
-/// concurrently; if its caller is cancelled, one waiter takes over the fill.
-/// `fetch` is polled only by a caller that fetches, and its error is returned
-/// to that caller alone.
-pub(crate) async fn get_or_fetch<F>(path: &str, fetch: F) -> Result<Bytes, Error>
+/// Bytes for `path` from the cache, or from the future `fetch` builds on a
+/// miss, inserting them on success. Concurrent misses for the same `path`
+/// share one fetch: the first caller runs it on its own task and later
+/// callers wait for that fill and use its cached bytes. If the fill fails or
+/// its bytes cannot be cached, the waiters fetch for themselves, concurrently;
+/// if it ends without leaving bytes in the cache, one waiter fills again.
+/// `fetch` is called only by a caller that fetches, and its error is returned
+/// to that caller alone. A panic in the fetch reaches the caller that
+/// started it.
+pub(crate) async fn get_or_fetch<M, F>(path: &str, fetch: M) -> Result<Bytes, Error>
 where
-    F: Future<Output = Result<Bytes, Error>>,
+    M: FnOnce() -> F,
+    F: Future<Output = Result<Bytes, Error>> + Send + 'static,
 {
-    GATES.get_or_fetch(path, fetch).await
+    CACHE.get_or_fetch(path, fetch).await
 }
 
 /// Process-wide counters of manifest-list and manifest cache fills, counted
@@ -131,31 +135,35 @@ pub struct ManifestCacheFillStats {
     /// Misses that found a fill of the same URI in flight and waited for it.
     pub waits: u64,
     /// Waiters that fetched themselves because the fill they waited for
-    /// failed, was cancelled or could not cache its bytes. Included in
-    /// `fills`.
+    /// failed or could not cache its bytes, or because it ended without
+    /// leaving bytes in the cache (its task panicked or was dropped, or the
+    /// bytes were evicted before the waiter re-checked). Included in `fills`.
     pub waiter_refills: u64,
 }
 
 /// Snapshot of the process-wide [`ManifestCacheFillStats`].
 pub fn manifest_cache_fill_stats() -> ManifestCacheFillStats {
-    GATES.stats()
+    CACHE.stats()
 }
 
-/// Per-URI gates around cache fills, with fill counters.
-struct FillGates {
+/// Manifest bytes by URI, with per-URI gates around their fills and fill
+/// counters.
+struct ManifestCache {
+    /// `None` when caching is disabled.
+    bytes: Option<Mutex<ByteCappedCache>>,
     /// One entry per URI with a fill in flight, holding the completion signal
     /// its waiters subscribe to.
     in_flight: Mutex<HashMap<String, watch::Receiver<bool>>>,
-    cap: usize,
+    max_gates: usize,
     fills: AtomicU64,
     waits: AtomicU64,
     waiter_refills: AtomicU64,
 }
 
 /// A caller's place in the fills of one URI.
-enum Role<'a> {
+enum Role {
     /// No fill was in flight: this caller fills.
-    Leader(Leader<'a>),
+    Leader(Leader),
     /// Another caller is filling. The receiver changes to `true` when that
     /// fill ended without caching bytes, and closes when the fill ends.
     Waiter(watch::Receiver<bool>),
@@ -163,26 +171,43 @@ enum Role<'a> {
     Ungated,
 }
 
-/// Leadership of one URI's fill. Dropping it ends the fill, whether the
-/// leader inserted, failed or was cancelled: the entry is removed and the
-/// completion signal closes, waking every waiter at once. Waking them one at
-/// a time (a mutex hand-off) would chain each waiter behind the previous
-/// one's task being polled.
-struct Leader<'a> {
-    gates: &'a FillGates,
-    path: &'a str,
+/// Leadership of one URI's fill, owned by the task that runs it. Dropping it
+/// ends the fill, whether it inserted, failed or its task was dropped: the
+/// entry is removed and the completion signal closes, waking every waiter at
+/// once. Waking them one at a time (a mutex hand-off) would chain each waiter
+/// behind the previous one's task being polled.
+struct Leader {
+    cache: &'static ManifestCache,
+    path: String,
     done: watch::Sender<bool>,
 }
 
-impl FillGates {
-    fn new(cap: usize) -> Self {
+impl ManifestCache {
+    /// A cache holding up to `cap_bytes` (`0` disables caching) with at most
+    /// `max_gates` gated fills in flight.
+    fn new(cap_bytes: usize, max_gates: usize) -> Self {
         Self {
+            bytes: (cap_bytes > 0).then(|| Mutex::new(ByteCappedCache::new(cap_bytes))),
             in_flight: Mutex::new(HashMap::new()),
-            cap,
+            max_gates,
             fills: AtomicU64::new(0),
             waits: AtomicU64::new(0),
             waiter_refills: AtomicU64::new(0),
         }
+    }
+
+    /// Cached bytes for `path`, touching its LRU position.
+    fn get(&self, path: &str) -> Option<Bytes> {
+        let mut guard = self.bytes.as_ref()?.lock().ok()?;
+        guard.entries.get(path).cloned()
+    }
+
+    /// Insert `bytes` under `path`; see [`ByteCappedCache::insert`].
+    fn put(&self, path: &str, bytes: &Bytes) -> bool {
+        self.bytes
+            .as_ref()
+            .and_then(|cache| cache.lock().ok())
+            .is_some_and(|mut guard| guard.insert(path, bytes))
     }
 
     fn table(&self) -> MutexGuard<'_, HashMap<String, watch::Receiver<bool>>> {
@@ -191,33 +216,35 @@ impl FillGates {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn enter<'a>(&'a self, path: &'a str) -> Role<'a> {
+    fn enter(&'static self, path: &str) -> Role {
         let mut table = self.table();
         if let Some(done) = table.get(path) {
             return Role::Waiter(done.clone());
         }
-        if table.len() >= self.cap {
+        if table.len() >= self.max_gates {
             return Role::Ungated;
         }
         let (done, subscribe) = watch::channel(false);
         table.insert(path.to_owned(), subscribe);
         Role::Leader(Leader {
-            gates: self,
-            path,
+            cache: self,
+            path: path.to_owned(),
             done,
         })
     }
 
-    async fn get_or_fetch<F>(&self, path: &str, fetch: F) -> Result<Bytes, Error>
+    async fn get_or_fetch<M, F>(&'static self, path: &str, fetch: M) -> Result<Bytes, Error>
     where
-        F: Future<Output = Result<Bytes, Error>>,
+        M: FnOnce() -> F,
+        F: Future<Output = Result<Bytes, Error>> + Send + 'static,
     {
-        if let Some(bytes) = get(path) {
+        if let Some(bytes) = self.get(path) {
             return Ok(bytes);
         }
-        // Without a cache a waiter could never be served by another fill.
-        if CACHE.is_none() {
-            return self.fetch(path, fetch).await;
+        // Without a cache a waiter could never be served by another fill, and
+        // without a runtime the fill cannot run on its own task.
+        if self.bytes.is_none() || tokio::runtime::Handle::try_current().is_err() {
+            return self.fetch(path, fetch()).await;
         }
         let mut waited = false;
         loop {
@@ -225,47 +252,34 @@ impl FillGates {
                 Role::Leader(leader) => {
                     // A fill may have completed between the lookup and taking
                     // the lead.
-                    if let Some(bytes) = get(path) {
+                    if let Some(bytes) = self.get(path) {
                         return Ok(bytes);
                     }
                     if waited {
                         self.waiter_refills.fetch_add(1, Ordering::Relaxed);
                     }
                     self.fills.fetch_add(1, Ordering::Relaxed);
-                    let result = fetch.await;
-                    let cached = result.as_ref().is_ok_and(|bytes| put(path, bytes));
-                    if !cached {
-                        // Failed or uncacheable: waiters fetch for themselves,
-                        // concurrently. Electing one of them while the rest
-                        // wait again would repeat a persistent error (object
-                        // stores already retry transient ones) or an
-                        // uncacheable fetch once per waiter, in sequence.
-                        leader.done.send_replace(true);
-                    }
-                    // Dropped only after the insert, so woken waiters find
-                    // the bytes.
-                    drop(leader);
-                    return result;
+                    return leader.fill(fetch()).await;
                 }
                 Role::Waiter(mut done) => {
                     if !waited {
                         waited = true;
                         self.waits.fetch_add(1, Ordering::Relaxed);
                     }
-                    // Resolves once the leader marks the fill uncached or
-                    // drops its sender.
+                    // Resolves once the fill marks itself uncached or drops
+                    // its sender.
                     let _ = done.changed().await;
-                    if let Some(bytes) = get(path) {
+                    if let Some(bytes) = self.get(path) {
                         return Ok(bytes);
                     }
                     if *done.borrow() {
                         self.waiter_refills.fetch_add(1, Ordering::Relaxed);
-                        return self.fetch(path, fetch).await;
+                        return self.fetch(path, fetch()).await;
                     }
-                    // The leader was cancelled: take the lead, or wait for
-                    // whichever waiter took it first.
+                    // The fill ended without leaving bytes to find: take the
+                    // lead, or wait for whichever waiter took it first.
                 }
-                Role::Ungated => return self.fetch(path, fetch).await,
+                Role::Ungated => return self.fetch(path, fetch()).await,
             }
         }
     }
@@ -277,7 +291,7 @@ impl FillGates {
     {
         self.fills.fetch_add(1, Ordering::Relaxed);
         let bytes = fetch.await?;
-        put(path, &bytes);
+        self.put(path, &bytes);
         Ok(bytes)
     }
 
@@ -290,119 +304,69 @@ impl FillGates {
     }
 }
 
-impl Drop for Leader<'_> {
+impl Leader {
+    /// Run `fetch` to completion on its own task, insert its bytes and end
+    /// the fill, returning the fetch's result. The task owns the leadership,
+    /// so waiters never depend on this caller being polled: a caller that
+    /// stops polling or is dropped leaves the fill running.
+    async fn fill<F>(self, fetch: F) -> Result<Bytes, Error>
+    where
+        F: Future<Output = Result<Bytes, Error>> + Send + 'static,
+    {
+        let task = tokio::spawn(
+            async move {
+                let result = fetch.await;
+                let cached = result
+                    .as_ref()
+                    .is_ok_and(|bytes| self.cache.put(&self.path, bytes));
+                if !cached {
+                    // Failed or uncacheable: waiters fetch for themselves,
+                    // concurrently. Electing one of them while the rest wait
+                    // again would repeat a persistent error (object stores
+                    // already retry transient ones) or an uncacheable fetch
+                    // once per waiter, in sequence.
+                    self.done.send_replace(true);
+                }
+                // Dropped only after the insert, so woken waiters find the
+                // bytes.
+                drop(self);
+                result
+            }
+            .in_current_span(),
+        );
+        match task.await {
+            Ok(result) => result,
+            Err(error) => match error.try_into_panic() {
+                Ok(panic) => std::panic::resume_unwind(panic),
+                Err(error) => Err(error.into()),
+            },
+        }
+    }
+}
+
+impl Drop for Leader {
     fn drop(&mut self) {
         // The entry goes before the sender (a field, dropped after this body)
-        // closes, so a waiter woken by a cancelled leader can take the lead.
-        self.gates.table().remove(self.path);
+        // closes, so a waiter woken by a fill that left no bytes can take the
+        // lead.
+        self.cache.table().remove(&self.path);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    // The static cache reads its capacity from the environment once per
-    // process, so tests exercise the mechanics through a locally built
-    // instance of the same structure.
+    // The process-wide cache reads its capacity from the environment once per
+    // process, so tests of the cache and gate mechanics build their own
+    // instances. Tests that drive the real read paths go through the
+    // process-wide cache and skip when the environment disables it.
     use super::*;
 
-    fn build(cap_bytes: usize) -> ByteCappedCache {
-        ByteCappedCache {
-            entries: LruCache::unbounded(),
-            total_bytes: 0,
-            cap_bytes,
-        }
-    }
-
-    fn put_in(cache: &mut ByteCappedCache, path: &str, bytes: &Bytes) {
-        let len = bytes.len();
-        if len > cache.cap_bytes {
-            return;
-        }
-        if let Some(previous) = cache.entries.put(path.to_string(), bytes.clone()) {
-            cache.total_bytes = cache.total_bytes.saturating_sub(previous.len());
-        }
-        cache.total_bytes += len;
-        while cache.total_bytes > cache.cap_bytes {
-            match cache.entries.pop_lru() {
-                Some((_, evicted)) => {
-                    cache.total_bytes = cache.total_bytes.saturating_sub(evicted.len());
-                }
-                None => break,
-            }
-        }
-    }
-
-    #[test]
-    fn uri_keys_do_not_collide_across_stores() {
-        // Same store-relative path under two buckets must stay two entries,
-        // and the stripped form must not be a key at all. Exercises the real
-        // process-wide cache (default cap, env unset in tests).
-        put(
-            "s3://bucket-a/db/tbl/metadata/x-m0.avro",
-            &Bytes::from_static(b"bytes-a"),
-        );
-        put(
-            "s3://bucket-b/db/tbl/metadata/x-m0.avro",
-            &Bytes::from_static(b"bytes-b"),
-        );
-        assert_eq!(
-            get("s3://bucket-a/db/tbl/metadata/x-m0.avro").as_deref(),
-            Some(b"bytes-a".as_slice())
-        );
-        assert_eq!(
-            get("s3://bucket-b/db/tbl/metadata/x-m0.avro").as_deref(),
-            Some(b"bytes-b".as_slice())
-        );
-        assert!(get("/db/tbl/metadata/x-m0.avro").is_none());
-    }
-
-    #[test]
-    fn hit_and_miss() {
-        let mut cache = build(1024);
-        put_in(&mut cache, "a", &Bytes::from(vec![1u8; 10]));
-        assert!(cache.entries.get("a").is_some());
-        assert!(cache.entries.get("b").is_none());
-    }
-
-    #[test]
-    fn byte_cap_evicts_lru() {
-        let mut cache = build(100);
-        put_in(&mut cache, "a", &Bytes::from(vec![0u8; 60]));
-        put_in(&mut cache, "b", &Bytes::from(vec![0u8; 60]));
-        // "a" evicted to fit "b".
-        assert!(cache.entries.get("a").is_none());
-        assert!(cache.entries.get("b").is_some());
-        assert!(cache.total_bytes <= 100);
-    }
-
-    #[test]
-    fn oversized_payload_skipped() {
-        let mut cache = build(50);
-        put_in(&mut cache, "big", &Bytes::from(vec![0u8; 51]));
-        assert!(cache.entries.get("big").is_none());
-        assert_eq!(cache.total_bytes, 0);
-    }
-
-    #[test]
-    fn replacing_entry_updates_accounting() {
-        let mut cache = build(100);
-        put_in(&mut cache, "a", &Bytes::from(vec![0u8; 40]));
-        put_in(&mut cache, "a", &Bytes::from(vec![0u8; 20]));
-        assert_eq!(cache.total_bytes, 20);
-    }
-
-    // Concurrent cold fills, exercised through the real manifest-list and
-    // manifest read paths against a store that counts and holds GETs. Each
-    // test uses its own URIs, so the process-wide cache starts cold for them
-    // regardless of what other tests run alongside.
-
-    use std::collections::HashMap;
-    use std::future::Future;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::AtomicUsize;
     use std::sync::Arc;
+    use std::time::Duration;
 
     use futures::stream::BoxStream;
-    use futures::TryStreamExt;
+    use futures::{FutureExt, StreamExt, TryStreamExt};
     use iceberg_rust_spec::{
         manifest::{partition_value_schema, ManifestEntry},
         manifest_list::{manifest_list_schema_v2, Content, ManifestListEntry},
@@ -420,12 +384,99 @@ mod tests {
         ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as OsResult,
     };
 
-    use tokio::sync::watch;
-
-    use crate::error::Error;
     use crate::table::{datafiles, manifest::ManifestWriter, manifest_list::read_snapshot};
 
     const CALLERS: usize = 8;
+
+    /// A cache instance that lives for the rest of the test process, as the
+    /// fill tasks it spawns require.
+    fn leaked(cap_bytes: usize, max_gates: usize) -> &'static ManifestCache {
+        Box::leak(Box::new(ManifestCache::new(cap_bytes, max_gates)))
+    }
+
+    /// Whether the process-wide cache is disabled (`ICEBERG_MANIFEST_CACHE_MB=0`),
+    /// in which case the read-path tests have nothing to share and skip.
+    fn global_cache_disabled() -> bool {
+        let disabled = CACHE.bytes.is_none();
+        if disabled {
+            eprintln!("skipped: the process-wide manifest cache is disabled");
+        }
+        disabled
+    }
+
+    #[test]
+    fn uri_keys_do_not_collide_across_stores() {
+        // Same store-relative path under two buckets must stay two entries,
+        // and the stripped form must not be a key at all.
+        let cache = ManifestCache::new(1024, MAX_GATES);
+        cache.put(
+            "s3://bucket-a/db/tbl/metadata/x-m0.avro",
+            &Bytes::from_static(b"bytes-a"),
+        );
+        cache.put(
+            "s3://bucket-b/db/tbl/metadata/x-m0.avro",
+            &Bytes::from_static(b"bytes-b"),
+        );
+        assert_eq!(
+            cache
+                .get("s3://bucket-a/db/tbl/metadata/x-m0.avro")
+                .as_deref(),
+            Some(b"bytes-a".as_slice())
+        );
+        assert_eq!(
+            cache
+                .get("s3://bucket-b/db/tbl/metadata/x-m0.avro")
+                .as_deref(),
+            Some(b"bytes-b".as_slice())
+        );
+        assert!(cache.get("/db/tbl/metadata/x-m0.avro").is_none());
+    }
+
+    #[test]
+    fn hit_and_miss() {
+        let mut cache = ByteCappedCache::new(1024);
+        assert!(cache.insert("a", &Bytes::from(vec![1u8; 10])));
+        assert!(cache.entries.get("a").is_some());
+        assert!(cache.entries.get("b").is_none());
+    }
+
+    #[test]
+    fn byte_cap_evicts_lru() {
+        let mut cache = ByteCappedCache::new(100);
+        cache.insert("a", &Bytes::from(vec![0u8; 60]));
+        cache.insert("b", &Bytes::from(vec![0u8; 60]));
+        // "a" evicted to fit "b".
+        assert!(cache.entries.get("a").is_none());
+        assert!(cache.entries.get("b").is_some());
+        assert!(cache.total_bytes <= 100);
+    }
+
+    #[test]
+    fn oversized_payload_skipped() {
+        let mut cache = ByteCappedCache::new(50);
+        assert!(!cache.insert("big", &Bytes::from(vec![0u8; 51])));
+        assert!(cache.entries.get("big").is_none());
+        assert_eq!(cache.total_bytes, 0);
+    }
+
+    #[test]
+    fn replacing_entry_updates_accounting() {
+        let mut cache = ByteCappedCache::new(100);
+        cache.insert("a", &Bytes::from(vec![0u8; 40]));
+        cache.insert("a", &Bytes::from(vec![0u8; 20]));
+        assert_eq!(cache.total_bytes, 20);
+    }
+
+    #[test]
+    fn disabled_cache_stores_nothing() {
+        let cache = ManifestCache::new(0, MAX_GATES);
+        assert!(!cache.put("a", &Bytes::from_static(b"a")));
+        assert!(cache.get("a").is_none());
+    }
+
+    // Concurrent cold fills. The tests run on the current-thread runtime and
+    // hold fetches until they release them, so every interleaving they
+    // assert on is fixed.
 
     /// How a [`HoldingStore`] answers the first GET it receives.
     #[derive(Debug, Clone, Copy)]
@@ -613,12 +664,12 @@ mod tests {
         (store, snapshot)
     }
 
-    /// An empty data manifest stored at a URI unique to `tag`.
-    async fn manifest_fixture(
+    /// `count` empty data manifests in one store, at URIs unique to `tag`.
+    async fn manifests_fixture(
         tag: &str,
+        count: usize,
         metadata: &TableMetadata,
-    ) -> (Arc<InMemory>, ManifestListEntry) {
-        let uri = format!("s3://manifest-cache-tests/table/metadata/{tag}-m0.avro");
+    ) -> (Arc<InMemory>, Vec<ManifestListEntry>) {
         let partition_fields = metadata.current_partition_fields().unwrap();
         let schema = ManifestEntry::schema(
             &partition_value_schema(&partition_fields).unwrap(),
@@ -626,12 +677,26 @@ mod tests {
         )
         .unwrap();
         let store = Arc::new(InMemory::new());
-        let entry = ManifestWriter::new(&uri, 1, &schema, metadata, Content::Data)
-            .unwrap()
-            .finish(store.clone())
-            .await
-            .unwrap();
-        (store, entry)
+        let mut manifests = Vec::with_capacity(count);
+        for index in 0..count {
+            let uri = format!("s3://manifest-cache-tests/table/metadata/{tag}-m{index}.avro");
+            let entry = ManifestWriter::new(&uri, 1, &schema, metadata, Content::Data)
+                .unwrap()
+                .finish(store.clone())
+                .await
+                .unwrap();
+            manifests.push(entry);
+        }
+        (store, manifests)
+    }
+
+    /// One empty data manifest stored at a URI unique to `tag`.
+    async fn manifest_fixture(
+        tag: &str,
+        metadata: &TableMetadata,
+    ) -> (Arc<InMemory>, ManifestListEntry) {
+        let (store, mut manifests) = manifests_fixture(tag, 1, metadata).await;
+        (store, manifests.remove(0))
     }
 
     async fn read_list(
@@ -645,15 +710,22 @@ mod tests {
         Ok(entries.len())
     }
 
-    async fn read_manifest(
+    async fn read_manifests(
         store: Arc<HoldingStore>,
-        manifest: Arc<ManifestListEntry>,
+        manifests: &[ManifestListEntry],
     ) -> Result<usize, Error> {
-        let entries = datafiles(store, std::slice::from_ref(&*manifest), None, (None, None))
+        let entries = datafiles(store, manifests, None, (None, None))
             .await?
             .try_collect::<Vec<_>>()
             .await?;
         Ok(entries.len())
+    }
+
+    async fn read_manifest(
+        store: Arc<HoldingStore>,
+        manifest: Arc<ManifestListEntry>,
+    ) -> Result<usize, Error> {
+        read_manifests(store, std::slice::from_ref(&*manifest)).await
     }
 
     /// Let every spawned task run until it parks. The tests run on the
@@ -675,7 +747,7 @@ mod tests {
     /// No gate is left behind for `path` once its fills are done.
     fn assert_idle(path: &str) {
         assert!(
-            !GATES.table().contains_key(path),
+            !CACHE.table().contains_key(path),
             "idle gate left for {path}"
         );
     }
@@ -685,7 +757,7 @@ mod tests {
     async fn held_fetch(
         mut open: watch::Receiver<bool>,
         fail: bool,
-        fetches: &AtomicUsize,
+        fetches: Arc<AtomicUsize>,
     ) -> Result<Bytes, Error> {
         fetches.fetch_add(1, Ordering::SeqCst);
         open.wait_for(|open| *open).await.unwrap();
@@ -698,40 +770,40 @@ mod tests {
 
     #[tokio::test]
     async fn gates_count_fills_and_leave_no_idle_entry() {
-        let gates = FillGates::new(MAX_GATES);
-        let fetches = AtomicUsize::new(0);
+        let cache = leaked(1024, MAX_GATES);
+        let fetches = Arc::new(AtomicUsize::new(0));
 
         // Shared fill: one fetch serves every caller.
         let path = "s3://manifest-cache-tests/gates/shared-m0.avro";
         let (open_tx, open) = watch::channel(false);
         let callers = (0..CALLERS)
-            .map(|_| gates.get_or_fetch(path, held_fetch(open.clone(), false, &fetches)));
+            .map(|_| cache.get_or_fetch(path, || held_fetch(open.clone(), false, fetches.clone())));
         let (results, ()) = futures::join!(futures::future::join_all(callers), async {
             settle().await;
-            assert_eq!(gates.table().len(), 1, "all callers on one gate");
+            assert_eq!(cache.table().len(), 1, "all callers on one gate");
             assert_eq!(fetches.load(Ordering::SeqCst), 1, "only the leader fetches");
             open_tx.send_replace(true);
         });
         assert!(results.iter().all(Result::is_ok), "{results:?}");
         assert_eq!(fetches.load(Ordering::SeqCst), 1);
         assert_eq!(
-            gates.stats(),
+            cache.stats(),
             ManifestCacheFillStats {
                 fills: 1,
                 waits: CALLERS as u64 - 1,
                 waiter_refills: 0,
             }
         );
-        assert!(gates.table().is_empty(), "gate removed once idle");
+        assert!(cache.table().is_empty(), "gate removed once idle");
 
         // Warm: served from the cache without touching the gates.
-        let warm = gates
-            .get_or_fetch(path, held_fetch(open.clone(), true, &fetches))
+        let warm = cache
+            .get_or_fetch(path, || held_fetch(open.clone(), true, fetches.clone()))
             .await
             .unwrap();
         assert_eq!(warm.as_ref(), b"manifest");
         assert_eq!(fetches.load(Ordering::SeqCst), 1);
-        assert_eq!(gates.stats().fills, 1);
+        assert_eq!(cache.stats().fills, 1);
 
         // Failed fill: every waiter fetches for itself, all at once.
         let path = "s3://manifest-cache-tests/gates/failed-m0.avro";
@@ -743,7 +815,8 @@ mod tests {
             } else {
                 rest.clone()
             };
-            gates.get_or_fetch(path, held_fetch(open, call == 0, &fetches))
+            let fetches = fetches.clone();
+            cache.get_or_fetch(path, move || held_fetch(open, call == 0, fetches))
         });
         let (results, ()) = futures::join!(futures::future::join_all(callers), async {
             settle().await;
@@ -756,43 +829,205 @@ mod tests {
         assert!(results[1..].iter().all(Result::is_ok), "{results:?}");
         assert_eq!(fetches.load(Ordering::SeqCst), 1 + CALLERS);
         assert_eq!(
-            gates.stats(),
+            cache.stats(),
             ManifestCacheFillStats {
                 fills: 1 + CALLERS as u64,
                 waits: 2 * (CALLERS as u64 - 1),
                 waiter_refills: CALLERS as u64 - 1,
             }
         );
-        assert!(gates.table().is_empty(), "gate removed once idle");
+        assert!(cache.table().is_empty(), "gate removed once idle");
     }
 
     #[tokio::test]
     async fn full_gate_table_fills_ungated() {
-        let gates = FillGates::new(1);
+        let cache = leaked(1024, 1);
         let Role::Leader(occupied) =
-            gates.enter("s3://manifest-cache-tests/gates/occupied-m0.avro")
+            cache.enter("s3://manifest-cache-tests/gates/occupied-m0.avro")
         else {
             panic!("the first fill leads");
         };
         let path = "s3://manifest-cache-tests/gates/overflow-m0.avro";
         assert!(
-            matches!(gates.enter(path), Role::Ungated),
+            matches!(cache.enter(path), Role::Ungated),
             "the gate table is full"
         );
-        let bytes = gates
-            .get_or_fetch(path, async { Ok(Bytes::from_static(b"overflow")) })
+        let bytes = cache
+            .get_or_fetch(path, || async { Ok(Bytes::from_static(b"overflow")) })
             .await
             .unwrap();
         assert_eq!(bytes.as_ref(), b"overflow");
-        assert_eq!(get(path).as_deref(), Some(b"overflow".as_slice()));
-        assert_eq!(gates.stats().fills, 1);
-        assert_eq!(gates.table().len(), 1);
+        assert_eq!(cache.get(path).as_deref(), Some(b"overflow".as_slice()));
+        assert_eq!(cache.stats().fills, 1);
+        assert_eq!(cache.table().len(), 1);
         drop(occupied);
-        assert!(gates.table().is_empty());
+        assert!(cache.table().is_empty());
+    }
+
+    #[tokio::test]
+    async fn disabled_cache_fills_ungated() {
+        // With nothing to share, concurrent callers each fetch at once and no
+        // gate is taken.
+        let cache = leaked(0, MAX_GATES);
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let path = "s3://manifest-cache-tests/gates/disabled-m0.avro";
+        let (open_tx, open) = watch::channel(false);
+        let callers = (0..CALLERS)
+            .map(|_| cache.get_or_fetch(path, || held_fetch(open.clone(), false, fetches.clone())));
+        let (results, ()) = futures::join!(futures::future::join_all(callers), async {
+            settle().await;
+            assert_eq!(fetches.load(Ordering::SeqCst), CALLERS, "no caller waits");
+            assert!(cache.table().is_empty(), "no gate taken");
+            open_tx.send_replace(true);
+        });
+        assert!(results.iter().all(Result::is_ok), "{results:?}");
+        assert_eq!(
+            cache.stats(),
+            ManifestCacheFillStats {
+                fills: CALLERS as u64,
+                waits: 0,
+                waiter_refills: 0,
+            }
+        );
+        assert!(cache.get(path).is_none());
+    }
+
+    #[tokio::test]
+    async fn evicted_fill_hands_over() {
+        // The cache holds one entry, so caching another URI after the fill
+        // inserted evicts its bytes before the woken waiters re-check: one
+        // waiter fills again and serves the rest.
+        let cache = leaked(b"manifest".len(), MAX_GATES);
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let path = "s3://manifest-cache-tests/gates/evicted-m0.avro";
+        let (open_tx, open) = watch::channel(false);
+        let callers = (0..CALLERS)
+            .map(|_| cache.get_or_fetch(path, || held_fetch(open.clone(), false, fetches.clone())));
+        // `join!` polls the control branch before the callers on every wake,
+        // so it sees the fill's insert before any waiter re-checks the cache.
+        let ((), results) = futures::join!(
+            async {
+                settle().await;
+                open_tx.send_replace(true);
+                while cache.get(path).is_none() {
+                    tokio::task::yield_now().await;
+                }
+                assert!(cache.put(
+                    "s3://manifest-cache-tests/gates/evictor-m0.avro",
+                    &Bytes::from_static(b"evictor!"),
+                ));
+                assert!(cache.get(path).is_none(), "the fill's bytes were evicted");
+            },
+            futures::future::join_all(callers)
+        );
+        assert!(results.iter().all(Result::is_ok), "{results:?}");
+        assert_eq!(
+            fetches.load(Ordering::SeqCst),
+            2,
+            "one refill after the eviction"
+        );
+        assert_eq!(
+            cache.stats(),
+            ManifestCacheFillStats {
+                fills: 2,
+                waits: CALLERS as u64 - 1,
+                waiter_refills: 1,
+            }
+        );
+        assert!(cache.table().is_empty(), "gate removed once idle");
+    }
+
+    #[tokio::test]
+    async fn abandoned_caller_does_not_stall_waiters() {
+        // The first caller starts the fill and is then never polled again.
+        let cache = leaked(1024, MAX_GATES);
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let path = "s3://manifest-cache-tests/gates/abandoned-m0.avro";
+        let (open_tx, open) = watch::channel(false);
+        let mut abandoned =
+            Box::pin(cache.get_or_fetch(path, || held_fetch(open.clone(), false, fetches.clone())));
+        assert!(futures::poll!(&mut abandoned).is_pending());
+        let waiters = futures::future::join_all((1..CALLERS).map(|_| {
+            cache.get_or_fetch(path, || held_fetch(open.clone(), false, fetches.clone()))
+        }));
+        let (results, ()) = futures::join!(
+            async {
+                tokio::time::timeout(Duration::from_secs(10), waiters)
+                    .await
+                    .expect("waiters must not depend on the first caller being polled")
+            },
+            async {
+                settle().await;
+                open_tx.send_replace(true);
+            }
+        );
+        assert!(results.iter().all(Result::is_ok), "{results:?}");
+        assert_eq!(
+            fetches.load(Ordering::SeqCst),
+            1,
+            "served by the first fill"
+        );
+        assert!(
+            cache.table().is_empty(),
+            "the fill ended without its caller"
+        );
+        // The abandoned caller still gets the bytes when polled again.
+        assert_eq!(abandoned.await.unwrap().as_ref(), b"manifest");
+    }
+
+    #[tokio::test]
+    async fn panicked_fill_hands_over() {
+        // The first fetch panics: its caller sees the panic, and one waiter
+        // fills again and serves the rest.
+        let cache = leaked(1024, MAX_GATES);
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let path = "s3://manifest-cache-tests/gates/panicked-m0.avro";
+        let (open_tx, open) = watch::channel(false);
+        let leader = tokio::spawn({
+            let (open, fetches) = (open.clone(), fetches.clone());
+            cache.get_or_fetch(path, move || async move {
+                let fetched = held_fetch(open, false, fetches).await;
+                if fetched.is_ok() {
+                    panic!("injected fetch panic");
+                }
+                fetched
+            })
+        });
+        settle().await;
+        let waiters = (1..CALLERS)
+            .map(|_| {
+                let (open, fetches) = (open.clone(), fetches.clone());
+                tokio::spawn(cache.get_or_fetch(path, move || held_fetch(open, false, fetches)))
+            })
+            .collect::<Vec<_>>();
+        settle().await;
+        assert_eq!(
+            fetches.load(Ordering::SeqCst),
+            1,
+            "waiters wait for the fill"
+        );
+        open_tx.send_replace(true);
+        assert!(
+            leader.await.unwrap_err().is_panic(),
+            "the panic reaches the caller that started the fill"
+        );
+        for result in join_all(waiters).await {
+            assert_eq!(result.unwrap().as_ref(), b"manifest");
+        }
+        assert_eq!(
+            fetches.load(Ordering::SeqCst),
+            2,
+            "one refill after the panic"
+        );
+        assert_eq!(cache.stats().waiter_refills, 1);
+        assert!(cache.table().is_empty(), "gate removed once idle");
     }
 
     #[tokio::test]
     async fn concurrent_fills_fetch_once() {
+        if global_cache_disabled() {
+            return;
+        }
         let metadata = Arc::new(test_metadata());
 
         // Manifest list.
@@ -869,6 +1104,9 @@ mod tests {
 
     #[tokio::test]
     async fn leader_failure_lets_waiter_fill() {
+        if global_cache_disabled() {
+            return;
+        }
         let metadata = Arc::new(test_metadata());
 
         // Manifest list.
@@ -893,41 +1131,47 @@ mod tests {
     }
 
     /// Spawn a leader, queue `CALLERS - 1` waiters behind it and abort the
-    /// leader mid-fetch: exactly one waiter takes over the fill and the rest
-    /// are served by it.
-    async fn assert_cancelled_leader_hands_over<F, Fut>(store: &HoldingStore, holds: Holds, read: F)
+    /// leader mid-fetch: its fill keeps running and serves every waiter.
+    async fn assert_cancelled_leader_keeps_fill<F, Fut>(store: &HoldingStore, holds: Holds, read: F)
     where
         F: Fn() -> Fut,
         Fut: Future<Output = Result<usize, Error>> + Send + 'static,
     {
         let leader = tokio::spawn(read());
         settle().await;
-        assert_eq!(store.gets(), 1, "the leader is parked in its GET");
+        assert_eq!(store.gets(), 1, "the leader's fill is parked in its GET");
         let waiters = (1..CALLERS)
             .map(|_| tokio::spawn(read()))
             .collect::<Vec<_>>();
         settle().await;
-        assert_eq!(store.gets(), 1, "waiters queue behind the leader");
+        assert_eq!(store.gets(), 1, "waiters queue behind the fill");
         leader.abort();
         assert!(leader.await.unwrap_err().is_cancelled());
         settle().await;
-        assert_eq!(store.gets(), 2, "one waiter takes over the fill");
+        assert_eq!(store.gets(), 1, "the fill outlives its caller");
         holds.release_all();
         for result in join_all(waiters).await {
             assert_eq!(result.unwrap(), 0);
         }
-        assert_eq!(store.gets(), 2, "cancelled leader GET plus one takeover");
+        assert_eq!(
+            store.gets(),
+            1,
+            "the cancelled caller's GET served everyone"
+        );
     }
 
     #[tokio::test]
-    async fn cancelled_leader_releases_gate() {
+    async fn cancelled_leader_keeps_fill_running() {
+        if global_cache_disabled() {
+            return;
+        }
         let metadata = Arc::new(test_metadata());
 
         // Manifest list.
         let (inner, snapshot) = manifest_list_fixture("cancelled-leader").await;
         let (store, holds) = HoldingStore::new(inner, FirstGet::Serve);
         let snapshot = Arc::new(snapshot);
-        assert_cancelled_leader_hands_over(&store, holds, || {
+        assert_cancelled_leader_keeps_fill(&store, holds, || {
             read_list(store.clone(), snapshot.clone(), metadata.clone())
         })
         .await;
@@ -937,10 +1181,52 @@ mod tests {
         let (inner, manifest) = manifest_fixture("cancelled-leader", &metadata).await;
         let (store, holds) = HoldingStore::new(inner, FirstGet::Serve);
         let manifest = Arc::new(manifest);
-        assert_cancelled_leader_hands_over(&store, holds, || {
+        assert_cancelled_leader_keeps_fill(&store, holds, || {
             read_manifest(store.clone(), manifest.clone())
         })
         .await;
         assert_idle(&manifest.manifest_path);
+    }
+
+    #[tokio::test]
+    async fn stalled_scan_stream_does_not_block_other_readers() {
+        // A reader that pulls from its manifest stream once and then neither
+        // polls nor drops it still has fetches in flight; other readers of the
+        // same manifests, even on the same task, must not wait on it.
+        if global_cache_disabled() {
+            return;
+        }
+        let metadata = test_metadata();
+        let (inner, manifests) = manifests_fixture("stalled-stream", 2, &metadata).await;
+        let (store, holds) = HoldingStore::new(inner, FirstGet::Serve);
+        let mut stalled = Box::pin(
+            datafiles(store.clone(), &manifests, None, (None, None))
+                .await
+                .unwrap(),
+        );
+        assert!(
+            stalled.next().now_or_never().is_none(),
+            "the stalled reader's GETs are held"
+        );
+        settle().await;
+        assert_eq!(store.gets(), manifests.len());
+        holds.release_all();
+        let entries = tokio::time::timeout(
+            Duration::from_secs(10),
+            read_manifests(store.clone(), &manifests),
+        )
+        .await
+        .expect("a stalled reader must not block other readers")
+        .unwrap();
+        assert_eq!(entries, 0);
+        assert_eq!(
+            store.gets(),
+            manifests.len(),
+            "served by the stalled reader's fills"
+        );
+        for manifest in &manifests {
+            assert_idle(&manifest.manifest_path);
+        }
+        drop(stalled);
     }
 }

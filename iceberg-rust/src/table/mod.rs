@@ -412,11 +412,16 @@ pub(crate) async fn datafiles(
             // Manifest files are immutable by path. Key by the original
             // URI so equal store-relative paths cannot alias across stores;
             // concurrent cold readers of one manifest share a single fetch.
-            let data = crate::util::manifest_cache::get_or_fetch(
-                &manifest_path,
-                read_metadata_object(object_store.as_ref(), &manifest_path)
-                    .instrument(tracing::trace_span!("iceberg_rust::get_manifest")),
-            )
+            // The span is created only by a caller that fetches, so its
+            // count matches the GETs issued.
+            let data = crate::util::manifest_cache::get_or_fetch(&manifest_path, || {
+                let manifest_path = manifest_path.clone();
+                async move {
+                    read_metadata_object(object_store.as_ref(), &manifest_path)
+                        .instrument(tracing::trace_span!("iceberg_rust::get_manifest"))
+                        .await
+                }
+            })
             .await?;
             let bytes = Cursor::new(Vec::from(data));
 

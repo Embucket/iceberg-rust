@@ -325,10 +325,10 @@ pub(crate) async fn read_snapshot<'metadata>(
     // The cache key is the original URI (scheme + bucket + path): distinct
     // stores can hold different bytes at the same store-relative path.
     let uri = snapshot.manifest_list();
-    let data = crate::util::manifest_cache::get_or_fetch(
-        uri,
-        read_metadata_object(object_store.as_ref(), uri),
-    )
+    let data = crate::util::manifest_cache::get_or_fetch(uri, || {
+        let uri = uri.to_owned();
+        async move { read_metadata_object(object_store.as_ref(), &uri).await }
+    })
     .await?;
     let bytes: Cursor<Vec<u8>> = Cursor::new(data.into());
     ManifestListReader::new_with_schema(
