@@ -3080,10 +3080,19 @@ mod tests {
     /// defaults `ParquetFormat::create_physical_plan` installs.
     #[tokio::test]
     async fn sorted_attested_scan_keeps_caching_factory_and_pushdown() {
+        use crate::parquet_metadata_cache::{process_cache_enabled, PROCESS_CACHE_LOCK};
         use datafusion::physical_plan::{collect, displayable};
         use datafusion::prelude::{col, lit, SessionConfig};
         use iceberg_rust::arrow::write::write_sorted_parquet_partitioned;
         use iceberg_rust::spec::sort::{NullOrder, SortDirection, SortField, SortOrderBuilder};
+
+        // The warm-repeat assertions read the process-wide footer cache: keep
+        // the cache-clearing benches out for the whole test.
+        let _shared = PROCESS_CACHE_LOCK.read().await;
+        assert!(
+            process_cache_enabled(),
+            "precondition: ICEBERG_PARQUET_METADATA_CACHE_MB is not 0"
+        );
 
         // Wide enough (8 columns) for a one-column predicate to enable
         // row-filter pushdown.
@@ -3172,6 +3181,8 @@ mod tests {
             "wide attested scan must keep the caching factory, pushdown and ordering"
         );
         // Narrow scan: the heuristic turns pushdown off; ordering still declared.
+        // `false` is also what the defaults would give, so this case guards the
+        // heuristic and the caching factory, not the pushdown decision itself.
         let narrow = table
             .scan(&state, Some(&vec![0]), &filter, None)
             .await
