@@ -112,7 +112,7 @@ use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
-use crate::parquet_data_cache::{DataMetrics, DATA_CACHE};
+use crate::parquet_data_cache::{DataMetrics, ScanAdmission, DATA_CACHE};
 use bytes::Bytes;
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::physical_plan::parquet::{
@@ -555,10 +555,14 @@ static CACHE: LazyLock<MetadataCache> = LazyLock::new(|| {
 /// One factory is built per scan; it carries the scan's object-store URL as a
 /// key prefix so cache keys are unique across stores and buckets even though
 /// the [`PartitionedFile`] locations it receives are only store-relative.
+/// Being per scan, it also carries that scan's data-cache admission budget.
 #[derive(Debug)]
 pub(crate) struct CachingParquetFileReaderFactory {
     inner: Arc<dyn ParquetFileReaderFactory>,
     key_prefix: Arc<str>,
+    /// Shared by every reader of this scan; `None` while the data cache is
+    /// disabled, in which case data reads go straight to the inner reader.
+    data_scan: Option<Arc<ScanAdmission>>,
 }
 
 impl CachingParquetFileReaderFactory {
@@ -568,6 +572,7 @@ impl CachingParquetFileReaderFactory {
         Self {
             inner: Arc::new(DefaultParquetFileReaderFactory::new(store)),
             key_prefix: Arc::from(key_prefix),
+            data_scan: DATA_CACHE.enabled().then(Arc::default),
         }
     }
 }
@@ -587,7 +592,7 @@ impl ParquetFileReaderFactory for CachingParquetFileReaderFactory {
         );
         let size = partitioned_file.object_meta.size;
         let cache_metrics = CacheMetrics::new(metrics, partition_index);
-        let data_metrics = DataMetrics::new(metrics, partition_index);
+        let data_metrics = DataMetrics::new(metrics, partition_index, self.data_scan.is_some());
         let inner = self.inner.create_reader(
             partition_index,
             partitioned_file,
@@ -600,6 +605,7 @@ impl ParquetFileReaderFactory for CachingParquetFileReaderFactory {
             size,
             metrics: cache_metrics,
             data_metrics,
+            data_scan: self.data_scan.clone(),
         }))
     }
 }
@@ -612,22 +618,25 @@ struct CachingMetadataReader {
     size: u64,
     metrics: CacheMetrics,
     data_metrics: DataMetrics,
+    data_scan: Option<Arc<ScanAdmission>>,
 }
 
 impl AsyncFileReader for CachingMetadataReader {
     fn get_bytes(&mut self, range: Range<u64>) -> BoxFuture<'_, ParquetResult<Bytes>> {
-        if !DATA_CACHE.enabled() {
-            return self.inner.get_bytes(range);
-        }
+        let Self {
+            inner,
+            key,
+            size,
+            data_metrics,
+            data_scan,
+            ..
+        } = self;
+        let Some(scan) = data_scan.as_deref() else {
+            return inner.get_bytes(range);
+        };
         async move {
             let mut bytes = DATA_CACHE
-                .read(
-                    &mut *self.inner,
-                    &self.key,
-                    self.size,
-                    vec![range],
-                    &self.data_metrics,
-                )
+                .read(&mut **inner, key, *size, vec![range], scan, data_metrics)
                 .await?;
             bytes.pop().ok_or_else(|| {
                 datafusion::parquet::errors::ParquetError::General(
@@ -642,15 +651,16 @@ impl AsyncFileReader for CachingMetadataReader {
         &mut self,
         ranges: Vec<Range<u64>>,
     ) -> BoxFuture<'_, ParquetResult<Vec<Bytes>>> {
-        if !DATA_CACHE.enabled() {
+        let Some(scan) = self.data_scan.as_deref() else {
             return self.inner.get_byte_ranges(ranges);
-        }
+        };
         DATA_CACHE
             .read(
                 &mut *self.inner,
                 &self.key,
                 self.size,
                 ranges,
+                scan,
                 &self.data_metrics,
             )
             .boxed()

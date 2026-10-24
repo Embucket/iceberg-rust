@@ -9,8 +9,56 @@
 //! Each retained range owns its buffer: an object-store multi-range response can
 //! return slices backed by a much larger coalesced allocation. Retaining those
 //! slices while charging only their lengths would evade the cache's byte cap.
+//!
+//! # Scan resistance
+//!
+//! A plain LRU is pure overhead when one scan reads more than the cap: every
+//! miss is copied and inserted, each insert evicts an older entry (first the
+//! rest of the process's working set, then the scan's own earlier ranges), and
+//! a repeat of the scan finds nothing, because LRU evicts a cyclic scan larger
+//! than the cache just ahead of its next pass. Two rules bound that:
+//!
+//! - **Per-scan admission budget.** Every reader of one table scan shares a
+//!   [`ScanAdmission`]. A miss is admitted only while the scan's cumulative
+//!   miss weight (bytes plus the per-entry charge, the unit of the cap) stays
+//!   within the cap. A scan that fits is admitted in full, exactly as before;
+//!   one that does not stops copying and inserting once it has missed a cap's
+//!   worth, so it can evict at most a cap's worth of entries and its repeat
+//!   reuses the ranges it admitted first. The threshold is the cap itself: any
+//!   lower value would drop warm hits for scans that fit, and admitting more
+//!   than a cap's worth from one scan can only evict that scan's own ranges.
+//!   Every scan starts with a fresh budget, so admission resumes as soon as
+//!   the large scan ends; there is no global latch, clock or tunable.
+//! - **Second chance for reused ranges, bounded to a quarter of the cap.** A
+//!   hit marks its entry. Eviction moves a marked least-recently-used entry to
+//!   the most-recent end and clears the mark instead of dropping it, as long
+//!   as entries reprieved this way (and not evicted since) total at most a
+//!   quarter of the cap; past that, marked entries are evicted in LRU order.
+//!   The cap's worth a large scan may still admit then recycles that scan's
+//!   own unreused ranges before it reaches up to a quarter of the cap of
+//!   ranges other queries actually reuse. The bound limits what reprieves can
+//!   cost a working-set change: reprieved older ranges outrank the new set's
+//!   unhit ones, so a new set keeps on its first pass only the cap minus the
+//!   reprieved share. Up to three quarters of the cap, a new working set
+//!   therefore displaces an older reused one in one pass, exactly like a plain
+//!   LRU; a larger one loses at most a quarter of the cap on that pass and
+//!   re-admits it on the next.
+//!
+//! Neither rule affects results: a range that is not admitted is returned from
+//! the fetch exactly like an admitted one. The scan-local
+//! `parquet_data_cache_admission_skips` counts misses the budget declined, and
+//! `parquet_data_cache_evictions`/`parquet_data_cache_eviction_bytes` count
+//! entries (and their data bytes) dropped to make room for a scan's inserts.
+//! A cache whose working set does not fit shows evictions; one whose scans
+//! outgrow it shows skips. Neither is registered while the cache is disabled.
+//!
+//! Many concurrent or successive scans that each fit but together exceed the
+//! cap still churn the unreused ranges like a plain LRU; the second chance
+//! only keeps up to a quarter of the cap of reused ranges resident through
+//! that.
 
 use std::ops::Range;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use bytes::Bytes;
@@ -35,9 +83,54 @@ impl Key {
     }
 }
 
+struct Entry {
+    bytes: Bytes,
+    /// Hit since it was inserted or last spared from eviction.
+    hit: bool,
+    /// Spared from eviction at least once; its weight is in `State::spared`.
+    spared: bool,
+}
+
 struct State {
-    entries: LruCache<Key, Bytes>,
+    entries: LruCache<Key, Entry>,
     used: usize,
+    /// Weight of resident entries that eviction has spared; at most
+    /// `cap / SPARED_SHARE`.
+    spared: usize,
+}
+
+/// Reprieved entries may hold at most `1 / SPARED_SHARE` of the cap.
+const SPARED_SHARE: usize = 4;
+
+/// Entries (and their data bytes) one insert evicted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Evicted {
+    entries: usize,
+    bytes: usize,
+}
+
+/// Data-cache admission budget shared by every reader of one table scan.
+///
+/// Holds the scan's cumulative miss weight; see the module docs.
+#[derive(Debug, Default)]
+pub(crate) struct ScanAdmission {
+    missed: AtomicUsize,
+}
+
+impl ScanAdmission {
+    /// Charge one missed range of `weight` and say whether it may be inserted:
+    /// only while the scan's misses, this one included, total at most `cap`.
+    fn admit(&self, weight: usize, cap: usize) -> bool {
+        // Once over budget the scan never admits again; skip the shared
+        // read-modify-write so its readers stop contending on the counter.
+        if self.missed.load(Ordering::Relaxed) > cap {
+            return false;
+        }
+        self.missed
+            .fetch_add(weight, Ordering::Relaxed)
+            .saturating_add(weight)
+            <= cap
+    }
 }
 
 pub(crate) struct DataCache {
@@ -52,6 +145,7 @@ impl DataCache {
             state: Mutex::new(State {
                 entries: LruCache::unbounded(),
                 used: 0,
+                spared: 0,
             }),
         }
     }
@@ -61,29 +155,68 @@ impl DataCache {
     }
 
     fn get(&self, key: &Key) -> Option<Bytes> {
-        self.state.lock().ok()?.entries.get(key).cloned()
+        let mut state = self.state.lock().ok()?;
+        let entry = state.entries.get_mut(key)?;
+        entry.hit = true;
+        Some(entry.bytes.clone())
     }
 
-    fn put(&self, key: Key, bytes: &Bytes) {
+    fn put(&self, key: Key, bytes: &Bytes) -> Evicted {
+        let mut evicted = Evicted::default();
         let weight = key.weight(bytes.len());
         if weight > self.cap || bytes.is_empty() {
-            return;
+            return evicted;
         }
         // Copy outside the shared lock; never retain a slice of a larger range.
         let owned = Bytes::copy_from_slice(bytes);
         let Ok(mut state) = self.state.lock() else {
-            return;
+            return evicted;
         };
-        if let Some(previous) = state.entries.put(key.clone(), owned) {
-            state.used = state.used.saturating_sub(key.weight(previous.len()));
+        let entry = Entry {
+            bytes: owned,
+            hit: false,
+            spared: false,
+        };
+        if let Some(previous) = state.entries.put(key.clone(), entry) {
+            let previous_weight = key.weight(previous.bytes.len());
+            state.used = state.used.saturating_sub(previous_weight);
+            if previous.spared {
+                state.spared = state.spared.saturating_sub(previous_weight);
+            }
         }
         state.used = state.used.saturating_add(weight);
+        // Terminates: each pass either evicts or clears a mark, and the entry
+        // just inserted (unmarked, weight <= cap) fits once it is alone.
+        let spared_cap = self.cap / SPARED_SHARE;
         while state.used > self.cap {
-            let Some((old_key, old_bytes)) = state.entries.pop_lru() else {
+            let Some((lru, entry)) = state.entries.peek_lru() else {
                 break;
             };
-            state.used = state.used.saturating_sub(old_key.weight(old_bytes.len()));
+            let lru_weight = lru.weight(entry.bytes.len());
+            if entry.hit && (entry.spared || state.spared + lru_weight <= spared_cap) {
+                // Second chance: refresh instead of evicting, once per hit.
+                let newly_spared = !entry.spared;
+                let lru = lru.clone();
+                if let Some(entry) = state.entries.get_mut(&lru) {
+                    entry.hit = false;
+                    entry.spared = true;
+                }
+                if newly_spared {
+                    state.spared += lru_weight;
+                }
+                continue;
+            }
+            let Some((_, old)) = state.entries.pop_lru() else {
+                break;
+            };
+            state.used = state.used.saturating_sub(lru_weight);
+            if old.spared {
+                state.spared = state.spared.saturating_sub(lru_weight);
+            }
+            evicted.entries += 1;
+            evicted.bytes += old.bytes.len();
         }
+        evicted
     }
 
     pub(crate) async fn read(
@@ -92,6 +225,7 @@ impl DataCache {
         file: &Arc<str>,
         size: u64,
         ranges: Vec<Range<u64>>,
+        scan: &ScanAdmission,
         metrics: &DataMetrics,
     ) -> Result<Vec<Bytes>> {
         let mut output = Vec::with_capacity(ranges.len());
@@ -127,13 +261,26 @@ impl DataCache {
                     "Incomplete Parquet multi-range response".into(),
                 ));
             }
+            let mut evicted = Evicted::default();
+            let mut skipped = 0;
             for ((index, key), bytes) in missing_keys.into_iter().zip(fetched) {
                 if bytes.len() as u64 != key.end - key.start {
                     return Err(ParquetError::General("Truncated Parquet byte range".into()));
                 }
                 metrics.miss_bytes.add(bytes.len());
-                self.put(key, &bytes);
+                if scan.admit(key.weight(bytes.len()), self.cap) {
+                    let put = self.put(key, &bytes);
+                    evicted.entries += put.entries;
+                    evicted.bytes += put.bytes;
+                } else {
+                    skipped += 1;
+                }
                 output[index] = Some(bytes);
+            }
+            if let Some(guard) = &metrics.guard {
+                guard.evictions.add(evicted.entries);
+                guard.eviction_bytes.add(evicted.bytes);
+                guard.admission_skips.add(skipped);
             }
         }
         output
@@ -150,10 +297,19 @@ pub(crate) struct DataMetrics {
     misses: Count,
     hit_bytes: Count,
     miss_bytes: Count,
+    /// Registered only for an enabled cache, so plans with the cache off keep
+    /// exactly the metrics they always had.
+    guard: Option<GuardMetrics>,
+}
+
+struct GuardMetrics {
+    evictions: Count,
+    eviction_bytes: Count,
+    admission_skips: Count,
 }
 
 impl DataMetrics {
-    pub(crate) fn new(metrics: &ExecutionPlanMetricsSet, partition: usize) -> Self {
+    pub(crate) fn new(metrics: &ExecutionPlanMetricsSet, partition: usize, enabled: bool) -> Self {
         Self {
             hits: MetricBuilder::new(metrics).counter("parquet_data_cache_hits", partition),
             misses: MetricBuilder::new(metrics).counter("parquet_data_cache_misses", partition),
@@ -161,6 +317,14 @@ impl DataMetrics {
                 .counter("parquet_data_cache_hit_bytes", partition),
             miss_bytes: MetricBuilder::new(metrics)
                 .counter("parquet_data_cache_miss_bytes", partition),
+            guard: enabled.then(|| GuardMetrics {
+                evictions: MetricBuilder::new(metrics)
+                    .counter("parquet_data_cache_evictions", partition),
+                eviction_bytes: MetricBuilder::new(metrics)
+                    .counter("parquet_data_cache_eviction_bytes", partition),
+                admission_skips: MetricBuilder::new(metrics)
+                    .counter("parquet_data_cache_admission_skips", partition),
+            }),
         }
     }
 }
@@ -205,10 +369,14 @@ mod tests {
         }
     }
 
+    fn scan() -> ScanAdmission {
+        ScanAdmission::default()
+    }
+
     #[tokio::test]
     async fn mixed_hits_and_misses_preserve_requested_order() {
         let cache = DataCache::new(4096);
-        let metrics = DataMetrics::new(&ExecutionPlanMetricsSet::new(), 0);
+        let metrics = DataMetrics::new(&ExecutionPlanMetricsSet::new(), 0, true);
         let mut reader = Reader {
             data: Bytes::from_static(b"abcdefgh"),
             reads: vec![],
@@ -216,7 +384,7 @@ mod tests {
         };
         let file = Arc::from("s3://bucket/file");
         let first = cache
-            .read(&mut reader, &file, 8, vec![0..2, 4..6], &metrics)
+            .read(&mut reader, &file, 8, vec![0..2, 4..6], &scan(), &metrics)
             .await
             .unwrap();
         assert_eq!(
@@ -225,7 +393,14 @@ mod tests {
         );
         reader.reads.clear();
         let mixed = cache
-            .read(&mut reader, &file, 8, vec![4..6, 2..4, 0..2], &metrics)
+            .read(
+                &mut reader,
+                &file,
+                8,
+                vec![4..6, 2..4, 0..2],
+                &scan(),
+                &metrics,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -243,7 +418,7 @@ mod tests {
     #[tokio::test]
     async fn failed_read_is_not_cached_and_retry_can_succeed() {
         let cache = DataCache::new(4096);
-        let metrics = DataMetrics::new(&ExecutionPlanMetricsSet::new(), 0);
+        let metrics = DataMetrics::new(&ExecutionPlanMetricsSet::new(), 0, true);
         let mut reader = Reader {
             data: Bytes::from_static(b"abcd"),
             reads: vec![],
@@ -256,6 +431,7 @@ mod tests {
                 &file,
                 4,
                 std::iter::once(0..4).collect(),
+                &scan(),
                 &metrics
             )
             .await
@@ -267,6 +443,7 @@ mod tests {
                 &file,
                 4,
                 std::iter::once(0..4).collect(),
+                &scan(),
                 &metrics,
             )
             .await
@@ -278,7 +455,7 @@ mod tests {
     #[tokio::test]
     async fn empty_requests_and_invalid_bounds_do_not_read_storage() {
         let cache = DataCache::new(4096);
-        let metrics = DataMetrics::new(&ExecutionPlanMetricsSet::new(), 0);
+        let metrics = DataMetrics::new(&ExecutionPlanMetricsSet::new(), 0, true);
         let mut reader = Reader {
             data: Bytes::from_static(b"abcd"),
             reads: vec![],
@@ -286,13 +463,13 @@ mod tests {
         };
         let file = Arc::from("s3://bucket/file");
         assert!(cache
-            .read(&mut reader, &file, 4, vec![], &metrics)
+            .read(&mut reader, &file, 4, vec![], &scan(), &metrics)
             .await
             .unwrap()
             .is_empty());
         for range in [0..5, Range { start: 3, end: 2 }] {
             assert!(cache
-                .read(&mut reader, &file, 4, vec![range], &metrics)
+                .read(&mut reader, &file, 4, vec![range], &scan(), &metrics)
                 .await
                 .is_err());
         }
@@ -358,5 +535,322 @@ mod tests {
             assert!(cache.get(&a).is_none());
             assert_eq!(cache.state.lock().unwrap().used, 0);
         }
+    }
+
+    /// Bytes of one range in the guard tests.
+    const RANGE: u64 = 64;
+
+    /// `n` adjacent [`RANGE`]-byte ranges from the start of a file.
+    fn ranges(n: u64) -> Vec<Range<u64>> {
+        (0..n).map(|i| i * RANGE..(i + 1) * RANGE).collect()
+    }
+
+    /// A reader over a file of `n` ranges whose every byte is `fill`.
+    fn file_of(n: u64, fill: u8) -> Reader {
+        Reader {
+            data: Bytes::from(vec![fill; usize::try_from(n * RANGE).unwrap()]),
+            reads: vec![],
+            truncate: false,
+        }
+    }
+
+    /// The cache weight of one [`RANGE`]-byte range of `file`.
+    fn range_weight(file: &Arc<str>) -> usize {
+        key(file, 0, 0, RANGE).weight(usize::try_from(RANGE).unwrap())
+    }
+
+    fn guard(metrics: &DataMetrics) -> &GuardMetrics {
+        metrics.guard.as_ref().unwrap()
+    }
+
+    #[tokio::test]
+    async fn scan_larger_than_cap_stops_admitting() {
+        // Equal-length names, so hot and large ranges weigh the same.
+        let hot_file: Arc<str> = Arc::from("s3://bucket/hot");
+        let big_file: Arc<str> = Arc::from("s3://bucket/big");
+        let weight = range_weight(&hot_file);
+        assert_eq!(weight, range_weight(&big_file));
+        let cache = DataCache::new(16 * weight);
+        let mut hot = file_of(2, b'h');
+
+        // A small query caches two ranges and reuses them.
+        for _ in 0..2 {
+            let metrics = DataMetrics::new(&ExecutionPlanMetricsSet::new(), 0, true);
+            cache
+                .read(&mut hot, &hot_file, 2 * RANGE, ranges(2), &scan(), &metrics)
+                .await
+                .unwrap();
+        }
+        assert_eq!(hot.reads, ranges(2), "the repeat is served from the cache");
+
+        // One scan four times the cap: results are complete either way.
+        let large = scan();
+        let metrics = DataMetrics::new(&ExecutionPlanMetricsSet::new(), 0, true);
+        let mut big = file_of(64, b'b');
+        let out = cache
+            .read(
+                &mut big,
+                &big_file,
+                64 * RANGE,
+                ranges(64),
+                &large,
+                &metrics,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.len(), 64);
+        assert!(out
+            .iter()
+            .all(|bytes| bytes.len() == 64 && bytes[0] == b'b'));
+        // The first cap's worth of misses (16 ranges) is admitted; the rest
+        // is returned without being copied or inserted.
+        assert_eq!(guard(&metrics).admission_skips.value(), 48);
+        // Room for the last two admitted ranges came from the scan's own
+        // first ranges, not from the hot ones.
+        assert_eq!(guard(&metrics).evictions.value(), 2);
+        assert_eq!(guard(&metrics).eviction_bytes.value(), 2 * 64);
+        assert!(cache.state.lock().unwrap().used <= cache.cap);
+
+        // The previously cached hot ranges still hit.
+        hot.reads.clear();
+        let metrics = DataMetrics::new(&ExecutionPlanMetricsSet::new(), 0, true);
+        let again = cache
+            .read(&mut hot, &hot_file, 2 * RANGE, ranges(2), &scan(), &metrics)
+            .await
+            .unwrap();
+        assert_eq!(again, vec![Bytes::from(vec![b'h'; 64]); 2]);
+        assert!(
+            hot.reads.is_empty(),
+            "hot ranges were evicted: {:?}",
+            hot.reads
+        );
+        assert_eq!(metrics.hits.value(), 2);
+
+        // The same scan keeps declining: its budget is spent.
+        big.reads.clear();
+        let metrics = DataMetrics::new(&ExecutionPlanMetricsSet::new(), 0, true);
+        cache
+            .read(&mut big, &big_file, 64 * RANGE, ranges(1), &large, &metrics)
+            .await
+            .unwrap();
+        assert_eq!(big.reads, vec![0..64], "the evicted first range misses");
+        assert_eq!(guard(&metrics).admission_skips.value(), 1);
+        assert_eq!(guard(&metrics).evictions.value(), 0);
+    }
+
+    #[tokio::test]
+    async fn admission_resumes_with_the_next_scan() {
+        let file: Arc<str> = Arc::from("s3://bucket/file");
+        let cache = DataCache::new(4 * range_weight(&file));
+        let mut reader = file_of(16, b'x');
+        let metrics = DataMetrics::new(&ExecutionPlanMetricsSet::new(), 0, true);
+        // An over-budget scan admits its first four ranges only.
+        cache
+            .read(
+                &mut reader,
+                &file,
+                16 * RANGE,
+                ranges(16),
+                &scan(),
+                &metrics,
+            )
+            .await
+            .unwrap();
+        assert_eq!(guard(&metrics).admission_skips.value(), 12);
+        // The scan that follows starts with a fresh budget and is admitted.
+        let tail: Vec<_> = (12..16).map(|i| i * RANGE..(i + 1) * RANGE).collect();
+        let metrics = DataMetrics::new(&ExecutionPlanMetricsSet::new(), 0, true);
+        cache
+            .read(
+                &mut reader,
+                &file,
+                16 * RANGE,
+                tail.clone(),
+                &scan(),
+                &metrics,
+            )
+            .await
+            .unwrap();
+        assert_eq!(guard(&metrics).admission_skips.value(), 0);
+        assert_eq!(guard(&metrics).evictions.value(), 4);
+        reader.reads.clear();
+        cache
+            .read(&mut reader, &file, 16 * RANGE, tail, &scan(), &metrics)
+            .await
+            .unwrap();
+        assert!(reader.reads.is_empty(), "the new scan's ranges were cached");
+    }
+
+    #[tokio::test]
+    async fn a_scan_that_fits_is_admitted_in_full() {
+        let file: Arc<str> = Arc::from("s3://bucket/file");
+        let cache = DataCache::new(16 * range_weight(&file));
+        let mut reader = file_of(16, b'x');
+        let metrics = DataMetrics::new(&ExecutionPlanMetricsSet::new(), 0, true);
+        cache
+            .read(
+                &mut reader,
+                &file,
+                16 * RANGE,
+                ranges(16),
+                &scan(),
+                &metrics,
+            )
+            .await
+            .unwrap();
+        assert_eq!(guard(&metrics).admission_skips.value(), 0);
+        assert_eq!(guard(&metrics).evictions.value(), 0);
+        reader.reads.clear();
+        let metrics = DataMetrics::new(&ExecutionPlanMetricsSet::new(), 0, true);
+        cache
+            .read(
+                &mut reader,
+                &file,
+                16 * RANGE,
+                ranges(16),
+                &scan(),
+                &metrics,
+            )
+            .await
+            .unwrap();
+        assert!(reader.reads.is_empty());
+        assert_eq!(metrics.hits.value(), 16);
+    }
+
+    #[tokio::test]
+    async fn evictions_are_counted() {
+        let file: Arc<str> = Arc::from("s3://bucket/file");
+        let cache = DataCache::new(2 * range_weight(&file));
+        let mut reader = file_of(4, b'x');
+        let metrics = DataMetrics::new(&ExecutionPlanMetricsSet::new(), 0, true);
+        // Separate scans, so the budget never declines; the third insert
+        // evicts the least recently used range.
+        for range in ranges(3) {
+            cache
+                .read(
+                    &mut reader,
+                    &file,
+                    4 * RANGE,
+                    vec![range],
+                    &scan(),
+                    &metrics,
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(guard(&metrics).evictions.value(), 1);
+        assert_eq!(guard(&metrics).eviction_bytes.value(), 64);
+        assert_eq!(guard(&metrics).admission_skips.value(), 0);
+        assert!(cache.get(&key(&file, 4 * RANGE, 0, RANGE)).is_none());
+        assert_eq!(cache.state.lock().unwrap().used, cache.cap);
+    }
+
+    #[tokio::test]
+    async fn a_new_working_set_displaces_an_old_reused_one_in_one_pass() {
+        let old_file: Arc<str> = Arc::from("s3://bucket/old");
+        let new_file: Arc<str> = Arc::from("s3://bucket/new");
+        let cache = DataCache::new(16 * range_weight(&old_file));
+        // A reused working set of ten ranges, then a new one of ten: together
+        // more than the cap, each within three quarters of it.
+        let mut old = file_of(10, b'o');
+        for _ in 0..2 {
+            let metrics = DataMetrics::new(&ExecutionPlanMetricsSet::new(), 0, true);
+            cache
+                .read(
+                    &mut old,
+                    &old_file,
+                    10 * RANGE,
+                    ranges(10),
+                    &scan(),
+                    &metrics,
+                )
+                .await
+                .unwrap();
+        }
+        let mut new = file_of(10, b'n');
+        let metrics = DataMetrics::new(&ExecutionPlanMetricsSet::new(), 0, true);
+        cache
+            .read(
+                &mut new,
+                &new_file,
+                10 * RANGE,
+                ranges(10),
+                &scan(),
+                &metrics,
+            )
+            .await
+            .unwrap();
+        // Six ranges fit the free room; the other four evict old ones, after
+        // the first four old ones (a quarter of the cap) were reprieved.
+        assert_eq!(guard(&metrics).evictions.value(), 4);
+        assert_eq!(
+            cache.state.lock().unwrap().spared,
+            4 * range_weight(&old_file)
+        );
+        new.reads.clear();
+        let metrics = DataMetrics::new(&ExecutionPlanMetricsSet::new(), 0, true);
+        cache
+            .read(
+                &mut new,
+                &new_file,
+                10 * RANGE,
+                ranges(10),
+                &scan(),
+                &metrics,
+            )
+            .await
+            .unwrap();
+        assert!(new.reads.is_empty(), "the new set lost {:?}", new.reads);
+        assert_eq!(metrics.hits.value(), 10);
+        assert!(cache.state.lock().unwrap().used <= cache.cap);
+    }
+
+    #[test]
+    fn a_hit_range_gets_one_second_chance() {
+        let k = |name: &str| key(name, 20, 0, 4);
+        let put = |cache: &DataCache, name: &str| {
+            cache.put(k(name), &Bytes::from(name.repeat(4).into_bytes()))
+        };
+        // Four entries; the spared share holds exactly one.
+        let cache = DataCache::new(4 * k("a").weight(4));
+        assert_eq!(cache.cap / SPARED_SHARE, k("a").weight(4));
+        for name in ["a", "b", "c", "d"] {
+            assert_eq!(put(&cache, name), Evicted::default());
+        }
+        // Hit `a`, then refresh the others: `a` is least recently used but
+        // marked, so `b` goes instead.
+        assert!(cache.get(&k("a")).is_some());
+        for name in ["b", "c", "d"] {
+            put(&cache, name);
+        }
+        assert_eq!(
+            put(&cache, "e"),
+            Evicted {
+                entries: 1,
+                bytes: 4
+            }
+        );
+        assert!(cache.get(&k("b")).is_none());
+        // Hit again, an already reprieved entry is reprieved again; a second
+        // marked entry would exceed the spared share and is evicted in turn.
+        assert!(cache.get(&k("a")).is_some());
+        assert!(cache.get(&k("c")).is_some());
+        let order = ["a", "c", "d", "e"];
+        for name in order {
+            cache.state.lock().unwrap().entries.promote(&k(name));
+        }
+        put(&cache, "f");
+        let resident = |name: &str| cache.state.lock().unwrap().entries.contains(&k(name));
+        assert!(resident("a"), "the reprieved entry is reprieved again");
+        assert!(!resident("c"), "the spared share is full");
+        assert_eq!(cache.state.lock().unwrap().spared, k("a").weight(4));
+        // Unhit since its reprieve, `a` is evicted when it is next in line.
+        for name in ["d", "e", "f"] {
+            cache.state.lock().unwrap().entries.promote(&k(name));
+        }
+        put(&cache, "g");
+        assert!(!resident("a"));
+        assert_eq!(cache.state.lock().unwrap().spared, 0);
+        assert!(cache.state.lock().unwrap().used <= cache.cap);
     }
 }
