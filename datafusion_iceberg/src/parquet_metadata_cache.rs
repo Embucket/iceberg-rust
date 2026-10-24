@@ -677,17 +677,27 @@ mod tests {
     use super::*;
 
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
-    use datafusion::arrow::array::{ArrayRef, Int32Array, RecordBatch};
+    use datafusion::arrow::array::{ArrayRef, Int32Array, Int64Array, RecordBatch};
+    use datafusion::arrow::datatypes::SchemaRef;
+    use datafusion::common::ScalarValue;
+    use datafusion::datasource::physical_plan::{FileGroup, FileScanConfigBuilder, ParquetSource};
+    use datafusion::datasource::source::DataSourceExec;
+    use datafusion::execution::object_store::ObjectStoreUrl;
+    use datafusion::logical_expr::Operator;
     use datafusion::parquet::arrow::ArrowWriter;
     use datafusion::parquet::file::metadata::FileMetaData;
+    use datafusion::parquet::file::properties::WriterProperties;
     use datafusion::parquet::schema::types::{SchemaDescriptor, Type};
+    use datafusion::physical_expr::expressions::{BinaryExpr, Column, Literal};
+    use datafusion::physical_plan::{collect, ExecutionPlan};
+    use datafusion::prelude::{SessionConfig, SessionContext};
     use futures::stream::BoxStream;
     use object_store::memory::InMemory;
     use object_store::path::Path as ObjectPath;
     use object_store::{
-        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+        CopyOptions, GetOptions, GetRange, GetResult, ListResult, MultipartUpload, ObjectMeta,
         ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as OsResult,
     };
 
@@ -865,6 +875,7 @@ mod tests {
 
     #[test]
     fn uri_keys_do_not_collide_across_stores() {
+        let _shared = PROCESS_CACHE_LOCK.blocking_read();
         // Same store-relative path under two object-store URLs must stay two
         // entries. Exercises the real process-wide cache (default cap, env
         // unset in tests). Keys mirror how the factory namespaces the
@@ -927,12 +938,107 @@ mod tests {
     /// An [`ObjectStore`] that counts `get_opts` calls (all footer/data reads
     /// funnel through it) and delegates everything else to an inner store. An
     /// optional per-`get` `delay` widens the window in which concurrent cold
-    /// readers overlap, exercising cold-read contention.
+    /// readers overlap, exercising cold-read contention. `probe` additionally
+    /// tracks GET concurrency and splits GETs of registered files into metadata
+    /// and data reads.
     #[derive(Debug)]
     struct CountingStore {
         inner: Arc<dyn ObjectStore>,
         gets: Arc<AtomicUsize>,
         delay: Option<Duration>,
+        probe: Arc<GetProbe>,
+    }
+
+    /// Per-GET accounting shared between a [`CountingStore`] and the test that
+    /// drives it.
+    ///
+    /// HEAD requests (`get_opts` with `head` set) are only counted, in
+    /// `heads`. Every other GET counts towards the in-flight gauge (held from
+    /// request start, including the injected delay, until the inner store
+    /// answers). GETs of a file registered with [`GetProbe::register`] are also
+    /// classified by byte range: Parquet places the page index and the footer
+    /// after the last column chunk, so a range that starts at or past the end
+    /// of column-chunk data, or that reaches the end of the file (the 8-byte
+    /// tail probe and any hinted suffix read), is a metadata GET; anything else
+    /// is a data-range GET.
+    #[derive(Debug, Default)]
+    struct GetProbe {
+        in_flight: AtomicUsize,
+        max_in_flight: AtomicUsize,
+        metadata: AtomicUsize,
+        data: AtomicUsize,
+        heads: AtomicUsize,
+        /// `(end of column-chunk data, file size)` per registered location.
+        layouts: Mutex<std::collections::HashMap<String, (u64, u64)>>,
+    }
+
+    /// GET counts accumulated since the previous [`GetProbe::take`].
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct GetCounts {
+        metadata: usize,
+        data: usize,
+        heads: usize,
+        max_in_flight: usize,
+    }
+
+    impl GetProbe {
+        fn register(&self, location: &str, data_end: u64, size: u64) {
+            self.layouts
+                .lock()
+                .unwrap()
+                .insert(location.to_string(), (data_end, size));
+        }
+
+        /// Classify one GET of `location`. Unregistered locations are only
+        /// counted by the gauge.
+        fn record(&self, location: &ObjectPath, range: Option<&GetRange>) {
+            let Some((data_end, size)) =
+                self.layouts.lock().unwrap().get(location.as_ref()).copied()
+            else {
+                return;
+            };
+            let metadata = match range {
+                Some(GetRange::Suffix(_) | GetRange::Offset(_)) => true,
+                Some(GetRange::Bounded(r)) => r.start >= data_end || r.end >= size,
+                None => false,
+            };
+            let counter = if metadata { &self.metadata } else { &self.data };
+            counter.fetch_add(1, Ordering::SeqCst);
+        }
+
+        /// Account for one `get_opts` call. A HEAD is only counted; a GET is
+        /// classified and enters the in-flight gauge, which the returned guard
+        /// leaves on drop, so a cancelled request does not leak a slot.
+        fn begin(&self, location: &ObjectPath, options: &GetOptions) -> Option<InFlight<'_>> {
+            if options.head {
+                self.heads.fetch_add(1, Ordering::SeqCst);
+                return None;
+            }
+            self.record(location, options.range.as_ref());
+            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_in_flight.fetch_max(now, Ordering::SeqCst);
+            Some(InFlight(&self.in_flight))
+        }
+
+        /// Counts since the previous call; resets them for the next measurement.
+        fn take(&self) -> GetCounts {
+            GetCounts {
+                metadata: self.metadata.swap(0, Ordering::SeqCst),
+                data: self.data.swap(0, Ordering::SeqCst),
+                heads: self.heads.swap(0, Ordering::SeqCst),
+                max_in_flight: self
+                    .max_in_flight
+                    .swap(self.in_flight.load(Ordering::SeqCst), Ordering::SeqCst),
+            }
+        }
+    }
+
+    struct InFlight<'a>(&'a AtomicUsize);
+
+    impl Drop for InFlight<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
     }
 
     impl std::fmt::Display for CountingStore {
@@ -965,6 +1071,7 @@ mod tests {
             location: &ObjectPath,
             options: GetOptions,
         ) -> OsResult<GetResult> {
+            let _in_flight = self.probe.begin(location, &options);
             if let Some(delay) = self.delay {
                 // Yield while "fetching" so cold readers overlap before any
                 // reader inserts its result.
@@ -1020,6 +1127,7 @@ mod tests {
 
     #[tokio::test]
     async fn warm_scan_performs_zero_metadata_fetches() {
+        let _shared = PROCESS_CACHE_LOCK.read().await;
         let inner = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
         let path = "db/tbl/data/warm.parquet";
         let size = write_parquet(&inner, path).await;
@@ -1029,6 +1137,7 @@ mod tests {
             inner,
             gets: Arc::clone(&gets),
             delay: None,
+            probe: Arc::default(),
         }) as Arc<dyn ObjectStore>;
 
         // Unique prefix so the shared process cache does not collide with
@@ -1082,6 +1191,7 @@ mod tests {
             inner: Arc::clone(&inner),
             gets: Arc::clone(&gets),
             delay,
+            probe: Arc::default(),
         }) as Arc<dyn ObjectStore>;
         (
             inner,
@@ -1375,5 +1485,493 @@ mod tests {
         reader.get_metadata(Some(&widened)).await.unwrap();
         let hinted = gets.swap(0, Ordering::SeqCst);
         assert_eq!(hinted, 1, "hinted cold load must be a single suffix GET");
+    }
+
+    /// Footer and data cache keys are prefixed with the scan's object-store
+    /// URL, so a URL no earlier scan used makes the next scan cold even though
+    /// [`CACHE`] and the data cache live for the whole process.
+    fn fresh_store_url(tag: &str) -> ObjectStoreUrl {
+        static RUNS: AtomicUsize = AtomicUsize::new(0);
+        let run = RUNS.fetch_add(1, Ordering::Relaxed);
+        ObjectStoreUrl::parse(format!("iceberg-rust://{tag}-{run}")).unwrap()
+    }
+
+    /// Guards the process-wide [`CACHE`] against [`clear_process_cache`]. Tests
+    /// that expect entries they put there to stay hold the read side for their
+    /// whole body; the bench holds the write side, so it can never empty the
+    /// cache under them, even when ignored tests run alongside the rest
+    /// (`--include-ignored`).
+    static PROCESS_CACHE_LOCK: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
+
+    /// Empty the process-wide footer cache without counting the dropped
+    /// entries as evictions, so every bench configuration starts from the
+    /// same state and earlier configurations cannot latch the page-index
+    /// backoff for later ones. Requires the write side of
+    /// [`PROCESS_CACHE_LOCK`], so no test relying on [`CACHE`] runs meanwhile.
+    fn clear_process_cache(_exclusive: &tokio::sync::RwLockWriteGuard<'static, ()>) {
+        if let Some(store) = CACHE.store.as_ref() {
+            let mut cache = store.lock().unwrap();
+            cache.entries.clear();
+            cache.total_bytes = 0;
+        }
+    }
+
+    const OPEN_AHEAD_KEY: &str = "datafusion.execution.file_stream_open_ahead";
+
+    /// Whether the DataFusion this crate is built against has the per-stream
+    /// open-ahead option. Probed through the string config API so the tests
+    /// compile against builds with and without it.
+    fn open_ahead_supported() -> bool {
+        let mut config = SessionConfig::new();
+        config.options_mut().set(OPEN_AHEAD_KEY, "true").is_ok()
+    }
+
+    /// Layout of every file in a [`ScanFixture`]: `rows` rows of
+    /// `(id: 0..rows, file: index)` in row groups of `rows_per_group`.
+    #[derive(Debug, Clone, Copy)]
+    struct FileShape {
+        name: &'static str,
+        rows: usize,
+        rows_per_group: usize,
+        /// Scan predicate `id = probe_id`; row-group statistics resolve it to a
+        /// single group per file. `None` scans every row.
+        probe_id: Option<i64>,
+    }
+
+    /// One small row group per file: the scan is dominated by per-file opens.
+    const SMALL_FILES: FileShape = FileShape {
+        name: "small",
+        rows: 1_000,
+        rows_per_group: 1_000,
+        probe_id: None,
+    };
+
+    /// 100 row groups per file (100x the row-group and page-index metadata)
+    /// under a predicate that keeps one group, so data reads stay at one range
+    /// per file and the metadata cost is what varies.
+    const HUNDRED_GROUP_FILES: FileShape = FileShape {
+        name: "100-rg",
+        rows: 10_000,
+        rows_per_group: 100,
+        probe_id: Some(4_250),
+    };
+
+    /// Parquet files of one [`FileShape`] in an in-memory store, read through a
+    /// [`CountingStore`] whose probe knows every file's layout.
+    struct ScanFixture {
+        store: Arc<dyn ObjectStore>,
+        probe: Arc<GetProbe>,
+        files: Vec<(String, u64)>,
+        schema: SchemaRef,
+        shape: FileShape,
+    }
+
+    /// One scan's output, wall time, and GET counts.
+    struct ScanRun {
+        batches: Vec<RecordBatch>,
+        wall: Duration,
+        gets: GetCounts,
+    }
+
+    impl ScanFixture {
+        async fn build(files: usize, shape: FileShape, delay: Option<Duration>) -> Self {
+            let inner = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+            let probe = Arc::new(GetProbe::default());
+            let rows = i64::try_from(shape.rows).unwrap();
+            let ids: ArrayRef = Arc::new(Int64Array::from_iter_values(0..rows));
+            let props = WriterProperties::builder()
+                .set_max_row_group_row_count(Some(shape.rows_per_group))
+                .build();
+            let mut written = Vec::with_capacity(files);
+            let mut schema = None;
+            for index in 0..files {
+                let file: ArrayRef = Arc::new(Int64Array::from(vec![
+                    i64::try_from(index).unwrap();
+                    shape.rows
+                ]));
+                let batch =
+                    RecordBatch::try_from_iter(vec![("id", Arc::clone(&ids)), ("file", file)])
+                        .unwrap();
+                let mut buf = Vec::new();
+                let mut writer =
+                    ArrowWriter::try_new(&mut buf, batch.schema(), Some(props.clone())).unwrap();
+                writer.write(&batch).unwrap();
+                let meta = writer.close().unwrap();
+                assert_eq!(
+                    meta.num_row_groups(),
+                    shape.rows / shape.rows_per_group,
+                    "fixture row-group layout"
+                );
+                let data_end = meta
+                    .row_groups()
+                    .iter()
+                    .flat_map(|group| group.columns())
+                    .map(|column| {
+                        let (start, len) = column.byte_range();
+                        start + len
+                    })
+                    .max()
+                    .unwrap();
+                let path = format!("db/tbl/data/{index:05}.parquet");
+                let size = buf.len() as u64;
+                probe.register(&path, data_end, size);
+                inner
+                    .put(&ObjectPath::from(path.as_str()), PutPayload::from(buf))
+                    .await
+                    .unwrap();
+                schema.get_or_insert_with(|| batch.schema());
+                written.push((path, size));
+            }
+            let store = Arc::new(CountingStore {
+                inner,
+                gets: Arc::default(),
+                delay,
+                probe: Arc::clone(&probe),
+            }) as Arc<dyn ObjectStore>;
+            Self {
+                store,
+                probe,
+                files: written,
+                schema: schema.unwrap(),
+                shape,
+            }
+        }
+
+        /// Scan every file once through `DataSourceExec` with the caching
+        /// reader factory a table scan installs, spreading the files over
+        /// `partitions` file groups (siblings share them by work stealing).
+        /// `hint` is stamped on each `PartitionedFile`, clamped to the file
+        /// size the way table scans clamp the configured hint. Only plan
+        /// execution is timed.
+        async fn scan(
+            &self,
+            url: &ObjectStoreUrl,
+            partitions: usize,
+            hint: Option<usize>,
+            open_ahead: bool,
+        ) -> ScanRun {
+            let mut config = SessionConfig::new().with_target_partitions(partitions);
+            if open_ahead {
+                config
+                    .options_mut()
+                    .set(OPEN_AHEAD_KEY, "true")
+                    .expect("open-ahead requested on a build that supports it");
+            }
+            let ctx = SessionContext::new_with_config(config);
+            ctx.register_object_store(url.as_ref(), Arc::clone(&self.store));
+            let factory = Arc::new(CachingParquetFileReaderFactory::new(
+                Arc::clone(&self.store),
+                url.as_str(),
+            ));
+            let mut source = ParquetSource::new(Arc::clone(&self.schema))
+                .with_parquet_file_reader_factory(factory);
+            if let Some(id) = self.shape.probe_id {
+                source = source.with_predicate(Arc::new(BinaryExpr::new(
+                    Arc::new(Column::new("id", 0)),
+                    Operator::Eq,
+                    Arc::new(Literal::new(ScalarValue::Int64(Some(id)))),
+                )));
+            }
+            let mut groups = vec![Vec::new(); partitions];
+            for (index, (path, size)) in self.files.iter().enumerate() {
+                let mut file = PartitionedFile::new(path.clone(), *size);
+                file.metadata_size_hint = clamp_metadata_size_hint(hint, *size);
+                groups[index % partitions].push(file);
+            }
+            let scan_config = FileScanConfigBuilder::new(url.clone(), Arc::new(source))
+                .with_file_groups(groups.into_iter().map(FileGroup::new).collect())
+                .build();
+            let plan: Arc<dyn ExecutionPlan> = DataSourceExec::from_data_source(scan_config);
+            let task_ctx = ctx.task_ctx();
+            self.probe.take();
+            let started = Instant::now();
+            let batches = collect(plan, task_ctx).await.unwrap();
+            let wall = started.elapsed();
+            ScanRun {
+                batches,
+                wall,
+                gets: self.probe.take(),
+            }
+        }
+
+        /// Assert a scan returned exactly the fixture's expected rows.
+        fn check(&self, batches: &[RecordBatch]) {
+            let column_sum = |name: &str| -> i64 {
+                batches
+                    .iter()
+                    .map(|batch| {
+                        let column = batch.column_by_name(name).unwrap();
+                        let values = column.as_any().downcast_ref::<Int64Array>().unwrap();
+                        values.values().iter().sum::<i64>()
+                    })
+                    .sum()
+            };
+            let ids = || {
+                batches.iter().flat_map(|batch| {
+                    let column = batch.column_by_name("id").unwrap();
+                    let values = column.as_any().downcast_ref::<Int64Array>().unwrap();
+                    values.values().to_vec()
+                })
+            };
+            let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+            let files = self.files.len();
+            let (per_file, id_range) = match self.shape.probe_id {
+                None => (self.shape.rows, 0..i64::try_from(self.shape.rows).unwrap()),
+                Some(id) => {
+                    let group = i64::try_from(self.shape.rows_per_group).unwrap();
+                    let start = id - id % group;
+                    (self.shape.rows_per_group, start..start + group)
+                }
+            };
+            assert_eq!(rows, files * per_file, "scan row count");
+            assert!(
+                ids().all(|id| id_range.contains(&id)),
+                "ids outside {id_range:?}"
+            );
+            let id_sum: i64 = id_range.clone().sum();
+            let files_i64 = i64::try_from(files).unwrap();
+            assert_eq!(column_sum("id"), id_sum * files_i64, "id checksum");
+            let per_file_i64 = i64::try_from(per_file).unwrap();
+            assert_eq!(
+                column_sum("file"),
+                per_file_i64 * files_i64 * (files_i64 - 1) / 2,
+                "every file read exactly once"
+            );
+        }
+    }
+
+    /// A cold scan with no metadata size hint, through the same
+    /// `DataSourceExec` and caching reader factory a table scan uses, pays
+    /// exactly three metadata GETs per file: the 8-byte footer tail, the
+    /// footer body, and the page index the cold load is widened to fetch. The
+    /// page-index GET exists only while
+    /// `ICEBERG_PARQUET_METADATA_CACHE_PAGE_INDEX` keeps its default (on) and
+    /// the eviction backoff has not latched; otherwise the unfiltered scan
+    /// pays two. A warm repeat pays none, which needs the footer cache, so
+    /// `ICEBERG_PARQUET_METADATA_CACHE_MB=0` is the one setting this test
+    /// rejects. Data-range GETs are counted separately: with the data cache
+    /// at its default (off) the warm scan pays them again. The scan issues no
+    /// HEAD requests: every `PartitionedFile` carries its size.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cold_scan_get_count_per_file() {
+        let _shared = PROCESS_CACHE_LOCK.read().await;
+        assert!(
+            CACHE.enabled(),
+            "precondition: ICEBERG_PARQUET_METADATA_CACHE_MB is not 0"
+        );
+        let page_index_gets = usize::from(*CACHE_PAGE_INDEX && !CACHE.page_index_backed_off());
+        let files = 4;
+        let fixture = ScanFixture::build(files, SMALL_FILES, None).await;
+        let url = fresh_store_url("cold-scan-get-count");
+
+        let cold = fixture.scan(&url, 2, None, false).await;
+        fixture.check(&cold.batches);
+        assert_eq!(
+            cold.gets.metadata,
+            (2 + page_index_gets) * files,
+            "cold, unhinted: tail + footer (+ page index when cached) per file, saw {:?}",
+            cold.gets
+        );
+        assert_eq!(cold.gets.heads, 0, "no HEAD requests, saw {:?}", cold.gets);
+        assert!(
+            cold.gets.data >= files,
+            "every file reads its column chunks, saw {:?}",
+            cold.gets
+        );
+
+        let warm = fixture.scan(&url, 2, None, false).await;
+        fixture.check(&warm.batches);
+        assert_eq!(
+            warm.gets.metadata, 0,
+            "warm repeat is served from the footer cache, saw {:?}",
+            warm.gets
+        );
+        assert_eq!(warm.gets.heads, 0, "no HEAD requests, saw {:?}", warm.gets);
+        if !DATA_CACHE.enabled() {
+            assert_eq!(
+                warm.gets.data, cold.gets.data,
+                "without the data cache warm data reads match cold ones"
+            );
+        }
+    }
+
+    /// Scan-latency instrument: prints, per configuration, metadata GETs per
+    /// file, data-range GETs, peak concurrent GETs, and cold/warm wall time of
+    /// one `DataSourceExec` scan over an in-memory store whose every GET
+    /// sleeps 20 ms. Each configuration is measured [`BENCH_REPEATS`] times;
+    /// the table reports the median wall time and the min-max range, the
+    /// largest peak in-flight count, and GET counts that must agree across
+    /// repeats. Results are checked after the timer stops.
+    ///
+    /// Varied in-process: file count (64, 256), file shape ([`SMALL_FILES`],
+    /// [`HUNDRED_GROUP_FILES`]), `target_partitions` (1, 4, 8), the per-file
+    /// metadata size hint (none, 512 KiB via `PartitionedFile`), and
+    /// open-ahead (`datafusion.execution.file_stream_open_ahead`) when the
+    /// DataFusion build has that option; the header says whether it does.
+    ///
+    /// Each repeat empties the process-wide footer cache and scans under a
+    /// fresh object-store URL, so its first scan is cold and its second, under
+    /// the same URL, is warm. Cache capacities and the page-index switch
+    /// (`ICEBERG_PARQUET_METADATA_CACHE_MB`, `ICEBERG_PARQUET_DATA_CACHE_MB`,
+    /// `ICEBERG_PARQUET_METADATA_CACHE_PAGE_INDEX`) are read once per process
+    /// by `LazyLock` statics and cannot be varied here; run one process per
+    /// value instead, e.g.
+    /// `ICEBERG_PARQUET_DATA_CACHE_MB=256 cargo test -p datafusion_iceberg --lib
+    /// parquet_metadata_cache::tests::scan_latency_bench -- --ignored --exact --nocapture`.
+    ///
+    /// Coverage limits, so the table is not over-read:
+    /// - The cost model is latency only: every GET costs the same flat delay
+    ///   whatever its size, so bytes transferred are not measured.
+    /// - Every fixture file is smaller than the 512 KiB hint, so a hinted
+    ///   metadata GET is a suffix read of the whole file (and the data GET
+    ///   then reads its row group again). A hint smaller than footer plus page
+    ///   index, which needs a second metadata GET, is not exercised.
+    /// - The scan keeps `ParquetSource`'s default `pushdown_filters` (off),
+    ///   whereas table scans configure it; the [`HUNDRED_GROUP_FILES`]
+    ///   predicate prunes row groups by statistics but does not exercise the
+    ///   row-filter read path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[ignore = "latency benchmark that prints a table; run alone with \
+                `-- --ignored --exact parquet_metadata_cache::tests::scan_latency_bench --nocapture`"]
+    async fn scan_latency_bench() {
+        const DELAY: Duration = Duration::from_millis(20);
+        const HINT: usize = 512 * 1024;
+        let exclusive = PROCESS_CACHE_LOCK.write().await;
+        let open_ahead_modes: &[bool] = if open_ahead_supported() {
+            &[false, true]
+        } else {
+            &[false]
+        };
+        println!(
+            "scan_latency_bench: {} ms per GET; metadata cache {}; data cache {}; \
+             page-index caching {}; open-ahead {}; times are the median (and min-max) \
+             of {BENCH_REPEATS} repeats",
+            DELAY.as_millis(),
+            CACHE.store.as_ref().map_or("off".to_string(), |s| format!(
+                "{} MiB",
+                s.lock().unwrap().cap_bytes / (1024 * 1024)
+            )),
+            if DATA_CACHE.enabled() { "on" } else { "off" },
+            if *CACHE_PAGE_INDEX { "on" } else { "off" },
+            if open_ahead_supported() {
+                "available (measured off and on)"
+            } else {
+                "unavailable in this DataFusion build (every row is without open-ahead)"
+            },
+        );
+        println!(
+            "| shape | files | P | hint | open-ahead | cold meta GET/file | cold data GETs \
+             | cold max in-flight | cold ms | cold ms range | warm meta GET/file \
+             | warm data GETs | warm max in-flight | warm ms | warm ms range | evictions \
+             | page index |"
+        );
+        println!("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|");
+        for shape in [SMALL_FILES, HUNDRED_GROUP_FILES] {
+            for files in [64, 256] {
+                let fixture = ScanFixture::build(files, shape, Some(DELAY)).await;
+                for &open_ahead in open_ahead_modes {
+                    for hint in [None, Some(HINT)] {
+                        for partitions in [1, 4, 8] {
+                            let evictions = CACHE.evictions.load(Ordering::Relaxed);
+                            let mut cold = BenchCell::default();
+                            let mut warm = BenchCell::default();
+                            for _ in 0..BENCH_REPEATS {
+                                clear_process_cache(&exclusive);
+                                let url = fresh_store_url("scan-latency-bench");
+                                let cold_run =
+                                    fixture.scan(&url, partitions, hint, open_ahead).await;
+                                let warm_run =
+                                    fixture.scan(&url, partitions, hint, open_ahead).await;
+                                fixture.check(&cold_run.batches);
+                                fixture.check(&warm_run.batches);
+                                cold.push(&cold_run);
+                                warm.push(&warm_run);
+                            }
+                            let (cold_gets, warm_gets) = (cold.gets(), warm.gets());
+                            assert_eq!(
+                                (cold_gets.heads, warm_gets.heads),
+                                (0, 0),
+                                "no HEAD requests"
+                            );
+                            let per_file = |n: usize| n as f64 / files as f64;
+                            println!(
+                                "| {} | {files} | {partitions} | {} | {} | {:.2} | {} | {} | {} \
+                                 | {} | {:.2} | {} | {} | {} | {} | {} | {} |",
+                                shape.name,
+                                hint.map_or("none".to_string(), |h| format!("{} KiB", h / 1024)),
+                                if open_ahead { "on" } else { "off" },
+                                per_file(cold_gets.metadata),
+                                cold_gets.data,
+                                cold_gets.max_in_flight,
+                                cold.median_ms(),
+                                cold.range_ms(),
+                                per_file(warm_gets.metadata),
+                                warm_gets.data,
+                                warm_gets.max_in_flight,
+                                warm.median_ms(),
+                                warm.range_ms(),
+                                CACHE.evictions.load(Ordering::Relaxed) - evictions,
+                                if CACHE.page_index_backed_off() {
+                                    "backed off"
+                                } else {
+                                    "cached"
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Repeats of every [`scan_latency_bench`] configuration.
+    const BENCH_REPEATS: usize = 3;
+
+    /// The cold or the warm scans of one bench configuration across repeats.
+    #[derive(Default)]
+    struct BenchCell {
+        walls: Vec<Duration>,
+        gets: Vec<GetCounts>,
+    }
+
+    impl BenchCell {
+        fn push(&mut self, run: &ScanRun) {
+            self.walls.push(run.wall);
+            self.gets.push(run.gets);
+        }
+
+        /// GET counts of the first repeat, with the largest peak in-flight
+        /// count of any repeat. Request counts are deterministic for a fixed
+        /// configuration, so every repeat must match the first.
+        fn gets(&self) -> GetCounts {
+            let first = self.gets[0];
+            for gets in &self.gets[1..] {
+                assert_eq!(
+                    (gets.metadata, gets.data, gets.heads),
+                    (first.metadata, first.data, first.heads),
+                    "GET counts differ between repeats"
+                );
+            }
+            GetCounts {
+                max_in_flight: self.gets.iter().map(|g| g.max_in_flight).max().unwrap(),
+                ..first
+            }
+        }
+
+        fn sorted_ms(&self) -> Vec<f64> {
+            let mut ms: Vec<f64> = self.walls.iter().map(|w| w.as_secs_f64() * 1e3).collect();
+            ms.sort_by(f64::total_cmp);
+            ms
+        }
+
+        fn median_ms(&self) -> String {
+            let ms = self.sorted_ms();
+            format!("{:.0}", ms[ms.len() / 2])
+        }
+
+        fn range_ms(&self) -> String {
+            let ms = self.sorted_ms();
+            format!("{:.0}-{:.0}", ms[0], ms[ms.len() - 1])
+        }
     }
 }
