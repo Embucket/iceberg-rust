@@ -38,7 +38,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 use tokio::sync::mpsc::{self};
-use tracing::{instrument, Instrument};
+use tracing::instrument;
 
 use crate::deletion_vector_filter::DeletionVectorPredicate;
 use crate::row_lineage::{
@@ -68,11 +68,7 @@ use datafusion::{
     common::{not_impl_err, plan_err, runtime::SpawnedTask, DataFusionError, SchemaExt},
     config::TableParquetOptions,
     datasource::{
-        file_format::{
-            parquet::{ParquetFormat, ParquetSink},
-            write::demux::DemuxedStreamReceiver,
-            FileFormat,
-        },
+        file_format::{parquet::ParquetSink, write::demux::DemuxedStreamReceiver},
         listing::PartitionedFile,
         object_store::ObjectStoreUrl,
         physical_plan::{
@@ -1532,12 +1528,14 @@ async fn table_scan(
             .with_limit(limit)
             .build();
 
-        let mut sorted_plan = ParquetFormat::default()
-            .create_physical_plan(session, file_scan_config)
-            .instrument(tracing::debug_span!(
-                "datafusion_iceberg::create_physical_plan_scan_sorted_data_files"
-            ))
-            .await?;
+        // Build the exec directly, as for the unattested files:
+        // `ParquetFormat::create_physical_plan` would replace the caching
+        // reader factory with DataFusion's runtime-env one and reset the
+        // source's Parquet options (and with them the row-filter pushdown
+        // decision) to the format defaults.
+        let mut sorted_plan: Arc<dyn ExecutionPlan> =
+            tracing::debug_span!("datafusion_iceberg::create_physical_plan_scan_sorted_data_files")
+                .in_scope(|| DataSourceExec::from_data_source(file_scan_config));
 
         if enable_row_lineage {
             sorted_plan = Arc::new(ProjectionExec::try_new(
@@ -3031,6 +3029,224 @@ mod tests {
         assert!(
             count_caching_parquet_sources(plan.as_ref()) > 0,
             "expected at least one parquet scan node in the plan"
+        );
+    }
+
+    /// `(pushdown_filters, has output ordering)` of every parquet scan node in
+    /// `plan`, asserting along the way that each one carries the process-wide
+    /// caching reader factory.
+    fn parquet_scan_settings(plan: &dyn ExecutionPlan) -> Vec<(bool, bool)> {
+        let mut settings = Vec::new();
+        if let Some(exec) = plan.downcast_ref::<DataSourceExec>() {
+            if let Some(config) = exec.data_source().downcast_ref::<FileScanConfig>() {
+                assert_eq!(count_caching_parquet_sources(plan), 1);
+                let source = config
+                    .file_source()
+                    .downcast_ref::<ParquetSource>()
+                    .expect("iceberg scan file source should be a ParquetSource");
+                settings.push((
+                    source.table_parquet_options().global.pushdown_filters,
+                    !config.output_ordering.is_empty(),
+                ));
+            }
+        }
+        for child in plan.children() {
+            settings.extend(parquet_scan_settings(child.as_ref()));
+        }
+        settings
+    }
+
+    /// Sum of the metric `name` over every node of an executed `plan`, `None`
+    /// when no node registered it.
+    fn plan_metric_sum(plan: &dyn ExecutionPlan, name: &str) -> Option<usize> {
+        let own = plan
+            .metrics()
+            .and_then(|metrics| metrics.sum_by_name(name))
+            .map(|value| value.as_usize());
+        plan.children()
+            .into_iter()
+            .map(|child| plan_metric_sum(child.as_ref(), name))
+            .fold(own, |acc, child| match (acc, child) {
+                (Some(a), Some(b)) => Some(a + b),
+                (a, b) => a.or(b),
+            })
+    }
+
+    /// Files that attest the table's identity sort order are scanned by a
+    /// separate node that declares `output_ordering`. That node must be built
+    /// like the unattested one: with the process-wide caching reader factory
+    /// (footer cache, data cache, their metrics and caps) and the row-filter
+    /// pushdown decision of `use_parquet_row_filter_pushdown`, not with the
+    /// defaults `ParquetFormat::create_physical_plan` installs.
+    #[tokio::test]
+    async fn sorted_attested_scan_keeps_caching_factory_and_pushdown() {
+        use datafusion::physical_plan::{collect, displayable};
+        use datafusion::prelude::{col, lit, SessionConfig};
+        use iceberg_rust::arrow::write::write_sorted_parquet_partitioned;
+        use iceberg_rust::spec::sort::{NullOrder, SortDirection, SortField, SortOrderBuilder};
+
+        // Wide enough (8 columns) for a one-column predicate to enable
+        // row-filter pushdown.
+        const COLUMNS: usize = 8;
+
+        let catalog: Arc<dyn Catalog> = Arc::new(
+            SqlCatalog::new("sqlite://", "test", ObjectStoreBuilder::memory())
+                .await
+                .unwrap(),
+        );
+        let mut schema = Schema::builder();
+        for index in 0..COLUMNS {
+            schema.with_struct_field(StructField {
+                id: i32::try_from(index).unwrap() + 1,
+                name: format!("c{index}"),
+                required: true,
+                field_type: Type::Primitive(PrimitiveType::Long),
+                doc: None,
+                initial_default: None,
+                write_default: None,
+            });
+        }
+        let sort_order = SortOrderBuilder::default()
+            .with_order_id(1)
+            .with_sort_field(SortField {
+                source_id: 1,
+                transform: Transform::Identity,
+                direction: SortDirection::Ascending,
+                null_order: NullOrder::First,
+            })
+            .build()
+            .unwrap();
+        let mut table = Table::builder()
+            .with_name("sorted_attested")
+            .with_location("memory:///test/sorted_attested")
+            .with_schema(schema.build().unwrap())
+            .with_sort_order(sort_order)
+            .build(&["test".to_owned()], catalog)
+            .await
+            .expect("Failed to create table");
+
+        let arrow_schema = Arc::new(ArrowSchema::new(
+            (0..COLUMNS)
+                .map(|index| Field::new(format!("c{index}"), DataType::Int64, false))
+                .collect::<Vec<_>>(),
+        ));
+        // Two attested files with disjoint `c0` ranges, so the attested scan
+        // can satisfy `ORDER BY c0` without a sort.
+        for ids in [[1_i64, 2, 3, 4], [5, 6, 7, 8]] {
+            let batch = RecordBatch::try_new(
+                arrow_schema.clone(),
+                (0..COLUMNS)
+                    .map(|_| Arc::new(Int64Array::from(ids.to_vec())) as _)
+                    .collect(),
+            )
+            .unwrap();
+            let files =
+                write_sorted_parquet_partitioned(&table, stream::iter(vec![Ok(batch)]), None)
+                    .await
+                    .unwrap();
+            assert!(files.iter().all(|file| *file.sort_order_id() == Some(1)));
+            table
+                .new_transaction(None)
+                .append_data(files)
+                .commit()
+                .await
+                .unwrap();
+        }
+
+        let table = Arc::new(DataFusionTable::from(table));
+        let mut config = SessionConfig::new().with_target_partitions(4);
+        config
+            .options_mut()
+            .execution
+            .split_file_groups_by_statistics = true;
+        let ctx = SessionContext::new_with_config(config);
+        ctx.register_table("t", table.clone()).unwrap();
+        let state = ctx.state();
+        let filter = [col("c0").gt(lit(2_i64))];
+
+        // Wide scan, narrow predicate: pushdown on, ordering declared.
+        let wide = table.scan(&state, None, &filter, None).await.unwrap();
+        assert_eq!(
+            parquet_scan_settings(wide.as_ref()),
+            vec![(true, true)],
+            "wide attested scan must keep the caching factory, pushdown and ordering"
+        );
+        // Narrow scan: the heuristic turns pushdown off; ordering still declared.
+        let narrow = table
+            .scan(&state, Some(&vec![0]), &filter, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            parquet_scan_settings(narrow.as_ref()),
+            vec![(false, true)],
+            "narrow attested scan must keep the caching factory and ordering"
+        );
+
+        // End to end: the declared order satisfies ORDER BY without a sort,
+        // the predicate reaches the Parquet reader, and the scan is served by
+        // the process-wide footer cache.
+        let sql = "SELECT * FROM t WHERE c0 > 2 ORDER BY c0";
+        let plan = ctx
+            .sql(sql)
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let rendered = displayable(plan.as_ref()).indent(true).to_string();
+        assert!(
+            rendered.contains("output_ordering=[c0@0 ASC]"),
+            "attested scan must declare the table's sort order:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("SortExec"),
+            "non-overlapping attested files satisfy ORDER BY without a sort:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("FilterExec"),
+            "row-filter pushdown must move the predicate into the scan:\n{rendered}"
+        );
+
+        let expect_ids = |batches: &[RecordBatch]| {
+            let ids: Vec<i64> = batches
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column_by_name("c0")
+                        .unwrap()
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .values()
+                        .to_vec()
+                })
+                .collect();
+            assert_eq!(ids, vec![3, 4, 5, 6, 7, 8]);
+        };
+        // The first run may or may not find the footers cached (the write
+        // path does not populate the cache); a repeat of the same plan must.
+        expect_ids(&collect(plan.clone(), ctx.task_ctx()).await.unwrap());
+        let warm = ctx
+            .sql(sql)
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        expect_ids(&collect(warm.clone(), ctx.task_ctx()).await.unwrap());
+        assert_eq!(
+            plan_metric_sum(warm.as_ref(), "parquet_metadata_cache_misses"),
+            Some(0),
+            "warm attested scan must not reload footers"
+        );
+        // DataFusion may split each file into byte ranges; every opened range
+        // looks its footer up once.
+        let opened = plan_metric_sum(warm.as_ref(), "files_opened").unwrap();
+        assert!(opened >= 2, "both attested files are read, opened {opened}");
+        assert_eq!(
+            plan_metric_sum(warm.as_ref(), "parquet_metadata_cache_hits"),
+            Some(opened),
+            "warm attested scan must serve every footer from the cache"
         );
     }
 
