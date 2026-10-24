@@ -548,6 +548,22 @@ static CACHE: LazyLock<MetadataCache> = LazyLock::new(|| {
     MetadataCache::new(cap_mb.saturating_mul(1024 * 1024))
 });
 
+/// Guards the process-wide [`CACHE`] against the benches' cache clearing.
+/// Tests anywhere in the crate that expect entries they put there to stay
+/// hold the read side for their whole body; the benches hold the write side,
+/// so they can never empty the cache under them, even when ignored tests run
+/// alongside the rest (`--include-ignored`).
+#[cfg(test)]
+pub(crate) static PROCESS_CACHE_LOCK: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
+
+/// Whether the process-wide footer cache is enabled
+/// (`ICEBERG_PARQUET_METADATA_CACHE_MB` is not `0`), for test preconditions
+/// outside this module.
+#[cfg(test)]
+pub(crate) fn process_cache_enabled() -> bool {
+    CACHE.enabled()
+}
+
 /// A [`ParquetFileReaderFactory`] that serves parsed footer metadata from the
 /// process-wide [`CACHE`], falling back to an inner factory (the DataFusion
 /// default, which reads from the object store) on a miss.
@@ -1521,13 +1537,6 @@ mod tests {
         let run = RUNS.fetch_add(1, Ordering::Relaxed);
         ObjectStoreUrl::parse(format!("iceberg-rust://{tag}-{run}")).unwrap()
     }
-
-    /// Guards the process-wide [`CACHE`] against [`clear_process_cache`]. Tests
-    /// that expect entries they put there to stay hold the read side for their
-    /// whole body; the bench holds the write side, so it can never empty the
-    /// cache under them, even when ignored tests run alongside the rest
-    /// (`--include-ignored`).
-    static PROCESS_CACHE_LOCK: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
 
     /// Empty the process-wide footer cache without counting the dropped
     /// entries as evictions, so every bench configuration starts from the
