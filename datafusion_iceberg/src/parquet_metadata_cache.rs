@@ -875,6 +875,7 @@ mod tests {
 
     #[test]
     fn uri_keys_do_not_collide_across_stores() {
+        let _shared = PROCESS_CACHE_LOCK.blocking_read();
         // Same store-relative path under two object-store URLs must stay two
         // entries. Exercises the real process-wide cache (default cap, env
         // unset in tests). Keys mirror how the factory namespaces the
@@ -951,19 +952,22 @@ mod tests {
     /// Per-GET accounting shared between a [`CountingStore`] and the test that
     /// drives it.
     ///
-    /// Every GET counts towards the in-flight gauge (held from request start,
-    /// including the injected delay, until the inner store answers). GETs of a
-    /// file registered with [`GetProbe::register`] are also classified by byte
-    /// range: Parquet places the page index and the footer after the last
-    /// column chunk, so a range that starts at or past the end of column-chunk
-    /// data, or that reaches the end of the file (the 8-byte tail probe and any
-    /// hinted suffix read), is a metadata GET; anything else is a data-range GET.
+    /// HEAD requests (`get_opts` with `head` set) are only counted, in
+    /// `heads`. Every other GET counts towards the in-flight gauge (held from
+    /// request start, including the injected delay, until the inner store
+    /// answers). GETs of a file registered with [`GetProbe::register`] are also
+    /// classified by byte range: Parquet places the page index and the footer
+    /// after the last column chunk, so a range that starts at or past the end
+    /// of column-chunk data, or that reaches the end of the file (the 8-byte
+    /// tail probe and any hinted suffix read), is a metadata GET; anything else
+    /// is a data-range GET.
     #[derive(Debug, Default)]
     struct GetProbe {
         in_flight: AtomicUsize,
         max_in_flight: AtomicUsize,
         metadata: AtomicUsize,
         data: AtomicUsize,
+        heads: AtomicUsize,
         /// `(end of column-chunk data, file size)` per registered location.
         layouts: Mutex<std::collections::HashMap<String, (u64, u64)>>,
     }
@@ -973,6 +977,7 @@ mod tests {
     struct GetCounts {
         metadata: usize,
         data: usize,
+        heads: usize,
         max_in_flight: usize,
     }
 
@@ -1001,12 +1006,18 @@ mod tests {
             counter.fetch_add(1, Ordering::SeqCst);
         }
 
-        /// Enter one GET; the returned guard leaves it on drop, so a cancelled
-        /// request does not leak a slot.
-        fn enter(&self) -> InFlight<'_> {
+        /// Account for one `get_opts` call. A HEAD is only counted; a GET is
+        /// classified and enters the in-flight gauge, which the returned guard
+        /// leaves on drop, so a cancelled request does not leak a slot.
+        fn begin(&self, location: &ObjectPath, options: &GetOptions) -> Option<InFlight<'_>> {
+            if options.head {
+                self.heads.fetch_add(1, Ordering::SeqCst);
+                return None;
+            }
+            self.record(location, options.range.as_ref());
             let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_in_flight.fetch_max(now, Ordering::SeqCst);
-            InFlight(&self.in_flight)
+            Some(InFlight(&self.in_flight))
         }
 
         /// Counts since the previous call; resets them for the next measurement.
@@ -1014,6 +1025,7 @@ mod tests {
             GetCounts {
                 metadata: self.metadata.swap(0, Ordering::SeqCst),
                 data: self.data.swap(0, Ordering::SeqCst),
+                heads: self.heads.swap(0, Ordering::SeqCst),
                 max_in_flight: self
                     .max_in_flight
                     .swap(self.in_flight.load(Ordering::SeqCst), Ordering::SeqCst),
@@ -1059,8 +1071,7 @@ mod tests {
             location: &ObjectPath,
             options: GetOptions,
         ) -> OsResult<GetResult> {
-            let _in_flight = self.probe.enter();
-            self.probe.record(location, options.range.as_ref());
+            let _in_flight = self.probe.begin(location, &options);
             if let Some(delay) = self.delay {
                 // Yield while "fetching" so cold readers overlap before any
                 // reader inserts its result.
@@ -1116,6 +1127,7 @@ mod tests {
 
     #[tokio::test]
     async fn warm_scan_performs_zero_metadata_fetches() {
+        let _shared = PROCESS_CACHE_LOCK.read().await;
         let inner = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
         let path = "db/tbl/data/warm.parquet";
         let size = write_parquet(&inner, path).await;
@@ -1484,12 +1496,19 @@ mod tests {
         ObjectStoreUrl::parse(format!("iceberg-rust://{tag}-{run}")).unwrap()
     }
 
+    /// Guards the process-wide [`CACHE`] against [`clear_process_cache`]. Tests
+    /// that expect entries they put there to stay hold the read side for their
+    /// whole body; the bench holds the write side, so it can never empty the
+    /// cache under them, even when ignored tests run alongside the rest
+    /// (`--include-ignored`).
+    static PROCESS_CACHE_LOCK: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
+
     /// Empty the process-wide footer cache without counting the dropped
     /// entries as evictions, so every bench configuration starts from the
     /// same state and earlier configurations cannot latch the page-index
-    /// backoff for later ones. Only the ignored bench calls this: next to
-    /// concurrently running tests it would turn their warm reads cold.
-    fn clear_process_cache() {
+    /// backoff for later ones. Requires the write side of
+    /// [`PROCESS_CACHE_LOCK`], so no test relying on [`CACHE`] runs meanwhile.
+    fn clear_process_cache(_exclusive: &tokio::sync::RwLockWriteGuard<'static, ()>) {
         if let Some(store) = CACHE.store.as_ref() {
             let mut cache = store.lock().unwrap();
             cache.entries.clear();
@@ -1724,26 +1743,23 @@ mod tests {
     /// A cold scan with no metadata size hint, through the same
     /// `DataSourceExec` and caching reader factory a table scan uses, pays
     /// exactly three metadata GETs per file: the 8-byte footer tail, the
-    /// footer body, and the page index the cold load is widened to fetch. A
-    /// warm repeat pays none. The page-index GET exists only while
+    /// footer body, and the page index the cold load is widened to fetch. The
+    /// page-index GET exists only while
     /// `ICEBERG_PARQUET_METADATA_CACHE_PAGE_INDEX` keeps its default (on) and
-    /// the eviction backoff has not latched, so both are preconditions here.
-    /// Data-range GETs are counted separately: with the data cache at its
-    /// default (off) the warm scan pays them again.
+    /// the eviction backoff has not latched; otherwise the unfiltered scan
+    /// pays two. A warm repeat pays none, which needs the footer cache, so
+    /// `ICEBERG_PARQUET_METADATA_CACHE_MB=0` is the one setting this test
+    /// rejects. Data-range GETs are counted separately: with the data cache
+    /// at its default (off) the warm scan pays them again. The scan issues no
+    /// HEAD requests: every `PartitionedFile` carries its size.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cold_scan_get_count_per_file() {
-        assert!(
-            *CACHE_PAGE_INDEX,
-            "precondition: ICEBERG_PARQUET_METADATA_CACHE_PAGE_INDEX left at its default (on)"
-        );
+        let _shared = PROCESS_CACHE_LOCK.read().await;
         assert!(
             CACHE.enabled(),
             "precondition: ICEBERG_PARQUET_METADATA_CACHE_MB is not 0"
         );
-        assert!(
-            !CACHE.page_index_backed_off(),
-            "precondition: the page-index backoff has not latched in this process"
-        );
+        let page_index_gets = usize::from(*CACHE_PAGE_INDEX && !CACHE.page_index_backed_off());
         let files = 4;
         let fixture = ScanFixture::build(files, SMALL_FILES, None).await;
         let url = fresh_store_url("cold-scan-get-count");
@@ -1752,10 +1768,11 @@ mod tests {
         fixture.check(&cold.batches);
         assert_eq!(
             cold.gets.metadata,
-            3 * files,
-            "cold, unhinted: tail + footer + page index per file, saw {:?}",
+            (2 + page_index_gets) * files,
+            "cold, unhinted: tail + footer (+ page index when cached) per file, saw {:?}",
             cold.gets
         );
+        assert_eq!(cold.gets.heads, 0, "no HEAD requests, saw {:?}", cold.gets);
         assert!(
             cold.gets.data >= files,
             "every file reads its column chunks, saw {:?}",
@@ -1769,6 +1786,7 @@ mod tests {
             "warm repeat is served from the footer cache, saw {:?}",
             warm.gets
         );
+        assert_eq!(warm.gets.heads, 0, "no HEAD requests, saw {:?}", warm.gets);
         if !DATA_CACHE.enabled() {
             assert_eq!(
                 warm.gets.data, cold.gets.data,
@@ -1780,7 +1798,10 @@ mod tests {
     /// Scan-latency instrument: prints, per configuration, metadata GETs per
     /// file, data-range GETs, peak concurrent GETs, and cold/warm wall time of
     /// one `DataSourceExec` scan over an in-memory store whose every GET
-    /// sleeps 20 ms. Results are checked after the timer stops.
+    /// sleeps 20 ms. Each configuration is measured [`BENCH_REPEATS`] times;
+    /// the table reports the median wall time and the min-max range, the
+    /// largest peak in-flight count, and GET counts that must agree across
+    /// repeats. Results are checked after the timer stops.
     ///
     /// Varied in-process: file count (64, 256), file shape ([`SMALL_FILES`],
     /// [`HUNDRED_GROUP_FILES`]), `target_partitions` (1, 4, 8), the per-file
@@ -1788,21 +1809,34 @@ mod tests {
     /// open-ahead (`datafusion.execution.file_stream_open_ahead`) when the
     /// DataFusion build has that option; the header says whether it does.
     ///
-    /// Each configuration empties the process-wide footer cache and scans
-    /// under a fresh object-store URL, so its first scan is cold and its
-    /// second, under the same URL, is warm. Cache capacities and the
-    /// page-index switch (`ICEBERG_PARQUET_METADATA_CACHE_MB`,
-    /// `ICEBERG_PARQUET_DATA_CACHE_MB`,
+    /// Each repeat empties the process-wide footer cache and scans under a
+    /// fresh object-store URL, so its first scan is cold and its second, under
+    /// the same URL, is warm. Cache capacities and the page-index switch
+    /// (`ICEBERG_PARQUET_METADATA_CACHE_MB`, `ICEBERG_PARQUET_DATA_CACHE_MB`,
     /// `ICEBERG_PARQUET_METADATA_CACHE_PAGE_INDEX`) are read once per process
     /// by `LazyLock` statics and cannot be varied here; run one process per
     /// value instead, e.g.
     /// `ICEBERG_PARQUET_DATA_CACHE_MB=256 cargo test -p datafusion_iceberg --lib
     /// parquet_metadata_cache::tests::scan_latency_bench -- --ignored --exact --nocapture`.
+    ///
+    /// Coverage limits, so the table is not over-read:
+    /// - The cost model is latency only: every GET costs the same flat delay
+    ///   whatever its size, so bytes transferred are not measured.
+    /// - Every fixture file is smaller than the 512 KiB hint, so a hinted
+    ///   metadata GET is a suffix read of the whole file (and the data GET
+    ///   then reads its row group again). A hint smaller than footer plus page
+    ///   index, which needs a second metadata GET, is not exercised.
+    /// - The scan keeps `ParquetSource`'s default `pushdown_filters` (off),
+    ///   whereas table scans configure it; the [`HUNDRED_GROUP_FILES`]
+    ///   predicate prunes row groups by statistics but does not exercise the
+    ///   row-filter read path.
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-    #[ignore = "latency benchmark that prints a table; run with --ignored --nocapture"]
+    #[ignore = "latency benchmark that prints a table; run alone with \
+                `-- --ignored --exact parquet_metadata_cache::tests::scan_latency_bench --nocapture`"]
     async fn scan_latency_bench() {
         const DELAY: Duration = Duration::from_millis(20);
         const HINT: usize = 512 * 1024;
+        let exclusive = PROCESS_CACHE_LOCK.write().await;
         let open_ahead_modes: &[bool] = if open_ahead_supported() {
             &[false, true]
         } else {
@@ -1810,7 +1844,8 @@ mod tests {
         };
         println!(
             "scan_latency_bench: {} ms per GET; metadata cache {}; data cache {}; \
-             page-index caching {}; open-ahead {}",
+             page-index caching {}; open-ahead {}; times are the median (and min-max) \
+             of {BENCH_REPEATS} repeats",
             DELAY.as_millis(),
             CACHE.store.as_ref().map_or("off".to_string(), |s| format!(
                 "{} MiB",
@@ -1826,38 +1861,55 @@ mod tests {
         );
         println!(
             "| shape | files | P | hint | open-ahead | cold meta GET/file | cold data GETs \
-             | cold max in-flight | cold ms | warm meta GET/file | warm data GETs \
-             | warm max in-flight | warm ms | evictions | page index |"
+             | cold max in-flight | cold ms | cold ms range | warm meta GET/file \
+             | warm data GETs | warm max in-flight | warm ms | warm ms range | evictions \
+             | page index |"
         );
-        println!("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|");
+        println!("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|");
         for shape in [SMALL_FILES, HUNDRED_GROUP_FILES] {
             for files in [64, 256] {
                 let fixture = ScanFixture::build(files, shape, Some(DELAY)).await;
                 for &open_ahead in open_ahead_modes {
                     for hint in [None, Some(HINT)] {
                         for partitions in [1, 4, 8] {
-                            clear_process_cache();
                             let evictions = CACHE.evictions.load(Ordering::Relaxed);
-                            let url = fresh_store_url("scan-latency-bench");
-                            let cold = fixture.scan(&url, partitions, hint, open_ahead).await;
-                            let warm = fixture.scan(&url, partitions, hint, open_ahead).await;
-                            fixture.check(&cold.batches);
-                            fixture.check(&warm.batches);
+                            let mut cold = BenchCell::default();
+                            let mut warm = BenchCell::default();
+                            for _ in 0..BENCH_REPEATS {
+                                clear_process_cache(&exclusive);
+                                let url = fresh_store_url("scan-latency-bench");
+                                let cold_run =
+                                    fixture.scan(&url, partitions, hint, open_ahead).await;
+                                let warm_run =
+                                    fixture.scan(&url, partitions, hint, open_ahead).await;
+                                fixture.check(&cold_run.batches);
+                                fixture.check(&warm_run.batches);
+                                cold.push(&cold_run);
+                                warm.push(&warm_run);
+                            }
+                            let (cold_gets, warm_gets) = (cold.gets(), warm.gets());
+                            assert_eq!(
+                                (cold_gets.heads, warm_gets.heads),
+                                (0, 0),
+                                "no HEAD requests"
+                            );
                             let per_file = |n: usize| n as f64 / files as f64;
                             println!(
-                                "| {} | {files} | {partitions} | {} | {} | {:.2} | {} | {} | {:.0} \
-                                 | {:.2} | {} | {} | {:.0} | {} | {} |",
+                                "| {} | {files} | {partitions} | {} | {} | {:.2} | {} | {} | {} \
+                                 | {} | {:.2} | {} | {} | {} | {} | {} | {} |",
                                 shape.name,
                                 hint.map_or("none".to_string(), |h| format!("{} KiB", h / 1024)),
                                 if open_ahead { "on" } else { "off" },
-                                per_file(cold.gets.metadata),
-                                cold.gets.data,
-                                cold.gets.max_in_flight,
-                                cold.wall.as_secs_f64() * 1e3,
-                                per_file(warm.gets.metadata),
-                                warm.gets.data,
-                                warm.gets.max_in_flight,
-                                warm.wall.as_secs_f64() * 1e3,
+                                per_file(cold_gets.metadata),
+                                cold_gets.data,
+                                cold_gets.max_in_flight,
+                                cold.median_ms(),
+                                cold.range_ms(),
+                                per_file(warm_gets.metadata),
+                                warm_gets.data,
+                                warm_gets.max_in_flight,
+                                warm.median_ms(),
+                                warm.range_ms(),
                                 CACHE.evictions.load(Ordering::Relaxed) - evictions,
                                 if CACHE.page_index_backed_off() {
                                     "backed off"
@@ -1869,6 +1921,57 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// Repeats of every [`scan_latency_bench`] configuration.
+    const BENCH_REPEATS: usize = 3;
+
+    /// The cold or the warm scans of one bench configuration across repeats.
+    #[derive(Default)]
+    struct BenchCell {
+        walls: Vec<Duration>,
+        gets: Vec<GetCounts>,
+    }
+
+    impl BenchCell {
+        fn push(&mut self, run: &ScanRun) {
+            self.walls.push(run.wall);
+            self.gets.push(run.gets);
+        }
+
+        /// GET counts of the first repeat, with the largest peak in-flight
+        /// count of any repeat. Request counts are deterministic for a fixed
+        /// configuration, so every repeat must match the first.
+        fn gets(&self) -> GetCounts {
+            let first = self.gets[0];
+            for gets in &self.gets[1..] {
+                assert_eq!(
+                    (gets.metadata, gets.data, gets.heads),
+                    (first.metadata, first.data, first.heads),
+                    "GET counts differ between repeats"
+                );
+            }
+            GetCounts {
+                max_in_flight: self.gets.iter().map(|g| g.max_in_flight).max().unwrap(),
+                ..first
+            }
+        }
+
+        fn sorted_ms(&self) -> Vec<f64> {
+            let mut ms: Vec<f64> = self.walls.iter().map(|w| w.as_secs_f64() * 1e3).collect();
+            ms.sort_by(f64::total_cmp);
+            ms
+        }
+
+        fn median_ms(&self) -> String {
+            let ms = self.sorted_ms();
+            format!("{:.0}", ms[ms.len() / 2])
+        }
+
+        fn range_ms(&self) -> String {
+            let ms = self.sorted_ms();
+            format!("{:.0}-{:.0}", ms[0], ms[ms.len() - 1])
         }
     }
 }
