@@ -1576,11 +1576,36 @@ mod tests {
         shape: FileShape,
     }
 
-    /// One scan's output, wall time, and GET counts.
+    /// One scan's output, wall time, GET counts and data-cache counters.
     struct ScanRun {
         batches: Vec<RecordBatch>,
         wall: Duration,
         gets: GetCounts,
+        data: DataCacheCounts,
+    }
+
+    /// Data-cache plan metrics of one scan, summed over partitions. `None` for
+    /// a counter the scan did not register (the cache is off, or the build
+    /// predates the counter).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct DataCacheCounts {
+        hit_bytes: Option<usize>,
+        miss_bytes: Option<usize>,
+        evictions: Option<usize>,
+        admission_skips: Option<usize>,
+    }
+
+    impl DataCacheCounts {
+        fn of(plan: &dyn ExecutionPlan) -> Self {
+            let metrics = plan.metrics().unwrap_or_default();
+            let sum = |name: &str| metrics.sum_by_name(name).map(|value| value.as_usize());
+            Self {
+                hit_bytes: sum("parquet_data_cache_hit_bytes"),
+                miss_bytes: sum("parquet_data_cache_miss_bytes"),
+                evictions: sum("parquet_data_cache_evictions"),
+                admission_skips: sum("parquet_data_cache_admission_skips"),
+            }
+        }
     }
 
     impl ScanFixture {
@@ -1695,12 +1720,13 @@ mod tests {
             let task_ctx = ctx.task_ctx();
             self.probe.take();
             let started = Instant::now();
-            let batches = collect(plan, task_ctx).await.unwrap();
+            let batches = collect(Arc::clone(&plan), task_ctx).await.unwrap();
             let wall = started.elapsed();
             ScanRun {
                 batches,
                 wall,
                 gets: self.probe.take(),
+                data: DataCacheCounts::of(plan.as_ref()),
             }
         }
 
@@ -1936,6 +1962,129 @@ mod tests {
 
     /// Repeats of every [`scan_latency_bench`] configuration.
     const BENCH_REPEATS: usize = 3;
+
+    /// Four 64 Ki-row groups of two `Int64` columns per file, scanned in full:
+    /// about 2.5 MiB of column chunks per file, read as data ranges.
+    const DATA_CACHE_FILES: FileShape = FileShape {
+        name: "4x64Ki",
+        rows: 262_144,
+        rows_per_group: 65_536,
+        probe_id: None,
+    };
+
+    /// Repeats of every [`data_cache_bench`] configuration.
+    const DATA_CACHE_REPEATS: usize = 5;
+
+    /// Data-cache instrument: cold and warm wall time, data-range GETs, hit
+    /// and miss bytes, evictions and admission skips of full scans of 16
+    /// [`DATA_CACHE_FILES`] (about 40 MiB of data ranges) through the caching
+    /// reader factory. Each configuration is measured [`DATA_CACHE_REPEATS`]
+    /// times and reports the median and the min-max range; byte and GET
+    /// columns are the median too. Results are checked after the timer stops.
+    ///
+    /// Varied in-process: the per-GET delay (20 ms, a latency-bound store;
+    /// none, where the in-memory store's zero-copy reads make the cache's
+    /// copies and locking the visible cost), `target_partitions` (1, 4) and
+    /// the data-cache state each repeat starts from: `empty` (cleared) or
+    /// `previous` (still holding the previous repeat's ranges, which its warm
+    /// scan reused, so the cold scan must displace another working set).
+    /// Every repeat empties the footer cache and scans under a fresh
+    /// object-store URL, so its first scan is cold and the second warm.
+    ///
+    /// The data-cache capacity is a process-wide `LazyLock` read once from
+    /// `ICEBERG_PARQUET_DATA_CACHE_MB`; run one process per value, e.g. `0`
+    /// (off), `64` (the working set fits) and `8` (about a fifth of it):
+    /// `ICEBERG_PARQUET_DATA_CACHE_MB=8 cargo test -p datafusion_iceberg --lib
+    /// parquet_metadata_cache::tests::data_cache_bench -- --ignored --exact --nocapture`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[ignore = "data-cache benchmark that prints a table; run alone with \
+                `-- --ignored --exact parquet_metadata_cache::tests::data_cache_bench --nocapture`"]
+    async fn data_cache_bench() {
+        const FILES: usize = 16;
+        let exclusive = PROCESS_CACHE_LOCK.write().await;
+        let mib = |bytes: Option<usize>| {
+            bytes.map_or("n/a".to_string(), |b| {
+                format!("{:.1}", b as f64 / 1048576.0)
+            })
+        };
+        let count = |n: Option<usize>| n.map_or("n/a".to_string(), |n| n.to_string());
+        println!(
+            "data_cache_bench: ICEBERG_PARQUET_DATA_CACHE_MB={}; data cache {}; {FILES} files \
+             of {}; times are the median (and min-max) of {DATA_CACHE_REPEATS} repeats; \
+             GET, byte and counter columns are medians",
+            std::env::var("ICEBERG_PARQUET_DATA_CACHE_MB").unwrap_or_else(|_| "unset".into()),
+            if DATA_CACHE.enabled() { "on" } else { "off" },
+            DATA_CACHE_FILES.name,
+        );
+        println!(
+            "| GET delay | P | start | cold ms | cold ms range | cold data GETs | cold miss MiB \
+             | cold evictions | cold skips | warm ms | warm ms range | warm data GETs \
+             | warm hit MiB | warm miss MiB | warm evictions | warm skips |"
+        );
+        println!("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|");
+        for delay in [Some(Duration::from_millis(20)), None] {
+            let fixture = ScanFixture::build(FILES, DATA_CACHE_FILES, delay).await;
+            for partitions in [1, 4] {
+                for carry in [false, true] {
+                    let mut cold = Vec::with_capacity(DATA_CACHE_REPEATS);
+                    let mut warm = Vec::with_capacity(DATA_CACHE_REPEATS);
+                    // The `previous` cells start from a primed working set.
+                    DATA_CACHE.clear_for_tests();
+                    if carry {
+                        let url = fresh_store_url("data-cache-bench-prime");
+                        fixture.scan(&url, partitions, None, false).await;
+                        fixture.scan(&url, partitions, None, false).await;
+                    }
+                    for _ in 0..DATA_CACHE_REPEATS {
+                        clear_process_cache(&exclusive);
+                        if !carry {
+                            DATA_CACHE.clear_for_tests();
+                        }
+                        let url = fresh_store_url("data-cache-bench");
+                        let cold_run = fixture.scan(&url, partitions, None, false).await;
+                        let warm_run = fixture.scan(&url, partitions, None, false).await;
+                        fixture.check(&cold_run.batches);
+                        fixture.check(&warm_run.batches);
+                        cold.push(cold_run);
+                        warm.push(warm_run);
+                    }
+                    let ms = |runs: &[ScanRun]| {
+                        let mut ms: Vec<f64> =
+                            runs.iter().map(|r| r.wall.as_secs_f64() * 1e3).collect();
+                        ms.sort_by(f64::total_cmp);
+                        (
+                            format!("{:.1}", ms[ms.len() / 2]),
+                            format!("{:.1}-{:.1}", ms[0], ms[ms.len() - 1]),
+                        )
+                    };
+                    let median = |runs: &[ScanRun], f: &dyn Fn(&ScanRun) -> Option<usize>| {
+                        let mut values: Vec<Option<usize>> = runs.iter().map(f).collect();
+                        values.sort();
+                        values[values.len() / 2]
+                    };
+                    let data_gets = |r: &ScanRun| Some(r.gets.data);
+                    let (cold_ms, cold_range) = ms(&cold);
+                    let (warm_ms, warm_range) = ms(&warm);
+                    println!(
+                        "| {} | {partitions} | {} | {cold_ms} | {cold_range} | {} | {} | {} | {} \
+                         | {warm_ms} | {warm_range} | {} | {} | {} | {} | {} |",
+                        delay.map_or("none".to_string(), |d| format!("{} ms", d.as_millis())),
+                        if carry { "previous" } else { "empty" },
+                        count(median(&cold, &data_gets)),
+                        mib(median(&cold, &|r| r.data.miss_bytes)),
+                        count(median(&cold, &|r| r.data.evictions)),
+                        count(median(&cold, &|r| r.data.admission_skips)),
+                        count(median(&warm, &data_gets)),
+                        mib(median(&warm, &|r| r.data.hit_bytes)),
+                        mib(median(&warm, &|r| r.data.miss_bytes)),
+                        count(median(&warm, &|r| r.data.evictions)),
+                        count(median(&warm, &|r| r.data.admission_skips)),
+                    );
+                }
+            }
+        }
+        DATA_CACHE.clear_for_tests();
+    }
 
     /// The cold or the warm scans of one bench configuration across repeats.
     #[derive(Default)]

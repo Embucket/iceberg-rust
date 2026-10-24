@@ -154,6 +154,15 @@ impl DataCache {
         self.cap != 0
     }
 
+    /// Drop every entry, so a benchmark repeat starts from an empty cache.
+    #[cfg(test)]
+    pub(crate) fn clear_for_tests(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.entries.clear();
+        state.used = 0;
+        state.spared = 0;
+    }
+
     fn get(&self, key: &Key) -> Option<Bytes> {
         let mut state = self.state.lock().ok()?;
         let entry = state.entries.get_mut(key)?;
