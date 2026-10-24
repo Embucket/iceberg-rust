@@ -362,10 +362,12 @@ impl Table {
     }
 }
 
+pub use crate::util::manifest_cache::{manifest_cache_fill_stats, ManifestCacheFillStats};
+
 /// Path of a Manifest file
 pub type ManifestPath = String;
 
-async fn datafiles(
+pub(crate) async fn datafiles(
     object_store: Arc<dyn ObjectStore>,
     manifests: &'_ [ManifestListEntry],
     filter: Option<Vec<bool>>,
@@ -408,17 +410,19 @@ async fn datafiles(
         let manifest_first_row_id = file.first_row_id;
         async move {
             // Manifest files are immutable by path. Key by the original
-            // URI so equal store-relative paths cannot alias across stores.
-            let data = match crate::util::manifest_cache::get(&manifest_path) {
-                Some(bytes) => bytes,
-                None => {
-                    let bytes = read_metadata_object(object_store.as_ref(), &manifest_path)
+            // URI so equal store-relative paths cannot alias across stores;
+            // concurrent cold readers of one manifest share a single fetch.
+            // The span is created only by a caller that fetches, so its
+            // count matches the GETs issued.
+            let data = crate::util::manifest_cache::get_or_fetch(&manifest_path, || {
+                let manifest_path = manifest_path.clone();
+                async move {
+                    read_metadata_object(object_store.as_ref(), &manifest_path)
                         .instrument(tracing::trace_span!("iceberg_rust::get_manifest"))
-                        .await?;
-                    crate::util::manifest_cache::put(&manifest_path, &bytes);
-                    bytes
+                        .await
                 }
-            };
+            })
+            .await?;
             let bytes = Cursor::new(Vec::from(data));
 
             let mut first_row_id_inheritance =
