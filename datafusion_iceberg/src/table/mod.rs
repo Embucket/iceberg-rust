@@ -5992,3 +5992,323 @@ mod pushdown_heuristic_tests {
         assert!(!use_parquet_row_filter_pushdown(8, filter_columns.len()));
     }
 }
+
+/// Concurrent cold scan planning of one table: manifest-list and manifest
+/// GETs, with every GET delayed to stand in for object-store latency.
+#[cfg(test)]
+mod cold_planning_tests {
+    use std::{
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+        time::{Duration, Instant},
+    };
+
+    use datafusion::{execution::context::SessionState, prelude::SessionContext};
+    use futures::stream::BoxStream;
+    use iceberg_rust::{
+        catalog::Catalog,
+        object_store::ObjectStoreBuilder,
+        spec::{
+            manifest::{Content, DataFile, FileFormat},
+            schema::Schema,
+            types::{PrimitiveType, StructField, Type},
+            values::Struct,
+        },
+        table::Table,
+    };
+    use iceberg_sql_catalog::SqlCatalog;
+    use object_store::{
+        path::Path as ObjectPath, CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload,
+        ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+        Result as OsResult,
+    };
+
+    use super::{DataSourceExec, ExecutionPlan, FileScanConfig, TableProvider};
+    use crate::DataFusionTable;
+
+    /// Concurrent planners per burst.
+    const SCANS: usize = 8;
+
+    /// GETs by object kind since the previous [`PlanningStore::take`].
+    #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+    struct PlanningGets {
+        manifest_lists: usize,
+        manifests: usize,
+        other: usize,
+    }
+
+    /// Store that delays every GET by `delay` and counts GETs by object
+    /// kind: `snap-*.avro` is a manifest list, any other `.avro` a manifest.
+    #[derive(Debug)]
+    struct PlanningStore {
+        inner: Arc<dyn ObjectStore>,
+        delay: Duration,
+        manifest_lists: AtomicUsize,
+        manifests: AtomicUsize,
+        other: AtomicUsize,
+    }
+
+    impl PlanningStore {
+        fn take(&self) -> PlanningGets {
+            PlanningGets {
+                manifest_lists: self.manifest_lists.swap(0, Ordering::SeqCst),
+                manifests: self.manifests.swap(0, Ordering::SeqCst),
+                other: self.other.swap(0, Ordering::SeqCst),
+            }
+        }
+    }
+
+    impl std::fmt::Display for PlanningStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "PlanningStore({})", self.inner)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for PlanningStore {
+        async fn put_opts(
+            &self,
+            location: &ObjectPath,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> OsResult<PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjectPath,
+            opts: PutMultipartOptions,
+        ) -> OsResult<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &ObjectPath,
+            options: GetOptions,
+        ) -> OsResult<GetResult> {
+            let counter = match location.filename() {
+                Some(name) if name.starts_with("snap-") && name.ends_with(".avro") => {
+                    &self.manifest_lists
+                }
+                Some(name) if name.ends_with(".avro") => &self.manifests,
+                _ => &self.other,
+            };
+            counter.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(self.delay).await;
+            self.inner.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, OsResult<ObjectPath>>,
+        ) -> BoxStream<'static, OsResult<ObjectPath>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(&self, prefix: Option<&ObjectPath>) -> BoxStream<'static, OsResult<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(&self, prefix: Option<&ObjectPath>) -> OsResult<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &ObjectPath,
+            to: &ObjectPath,
+            options: CopyOptions,
+        ) -> OsResult<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    fn data_file(location: &str, index: usize) -> DataFile {
+        DataFile::builder()
+            .with_content(Content::Data)
+            .with_file_path(format!("{location}/data/{index:05}.parquet"))
+            .with_file_format(FileFormat::Parquet)
+            .with_partition(Struct::from_iter(Vec::new()))
+            .with_record_count(1)
+            .with_file_size_in_bytes(100)
+            .with_column_sizes(None)
+            .with_value_counts(None)
+            .with_null_value_counts(None)
+            .with_nan_value_counts(None)
+            .with_distinct_counts(None)
+            .with_lower_bounds(None)
+            .with_upper_bounds(None)
+            .build()
+            .unwrap()
+    }
+
+    /// A v3 table with `manifests` data manifests of one data file each (v3
+    /// appends keep earlier manifests and add a new one), read through a
+    /// [`PlanningStore`]. Locations are unique per call, so the
+    /// process-wide manifest cache is cold for the returned table.
+    async fn fixture(manifests: usize, delay: Duration) -> (Table, Arc<PlanningStore>) {
+        static TABLES: AtomicUsize = AtomicUsize::new(0);
+        let name = format!(
+            "cold_planning_{manifests}_{}",
+            TABLES.fetch_add(1, Ordering::Relaxed)
+        );
+        let location = format!("memory:///cold-planning/{name}");
+        let catalog: Arc<dyn Catalog> = Arc::new(
+            SqlCatalog::new("sqlite://", "test", ObjectStoreBuilder::memory())
+                .await
+                .unwrap(),
+        );
+        let schema = Schema::builder()
+            .with_struct_field(StructField {
+                id: 1,
+                name: "id".to_owned(),
+                required: true,
+                field_type: Type::Primitive(PrimitiveType::Long),
+                doc: None,
+                initial_default: None,
+                write_default: None,
+            })
+            .build()
+            .unwrap();
+        let mut table = Table::builder()
+            .with_name(name.as_str())
+            .with_location(location.as_str())
+            .with_schema(schema)
+            .with_property(("format-version".to_owned(), "3".to_owned()))
+            .build(&["test".to_owned()], catalog)
+            .await
+            .unwrap();
+        for index in 0..manifests {
+            table
+                .new_transaction(None)
+                .append_data(vec![data_file(&location, index)])
+                .commit()
+                .await
+                .unwrap();
+        }
+        let store = Arc::new(PlanningStore {
+            inner: table.object_store(),
+            delay,
+            manifest_lists: AtomicUsize::new(0),
+            manifests: AtomicUsize::new(0),
+            other: AtomicUsize::new(0),
+        });
+        let table = Table::new(
+            table.identifier().clone(),
+            table.catalog(),
+            store.clone(),
+            table.metadata().clone(),
+        )
+        .await
+        .unwrap();
+        (table, store)
+    }
+
+    fn planned_files(plan: &dyn ExecutionPlan) -> usize {
+        let own = plan
+            .downcast_ref::<DataSourceExec>()
+            .and_then(|exec| exec.data_source().downcast_ref::<FileScanConfig>())
+            .map(|config| {
+                config
+                    .file_groups
+                    .iter()
+                    .map(|group| group.files().len())
+                    .sum::<usize>()
+            })
+            .unwrap_or_default();
+        own + plan
+            .children()
+            .iter()
+            .map(|child| planned_files(child.as_ref()))
+            .sum::<usize>()
+    }
+
+    /// Plan `SCANS` concurrent full scans of one cold table, each on its
+    /// own task. Returns the GETs the burst issued and its wall time.
+    async fn cold_burst(manifests: usize, delay: Duration) -> (PlanningGets, Duration) {
+        let (table, store) = fixture(manifests, delay).await;
+        let provider = Arc::new(DataFusionTable::from(table));
+        let state: SessionState = SessionContext::new().state();
+        store.take();
+        let started = Instant::now();
+        let tasks = (0..SCANS)
+            .map(|_| {
+                let provider = provider.clone();
+                let state = state.clone();
+                tokio::spawn(async move { provider.scan(&state, None, &[], None).await })
+            })
+            .collect::<Vec<_>>();
+        for task in tasks {
+            let plan = task.await.unwrap().unwrap();
+            assert_eq!(planned_files(plan.as_ref()), manifests);
+        }
+        (store.take(), started.elapsed())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_cold_scans_fetch_each_manifest_once() {
+        let manifests = 8;
+        let (gets, _) = cold_burst(manifests, Duration::from_millis(5)).await;
+        assert_eq!(
+            gets,
+            PlanningGets {
+                manifest_lists: 1,
+                manifests,
+                other: 0,
+            },
+            "{SCANS} concurrent cold plans share every manifest-list and manifest fill"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "latency benchmark that prints a table; run alone with \
+                `cargo test -p datafusion_iceberg --lib cold_planning_tests::cold_planning_bench -- --ignored --nocapture`"]
+    async fn cold_planning_bench() {
+        const REPEATS: usize = 9;
+        println!(
+            "\n{SCANS} concurrent cold scan plans of one table, {REPEATS} bursts per row \
+             (median and min-max burst wall)\n"
+        );
+        println!(
+            "| manifests | ms per GET | manifest-list GETs | manifest GETs | other GETs | wall median ms | wall min-max ms |"
+        );
+        println!("|---:|---:|---:|---:|---:|---:|---:|");
+        for manifests in [8, 64] {
+            for delay in [Duration::ZERO, Duration::from_millis(20)] {
+                let mut walls = Vec::with_capacity(REPEATS);
+                let mut bursts = Vec::with_capacity(REPEATS);
+                for _ in 0..REPEATS {
+                    let (gets, wall) = cold_burst(manifests, delay).await;
+                    bursts.push(gets);
+                    walls.push(wall.as_secs_f64() * 1e3);
+                }
+                walls.sort_by(f64::total_cmp);
+                // Without coalescing, how many cold readers overlap depends
+                // on timing, so counts are shown as a range when they vary.
+                let range = |count: fn(&PlanningGets) -> usize| {
+                    let min = bursts.iter().map(count).min().unwrap();
+                    let max = bursts.iter().map(count).max().unwrap();
+                    if min == max {
+                        min.to_string()
+                    } else {
+                        format!("{min}-{max}")
+                    }
+                };
+                println!(
+                    "| {manifests} | {} | {} | {} | {} | {:.1} | {:.1}-{:.1} |",
+                    delay.as_millis(),
+                    range(|gets| gets.manifest_lists),
+                    range(|gets| gets.manifests),
+                    range(|gets| gets.other),
+                    walls[REPEATS / 2],
+                    walls[0],
+                    walls[REPEATS - 1],
+                );
+            }
+        }
+    }
+}
