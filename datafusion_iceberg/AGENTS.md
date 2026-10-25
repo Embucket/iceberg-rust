@@ -15,7 +15,12 @@ instead (off by default).
 the default capacity is zero. Both use store-qualified file identity and bounded
 memory. Keep data-cache metrics attached to each scan. Preserve batched I/O on
 misses, do not hold synchronous locks across awaits, and account for retained
-buffer ownership rather than only a shared slice's visible length. The data
+buffer ownership rather than only a shared slice's visible length. Keep an
+admitted miss in the buffer it was fetched in when that buffer is exactly the
+range and nothing else shares it, and copy every other admitted miss; an
+unconditional copy sits on every first pass's path to its first batch. Do not
+rely on shrinking a reused buffer for accounting, since an allocator may keep
+the whole block. The data
 cache's per-scan admission budget lives on the reader factory, which is built
 once per table scan; keep it shared by every reader of that scan and absent
 when the cache is disabled, so cap `0` adds no work to the read path. The

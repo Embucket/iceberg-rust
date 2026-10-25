@@ -736,11 +736,13 @@ mod tests {
     use datafusion::physical_plan::{collect, ExecutionPlan};
     use datafusion::prelude::{SessionConfig, SessionContext};
     use futures::stream::BoxStream;
+    use futures::StreamExt;
     use object_store::memory::InMemory;
     use object_store::path::Path as ObjectPath;
     use object_store::{
-        CopyOptions, GetOptions, GetRange, GetResult, ListResult, MultipartUpload, ObjectMeta,
-        ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as OsResult,
+        CopyOptions, GetOptions, GetRange, GetResult, GetResultPayload, ListResult,
+        MultipartUpload, ObjectMeta, ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload,
+        PutResult, Result as OsResult,
     };
 
     /// A minimal parsed footer with a known [`memory_size`] weight is awkward
@@ -989,6 +991,10 @@ mod tests {
         gets: Arc<AtomicUsize>,
         delay: Option<Duration>,
         probe: Arc<GetProbe>,
+        /// Answer every GET with a freshly allocated body, the way a network
+        /// store does, instead of the in-memory store's zero-copy slice of
+        /// the stored object.
+        copy_bodies: bool,
     }
 
     /// Per-GET accounting shared between a [`CountingStore`] and the test that
@@ -1009,6 +1015,8 @@ mod tests {
         max_in_flight: AtomicUsize,
         metadata: AtomicUsize,
         data: AtomicUsize,
+        /// Bytes requested by data-range GETs.
+        data_bytes: AtomicUsize,
         heads: AtomicUsize,
         /// `(end of column-chunk data, file size)` per registered location.
         layouts: Mutex<std::collections::HashMap<String, (u64, u64)>>,
@@ -1019,6 +1027,7 @@ mod tests {
     struct GetCounts {
         metadata: usize,
         data: usize,
+        data_bytes: usize,
         heads: usize,
         max_in_flight: usize,
     }
@@ -1046,6 +1055,10 @@ mod tests {
             };
             let counter = if metadata { &self.metadata } else { &self.data };
             counter.fetch_add(1, Ordering::SeqCst);
+            if let (false, Some(GetRange::Bounded(r))) = (metadata, range) {
+                let len = usize::try_from(r.end - r.start).unwrap();
+                self.data_bytes.fetch_add(len, Ordering::SeqCst);
+            }
         }
 
         /// Account for one `get_opts` call. A HEAD is only counted; a GET is
@@ -1067,6 +1080,7 @@ mod tests {
             GetCounts {
                 metadata: self.metadata.swap(0, Ordering::SeqCst),
                 data: self.data.swap(0, Ordering::SeqCst),
+                data_bytes: self.data_bytes.swap(0, Ordering::SeqCst),
                 heads: self.heads.swap(0, Ordering::SeqCst),
                 max_in_flight: self
                     .max_in_flight
@@ -1120,7 +1134,32 @@ mod tests {
                 tokio::time::sleep(delay).await;
             }
             self.gets.fetch_add(1, Ordering::SeqCst);
-            self.inner.get_opts(location, options).await
+            let result = self.inner.get_opts(location, options).await?;
+            if !self.copy_bodies || matches!(result.payload, GetResultPayload::File(..)) {
+                return Ok(result);
+            }
+            let GetResult {
+                payload,
+                meta,
+                range,
+                attributes,
+            } = result;
+            let GetResultPayload::Stream(mut stream) = payload else {
+                unreachable!("file payloads are returned above")
+            };
+            let mut body = Vec::with_capacity(usize::try_from(range.end - range.start).unwrap());
+            while let Some(chunk) = stream.next().await {
+                body.extend_from_slice(&chunk?);
+            }
+            let body = Bytes::from(body);
+            Ok(GetResult {
+                payload: GetResultPayload::Stream(
+                    futures::stream::once(async { Ok(body) }).boxed(),
+                ),
+                meta,
+                range,
+                attributes,
+            })
         }
 
         fn delete_stream(
@@ -1180,6 +1219,7 @@ mod tests {
             gets: Arc::clone(&gets),
             delay: None,
             probe: Arc::default(),
+            copy_bodies: false,
         }) as Arc<dyn ObjectStore>;
 
         // Unique prefix so the shared process cache does not collide with
@@ -1234,6 +1274,7 @@ mod tests {
             gets: Arc::clone(&gets),
             delay,
             probe: Arc::default(),
+            copy_bodies: false,
         }) as Arc<dyn ObjectStore>;
         (
             inner,
@@ -1689,6 +1730,7 @@ mod tests {
                 gets: Arc::default(),
                 delay,
                 probe: Arc::clone(&probe),
+                copy_bodies: false,
             }) as Arc<dyn ObjectStore>;
             Self {
                 store,
@@ -2197,6 +2239,417 @@ mod tests {
             }
         }
         DATA_CACHE.clear_for_tests();
+    }
+
+    /// Layout of every file in a [`WideFixture`]: `id` (`0..rows`) followed by
+    /// `ints` pseudo-random `Int64` and `strings` pseudo-random `Utf8` payload
+    /// columns of `string_len` bytes, interleaved `i0, s0, i1, s1, ...`, in
+    /// `row_groups` groups of `rows_per_group` rows.
+    #[derive(Debug, Clone, Copy)]
+    struct WideShape {
+        name: &'static str,
+        files: usize,
+        row_groups: usize,
+        rows_per_group: usize,
+        ints: usize,
+        strings: usize,
+        string_len: usize,
+    }
+
+    /// 21 columns in four 16 Ki-row groups per file: each group holds about
+    /// 7.7 MiB of column chunks, most of it in the eight string columns.
+    const WIDE_FILES: WideShape = WideShape {
+        name: "21-col",
+        files: 8,
+        row_groups: 4,
+        rows_per_group: 16_384,
+        ints: 12,
+        strings: 8,
+        string_len: 40,
+    };
+
+    /// Parquet files of one [`WideShape`] in an in-memory store, read through
+    /// a [`CountingStore`] that answers every GET with a freshly allocated
+    /// body, as a network store does.
+    struct WideFixture {
+        store: Arc<dyn ObjectStore>,
+        probe: Arc<GetProbe>,
+        files: Vec<(String, u64)>,
+        schema: SchemaRef,
+    }
+
+    /// One wide scan: its checksum, wall time, GETs, data-cache counters, and
+    /// the CPU time and minor page faults of the whole process meanwhile.
+    struct WideRun {
+        checksum: (usize, i64, usize),
+        wall: Duration,
+        gets: GetCounts,
+        data: DataCacheCounts,
+        cpu: Duration,
+        faults: u64,
+    }
+
+    fn splitmix(mut x: u64) -> u64 {
+        x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        x ^ (x >> 31)
+    }
+
+    /// CPU time of every live thread of this process, and its minor faults.
+    fn process_usage() -> (Duration, u64) {
+        let cpu_ns: u64 = std::fs::read_dir("/proc/self/task")
+            .map(|tasks| {
+                tasks
+                    .filter_map(|task| task.ok())
+                    .filter_map(|task| std::fs::read_to_string(task.path().join("schedstat")).ok())
+                    .filter_map(|stat| stat.split_whitespace().next()?.parse::<u64>().ok())
+                    .sum()
+            })
+            .unwrap_or(0);
+        let faults = std::fs::read_to_string("/proc/self/stat")
+            .ok()
+            .and_then(|stat| {
+                let fields = &stat[stat.rfind(')')? + 2..];
+                fields.split_whitespace().nth(7)?.parse().ok()
+            })
+            .unwrap_or(0);
+        (Duration::from_nanos(cpu_ns), faults)
+    }
+
+    /// Row count, wrapping sum of every `Int64` value and total string bytes.
+    fn wide_checksum(batches: &[RecordBatch]) -> (usize, i64, usize) {
+        use datafusion::arrow::array::AsArray;
+        use datafusion::arrow::datatypes::{DataType, Int64Type};
+        let mut sum = 0i64;
+        let mut text = 0usize;
+        for batch in batches {
+            for column in batch.columns() {
+                match column.data_type() {
+                    DataType::Int64 => {
+                        for value in column.as_primitive::<Int64Type>().values() {
+                            sum = sum.wrapping_add(*value);
+                        }
+                    }
+                    DataType::Utf8 => {
+                        text += column
+                            .as_string::<i32>()
+                            .iter()
+                            .flatten()
+                            .map(str::len)
+                            .sum::<usize>();
+                    }
+                    DataType::Utf8View => {
+                        text += column
+                            .as_string_view()
+                            .iter()
+                            .flatten()
+                            .map(str::len)
+                            .sum::<usize>();
+                    }
+                    other => panic!("unexpected column type {other}"),
+                }
+            }
+        }
+        (batches.iter().map(RecordBatch::num_rows).sum(), sum, text)
+    }
+
+    impl WideFixture {
+        async fn build(shape: WideShape, delay: Option<Duration>) -> Self {
+            use datafusion::arrow::array::StringArray;
+            let inner = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+            let probe = Arc::new(GetProbe::default());
+            let rows = shape.row_groups * shape.rows_per_group;
+            let props = WriterProperties::builder()
+                .set_max_row_group_row_count(Some(shape.rows_per_group))
+                .build();
+            let mut written = Vec::with_capacity(shape.files);
+            let mut schema = None;
+            for index in 0..shape.files {
+                let seed = |column: usize, row: usize| {
+                    splitmix(((index * 64 + column) as u64) << 32 | row as u64)
+                };
+                let mut columns: Vec<(String, ArrayRef)> = vec![(
+                    "id".to_string(),
+                    Arc::new(Int64Array::from_iter_values(
+                        0..i64::try_from(rows).unwrap(),
+                    )),
+                )];
+                for column in 0..shape.ints.max(shape.strings) {
+                    if column < shape.ints {
+                        let values = (0..rows).map(|row| seed(column, row) as i64);
+                        columns.push((
+                            format!("i{column}"),
+                            Arc::new(Int64Array::from_iter_values(values)),
+                        ));
+                    }
+                    if column < shape.strings {
+                        let values = (0..rows).map(|row| {
+                            let mut state = seed(32 + column, row);
+                            (0..shape.string_len)
+                                .map(|_| {
+                                    state = splitmix(state);
+                                    char::from(b'a' + (state % 26) as u8)
+                                })
+                                .collect::<String>()
+                        });
+                        columns.push((
+                            format!("s{column}"),
+                            Arc::new(StringArray::from_iter_values(values)),
+                        ));
+                    }
+                }
+                let batch = RecordBatch::try_from_iter(columns).unwrap();
+                let mut buf = Vec::new();
+                let mut writer =
+                    ArrowWriter::try_new(&mut buf, batch.schema(), Some(props.clone())).unwrap();
+                writer.write(&batch).unwrap();
+                let meta = writer.close().unwrap();
+                assert_eq!(meta.num_row_groups(), shape.row_groups, "fixture layout");
+                let data_end = meta
+                    .row_groups()
+                    .iter()
+                    .flat_map(|group| group.columns())
+                    .map(|column| {
+                        let (start, len) = column.byte_range();
+                        start + len
+                    })
+                    .max()
+                    .unwrap();
+                let path = format!("db/wide/data/{index:05}.parquet");
+                let size = buf.len() as u64;
+                probe.register(&path, data_end, size);
+                inner
+                    .put(&ObjectPath::from(path.as_str()), PutPayload::from(buf))
+                    .await
+                    .unwrap();
+                schema.get_or_insert_with(|| batch.schema());
+                written.push((path, size));
+            }
+            let store = Arc::new(CountingStore {
+                inner,
+                gets: Arc::default(),
+                delay,
+                probe: Arc::clone(&probe),
+                copy_bodies: true,
+            }) as Arc<dyn ObjectStore>;
+            Self {
+                store,
+                probe,
+                files: written,
+                schema: schema.unwrap(),
+            }
+        }
+
+        /// Indices of the named columns.
+        fn columns(&self, names: &[&str]) -> Vec<usize> {
+            names
+                .iter()
+                .map(|name| self.schema.index_of(name).unwrap())
+                .collect()
+        }
+
+        /// Scan every file once, projected to `projection`, through the
+        /// caching reader factory with its data reads served by `data_cache`.
+        async fn scan(
+            &self,
+            url: &ObjectStoreUrl,
+            partitions: usize,
+            projection: &[usize],
+            data_cache: &'static DataCache,
+        ) -> WideRun {
+            let ctx = SessionContext::new_with_config(
+                SessionConfig::new().with_target_partitions(partitions),
+            );
+            ctx.register_object_store(url.as_ref(), Arc::clone(&self.store));
+            let factory = Arc::new(CachingParquetFileReaderFactory::with_data_cache(
+                Arc::clone(&self.store),
+                url.as_str(),
+                data_cache,
+            ));
+            let source = ParquetSource::new(Arc::clone(&self.schema))
+                .with_parquet_file_reader_factory(factory);
+            let mut groups = vec![Vec::new(); partitions];
+            for (index, (path, size)) in self.files.iter().enumerate() {
+                groups[index % partitions].push(PartitionedFile::new(path.clone(), *size));
+            }
+            let scan_config = FileScanConfigBuilder::new(url.clone(), Arc::new(source))
+                .with_file_groups(groups.into_iter().map(FileGroup::new).collect())
+                .with_projection_indices(Some(projection.to_vec()))
+                .unwrap()
+                .build();
+            let plan: Arc<dyn ExecutionPlan> = DataSourceExec::from_data_source(scan_config);
+            let task_ctx = ctx.task_ctx();
+            self.probe.take();
+            let (cpu_before, faults_before) = process_usage();
+            let started = Instant::now();
+            let batches = collect(Arc::clone(&plan), task_ctx).await.unwrap();
+            let wall = started.elapsed();
+            let (cpu_after, faults_after) = process_usage();
+            WideRun {
+                checksum: wide_checksum(&batches),
+                wall,
+                gets: self.probe.take(),
+                data: DataCacheCounts::of(plan.as_ref()),
+                cpu: cpu_after.saturating_sub(cpu_before),
+                faults: faults_after.saturating_sub(faults_before),
+            }
+        }
+    }
+
+    /// A [`wide_first_pass_bench`] case: its name, projection and the
+    /// projection an earlier scan warms first, if any.
+    type WideCase<'a> = (&'a str, &'a [usize], Option<&'a [usize]>);
+
+    /// Repeats of every [`wide_first_pass_bench`] configuration, overridable
+    /// with `WIDE_BENCH_REPEATS`.
+    fn wide_bench_repeats() -> usize {
+        std::env::var("WIDE_BENCH_REPEATS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(5)
+    }
+
+    /// First-pass instrument for wide scans: the wall time of a scan whose
+    /// footers are cached but whose data ranges are not, through a disabled
+    /// data cache (`off`) and through an empty one that fits the scan (`on`),
+    /// plus `on`'s warm repeat. Files are [`WIDE_FILES`] in a store whose
+    /// every GET sleeps the configured delay and returns a fresh body.
+    ///
+    /// Projections: `all` columns (contiguous chunks, one coalesced GET per
+    /// row group), `spread` (`id, i0, s2, i5, s6`: three GETs per row group,
+    /// two of them for two ranges), `strings` (`id, s2, s6`: one GET per
+    /// range), and `spread after s2` and `strings after s2`, the same
+    /// projections after a scan of `id, s2` warmed `on` (and ran through
+    /// `off` too, to keep the two sequences alike), which is the mixed
+    /// hit/miss first pass a query sees after an earlier query read some of
+    /// its columns. Each repeat uses a fresh object-store URL, warms its footers
+    /// through `off`, then measures `off` and `on` in alternating order.
+    /// Every scan's checksum must match. Columns are medians over repeats:
+    /// wall ms, data GETs, MiB per data GET, peak concurrent GETs, process CPU
+    /// ms and minor page faults during the scan.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[ignore = "wide first-pass benchmark that prints a table; run alone with \
+                `-- --ignored --exact parquet_metadata_cache::tests::wide_first_pass_bench --nocapture`"]
+    async fn wide_first_pass_bench() {
+        let exclusive = PROCESS_CACHE_LOCK.write().await;
+        let off: &'static DataCache = Box::leak(Box::new(DataCache::new(0)));
+        let on: &'static DataCache = Box::leak(Box::new(DataCache::new(1 << 30)));
+        let repeats = wide_bench_repeats();
+        println!(
+            "wide_first_pass_bench: {} files of {} ({} row groups of {} rows, {} int + {} string \
+             columns); data cache off vs on (1 GiB, empty); medians of {repeats} repeats; \
+             loadavg at start: {}",
+            WIDE_FILES.files,
+            WIDE_FILES.name,
+            WIDE_FILES.row_groups,
+            WIDE_FILES.rows_per_group,
+            WIDE_FILES.ints,
+            WIDE_FILES.strings,
+            std::fs::read_to_string("/proc/loadavg")
+                .unwrap_or_default()
+                .trim(),
+        );
+        println!(
+            "| GET delay | projection | P | off ms | on ms | on/off | off ms range | on ms range \
+             | off GETs | on GETs | off MiB/GET | on MiB/GET | off max in-flight \
+             | on max in-flight | off CPU ms | on CPU ms | off faults | on faults | on hit MiB \
+             | on warm ms |"
+        );
+        println!(
+            "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
+        );
+        let median_f = |mut values: Vec<f64>| {
+            values.sort_by(f64::total_cmp);
+            values[values.len() / 2]
+        };
+        let range_f = |mut values: Vec<f64>| {
+            values.sort_by(f64::total_cmp);
+            format!("{:.0}-{:.0}", values[0], values[values.len() - 1])
+        };
+        for delay in [Some(Duration::from_millis(20)), None] {
+            let fixture = WideFixture::build(WIDE_FILES, delay).await;
+            let all: Vec<usize> = (0..fixture.schema.fields().len()).collect();
+            let spread = fixture.columns(&["id", "i0", "s2", "i5", "s6"]);
+            let strings = fixture.columns(&["id", "s2", "s6"]);
+            let warmup = fixture.columns(&["id", "s2"]);
+            let cases: [WideCase; 5] = [
+                ("all", &all, None),
+                ("spread", &spread, None),
+                ("spread after s2", &spread, Some(&warmup)),
+                ("strings", &strings, None),
+                ("strings after s2", &strings, Some(&warmup)),
+            ];
+            for (name, projection, prewarm) in cases {
+                for partitions in [1, 4, 8] {
+                    let mut expected = None;
+                    let mut offs: Vec<WideRun> = Vec::new();
+                    let mut ons: Vec<WideRun> = Vec::new();
+                    let mut warms: Vec<WideRun> = Vec::new();
+                    for repeat in 0..repeats {
+                        clear_process_cache(&exclusive);
+                        let url = fresh_store_url("wide-first-pass");
+                        fixture.scan(&url, partitions, &all, off).await;
+                        let order = if repeat % 2 == 0 {
+                            [off, on]
+                        } else {
+                            [on, off]
+                        };
+                        for cache in order {
+                            cache.clear_for_tests();
+                            if let Some(prewarm) = prewarm {
+                                fixture.scan(&url, partitions, prewarm, cache).await;
+                            }
+                            let run = fixture.scan(&url, partitions, projection, cache).await;
+                            assert_eq!(*expected.get_or_insert(run.checksum), run.checksum);
+                            if cache.enabled() {
+                                let warm = fixture.scan(&url, partitions, projection, cache).await;
+                                assert_eq!(warm.checksum, run.checksum);
+                                assert_eq!(warm.gets.data, 0, "a warm repeat hits every range");
+                                ons.push(run);
+                                warms.push(warm);
+                            } else {
+                                offs.push(run);
+                            }
+                        }
+                    }
+                    on.clear_for_tests();
+                    let ms = |runs: &[WideRun]| {
+                        runs.iter()
+                            .map(|run| run.wall.as_secs_f64() * 1e3)
+                            .collect::<Vec<_>>()
+                    };
+                    let stat = |runs: &[WideRun], f: &dyn Fn(&WideRun) -> f64| {
+                        median_f(runs.iter().map(f).collect())
+                    };
+                    let per_get = |run: &WideRun| {
+                        run.gets.data_bytes as f64 / 1048576.0 / run.gets.data.max(1) as f64
+                    };
+                    let (off_ms, on_ms) = (median_f(ms(&offs)), median_f(ms(&ons)));
+                    println!(
+                        "| {} | {name} | {partitions} | {off_ms:.1} | {on_ms:.1} | {:.3} | {} | {} \
+                         | {:.0} | {:.0} | {:.2} | {:.2} | {:.0} | {:.0} | {:.0} | {:.0} | {:.0} \
+                         | {:.0} | {:.0} | {:.1} |",
+                        delay.map_or("none".to_string(), |d| format!("{} ms", d.as_millis())),
+                        on_ms / off_ms,
+                        range_f(ms(&offs)),
+                        range_f(ms(&ons)),
+                        stat(&offs, &|r| r.gets.data as f64),
+                        stat(&ons, &|r| r.gets.data as f64),
+                        stat(&offs, &per_get),
+                        stat(&ons, &per_get),
+                        stat(&offs, &|r| r.gets.max_in_flight as f64),
+                        stat(&ons, &|r| r.gets.max_in_flight as f64),
+                        stat(&offs, &|r| r.cpu.as_secs_f64() * 1e3),
+                        stat(&ons, &|r| r.cpu.as_secs_f64() * 1e3),
+                        stat(&offs, &|r| r.faults as f64),
+                        stat(&ons, &|r| r.faults as f64),
+                        stat(&ons, &|r| r.data.hit_bytes.map_or(0.0, |b| b as f64 / 1048576.0)),
+                        median_f(ms(&warms)),
+                    );
+                }
+            }
+        }
     }
 
     /// The cold or the warm scans of one bench configuration across repeats.
