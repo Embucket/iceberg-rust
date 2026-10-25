@@ -21,6 +21,15 @@ pub const ARROW_EXTENSION_TYPE_NAME_KEY: &str = "ARROW:extension:name";
 pub const PARQUET_VARIANT_EXTENSION_NAME: &str = "arrow.parquet.variant";
 pub const ICEBERG_DECIMAL_ZERO_PRECISION_META_KEY: &str = "embucket:iceberg_decimal_zero_precision";
 
+#[must_use]
+pub fn is_zero_precision_decimal(field: &Field) -> bool {
+    field.data_type() == &DataType::Decimal128(1, 0)
+        && field
+            .metadata()
+            .get(ICEBERG_DECIMAL_ZERO_PRECISION_META_KEY)
+            .is_some_and(|value| value == "true")
+}
+
 fn is_variant(field_type: &Type) -> bool {
     matches!(field_type, Type::Primitive(PrimitiveType::Variant))
 }
