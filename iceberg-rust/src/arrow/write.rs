@@ -141,6 +141,14 @@ pub fn zero_precision_decimal_columns(schema: &Schema) -> Result<Vec<usize>, Arr
     Ok(columns)
 }
 
+/// A nonzero value cannot be stored in an Iceberg decimal(0,0) column.
+#[derive(Debug, thiserror::Error)]
+#[error("Iceberg decimal(0,0) accepts only zero or NULL: {value}")]
+pub struct ZeroPrecisionDecimalOutOfRange {
+    /// The first nonzero value found in the column.
+    pub value: i128,
+}
+
 /// Validate only the exceptional logical decimal(0,0) columns; ordinary
 /// decimal batches never enter this kernel.
 pub fn validate_zero_precision_decimal_batch(
@@ -163,14 +171,21 @@ pub fn validate_zero_precision_decimal_batch(
                     "Iceberg decimal(0,0) requires Arrow Decimal128(1,0) storage".to_string(),
                 )
             })?;
-        if array.precision() != 1
-            || array.scale() != 0
-            || min(array).is_some_and(|value| value != 0)
-            || max(array).is_some_and(|value| value != 0)
-        {
-            return Err(ArrowError::InvalidArgumentError(
-                "Iceberg decimal(0,0) accepts only zero or NULL".to_string(),
+        if array.precision() != 1 || array.scale() != 0 {
+            return Err(ArrowError::SchemaError(
+                "Iceberg decimal(0,0) requires Arrow Decimal128(1,0) storage".to_string(),
             ));
+        }
+        if min(array).is_some_and(|value| value != 0) || max(array).is_some_and(|value| value != 0)
+        {
+            let value = array
+                .iter()
+                .flatten()
+                .find(|value| *value != 0)
+                .ok_or_else(|| ArrowError::ComputeError("missing nonzero decimal".to_string()))?;
+            return Err(ArrowError::ExternalError(Box::new(
+                ZeroPrecisionDecimalOutOfRange { value },
+            )));
         }
     }
     Ok(())
@@ -1500,8 +1515,20 @@ mod tests {
         assert!(
             validate_zero_precision_decimal_batch(&columns, &batch(vec![Some(0), None])).is_ok()
         );
-        assert!(validate_zero_precision_decimal_batch(&columns, &batch(vec![Some(1)])).is_err());
-        assert!(validate_zero_precision_decimal_batch(&columns, &batch(vec![Some(-1)])).is_err());
+        for value in [1, -1] {
+            let error = validate_zero_precision_decimal_batch(&columns, &batch(vec![Some(value)]))
+                .expect_err("nonzero decimal must be rejected");
+            let ArrowError::ExternalError(source) = error else {
+                panic!("expected typed decimal error");
+            };
+            assert_eq!(
+                source
+                    .downcast_ref::<ZeroPrecisionDecimalOutOfRange>()
+                    .expect("typed decimal error")
+                    .value,
+                value
+            );
+        }
         assert!(validate_zero_precision_decimal_batch(&[1], &batch(vec![Some(0)])).is_err());
     }
 
