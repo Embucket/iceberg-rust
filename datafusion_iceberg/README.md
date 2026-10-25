@@ -30,11 +30,10 @@ are not cached here. Metadata resolution and delete-file handling still run.
 Warm hits avoid object-store reads while retaining normal Parquet decoding and
 DataFusion execution. Misses keep the reader's batched multi-range API. Retained
 bytes own compact buffers, so a small slice cannot pin a large coalesced response.
-A miss the store returned in a buffer of its own is kept in that buffer, shared
-with the decoder, instead of being copied; of the slices of one coalesced
-response, the first keeps the response buffer (cut down to its own bytes) and
-the others are copied. A first pass that coalesces adjacent column chunks into
-one request therefore still pays a copy for most of its bytes.
+A miss the store returned in a buffer that holds exactly that range is kept in
+that buffer, shared with the decoder, instead of being copied. Every slice of a
+coalesced response is copied out once, so a first pass that coalesces adjacent
+column chunks into one request still pays a copy for those bytes.
 Entries plus conservative key overhead count against the cap. The process's
 other memory users and in-flight reads still need their own budget.
 

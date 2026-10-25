@@ -9,11 +9,11 @@
 //! Each retained range owns its buffer: an object-store multi-range response can
 //! return slices backed by a much larger coalesced allocation. Retaining those
 //! slices while charging only their lengths would evade the cache's byte cap.
-//! A miss is kept in the buffer it was fetched in when nothing else uses that
-//! buffer, cut down to the range: a range the store fetched on its own, or the
-//! first range of a coalesced response once the others are copied out of it.
-//! Any other miss is copied. The decoder reads the buffer the cache keeps, so
-//! a range fetched on its own costs a first pass no copy beyond what the cache
+//! A miss is kept in the buffer it was fetched in when that buffer holds
+//! exactly the range and nothing else uses it, as for a range the store
+//! fetched on its own; any other admitted miss, such as a slice of a coalesced
+//! response, is copied out. The decoder reads the buffer the cache keeps, so a
+//! range fetched on its own costs a first pass no copy beyond what the cache
 //! being off costs: copying every miss after the whole response arrived, on
 //! the decoder's path to its first batch, made wide first passes slower with
 //! the cache on than off.
@@ -226,11 +226,10 @@ impl DataCache {
     /// Insert a copy of `bytes`, which may be a slice of a larger buffer.
     #[cfg(test)]
     fn put(&self, key: Key, bytes: &Bytes) -> Evicted {
-        // The clone shares `bytes`' buffer, so `owned` copies it.
-        self.insert(key, owned(bytes.clone()))
+        self.insert(key, Bytes::copy_from_slice(bytes))
     }
 
-    /// Insert `owned`, which must own exactly its bytes (see [`owned`]).
+    /// Insert `owned`, which must be its buffer's only content (see [`owned`]).
     fn insert(&self, key: Key, owned: Bytes) -> Evicted {
         let mut evicted = Evicted::default();
         let weight = key.weight(owned.len());
@@ -334,18 +333,28 @@ impl DataCache {
         // ranges the misses would otherwise evict.
         scan.charge(hit_weight, self.cap);
         if !missing.is_empty() {
-            let fetched = inner.get_byte_ranges(missing).await?;
+            let mut fetched = inner.get_byte_ranges(missing).await?;
             if fetched.len() != missing_keys.len() {
                 return Err(ParquetError::General(
                     "Incomplete Parquet multi-range response".into(),
                 ));
             }
+            // Check every length before charging any range, so a truncated
+            // response neither inserts nor spends the scan's budget.
+            if missing_keys
+                .iter()
+                .zip(&fetched)
+                .any(|((_, key), bytes)| bytes.len() as u64 != key.end - key.start)
+            {
+                return Err(ParquetError::General("Truncated Parquet byte range".into()));
+            }
             let mut skipped = 0;
+            // Per range: `None` if not admitted, else whether its handle is
+            // the only user of its buffer. Uniqueness is read before any
+            // handle is dropped, so slices of one coalesced GET buffer all
+            // count as shared and are each copied once.
             let mut admitted = Vec::with_capacity(fetched.len());
             for ((_, key), bytes) in missing_keys.iter().zip(&fetched) {
-                if bytes.len() as u64 != key.end - key.start {
-                    return Err(ParquetError::General("Truncated Parquet byte range".into()));
-                }
                 metrics.miss_bytes.add(bytes.len());
                 let weight = key.weight(bytes.len());
                 // A range `insert` would reject (empty, or heavier than the
@@ -355,27 +364,23 @@ impl DataCache {
                     skipped += usize::from(!admit);
                     admit
                 };
-                admitted.push(admit);
+                admitted.push(admit.then(|| bytes.is_unique()));
             }
-            // Take ownership of the admitted ranges last to first: a coalesced
-            // GET returns nearby ranges as slices of one buffer, so once the
-            // later ones are copied out the first is that buffer's only user
-            // and `owned` keeps it without a copy (the decoder requests a row
-            // group's chunks in file order, so it sits at the buffer's start).
-            // A range fetched alone is kept as fetched. The decoder gets the
-            // buffer the cache keeps; ranges the budget declined stay slices.
-            let mut fetched: Vec<Bytes> = fetched
-                .into_iter()
-                .zip(&admitted)
-                .rev()
-                .map(|(bytes, &admit)| if admit { owned(bytes) } else { bytes })
-                .collect();
-            fetched.reverse();
+            // A range fetched in a buffer of its own is kept as fetched; any
+            // other admitted range is copied out. The decoder gets the buffer
+            // the cache keeps; ranges the budget declined stay as fetched.
+            for (bytes, admit) in fetched.iter_mut().zip(&admitted) {
+                match admit {
+                    Some(true) => *bytes = owned(std::mem::take(bytes)),
+                    Some(false) => *bytes = Bytes::copy_from_slice(bytes),
+                    None => {}
+                }
+            }
             let mut evicted = Evicted::default();
             for (((index, key), bytes), admit) in
                 missing_keys.into_iter().zip(fetched).zip(admitted)
             {
-                if admit {
+                if admit.is_some() {
                     let put = self.insert(key, bytes.clone());
                     evicted.entries += put.entries;
                     evicted.bytes += put.bytes;
@@ -397,18 +402,20 @@ impl DataCache {
     }
 }
 
-/// `bytes` in a buffer that holds nothing else, so a cached range is charged
-/// for all the memory it keeps: an object-store multi-range response returns
-/// slices of one coalesced buffer, and a slice keeps all of it alive.
+/// `bytes`, which is its buffer's only user, in a buffer that holds nothing
+/// else, so a cached range is charged for all the memory it keeps.
 ///
-/// The conversion reuses the buffer when `bytes` is its only user, giving
-/// back any of it outside the range, and copies the range otherwise. A range
-/// fetched on its own is thus kept without a copy, so filling the cache does
-/// not add a copy to every miss on the scan's path.
+/// The buffer is kept without a copy when it is exactly the range, as for a
+/// range the store fetched on its own; otherwise the range is copied out.
+/// Reusing a larger buffer and shrinking it would leave the charge to the
+/// allocator, which may keep the whole block on a shrink.
 fn owned(bytes: Bytes) -> Bytes {
-    let mut vec = Vec::from(bytes);
-    vec.shrink_to_fit();
-    Bytes::from(vec)
+    let vec = Vec::from(bytes);
+    if vec.capacity() == vec.len() {
+        Bytes::from(vec)
+    } else {
+        Bytes::copy_from_slice(&vec)
+    }
 }
 
 pub(crate) struct DataMetrics {
@@ -702,11 +709,10 @@ mod tests {
         assert_eq!(allocation_of(&cache, first), RANGE as usize);
     }
 
-    /// Ranges a coalesced GET returns as slices of one buffer: the first
-    /// keeps that buffer, cut down to its own bytes, the others are copied,
-    /// so no cached range keeps memory it is not charged for.
+    /// Ranges a coalesced GET returns as slices of one buffer are each
+    /// copied once, so no cached range keeps memory it is not charged for.
     #[tokio::test]
-    async fn a_coalesced_buffer_is_kept_by_its_first_range_only() {
+    async fn a_coalesced_buffer_is_copied_out_once_per_range() {
         let file: Arc<str> = Arc::from("s3://bucket/file");
         let cache = DataCache::new(1 << 20);
         let metrics = DataMetrics::new(&ExecutionPlanMetricsSet::new(), 0, true);
@@ -730,19 +736,131 @@ mod tests {
                 reader.data.slice(range.start as usize..range.end as usize)
             );
             assert_eq!(out[i].as_ptr(), cached[i].as_ptr());
+            assert!(!inside(&cached[i]), "range {i} was copied out");
         }
-        assert_eq!(
-            cached[0].as_ptr() as usize,
-            start,
-            "the first range keeps the buffer"
-        );
-        assert!(
-            !inside(&cached[1]) && !inside(&cached[2]),
-            "later ranges are copied"
-        );
         drop(out);
         let [first, ..] = <[Bytes; 3]>::try_from(cached).unwrap();
         assert_eq!(allocation_of(&cache, first), RANGE as usize);
+    }
+
+    /// Out-of-order, overlapping and duplicate ranges of one coalesced GET:
+    /// each cached range holds its own bytes in an allocation of its own
+    /// length, the decoder reads what the cache keeps, a duplicate replaces
+    /// the earlier entry and the resident weight is that of the entries left.
+    #[tokio::test]
+    async fn out_of_order_and_overlapping_slices_are_cached_exactly() {
+        let file: Arc<str> = Arc::from("s3://bucket/file");
+        let cache = DataCache::new(1 << 20);
+        let metrics = DataMetrics::new(&ExecutionPlanMetricsSet::new(), 0, true);
+        let mut reader = fresh_reader(3, true);
+        let half = RANGE / 2;
+        let requested = vec![
+            2 * RANGE..3 * RANGE,
+            0..RANGE,
+            half..RANGE + half,
+            2 * RANGE..3 * RANGE,
+        ];
+        let out = cache
+            .read(
+                &mut reader,
+                &file,
+                3 * RANGE,
+                requested.clone(),
+                &scan(),
+                &metrics,
+            )
+            .await
+            .unwrap();
+        assert_eq!(reader.buffers.len(), 1, "one GET buffer");
+        let start = reader.buffers[0];
+        let inside = |bytes: &Bytes| {
+            (start..start + 3 * RANGE as usize).contains(&(bytes.as_ptr() as usize))
+        };
+        let cached: Vec<Bytes> = requested
+            .iter()
+            .map(|r| cache.get(&key(&file, 3 * RANGE, r.start, r.end)).unwrap())
+            .collect();
+        for (i, range) in requested.iter().enumerate() {
+            let expected = reader.data.slice(range.start as usize..range.end as usize);
+            assert_eq!(out[i], expected, "decoder range {i}");
+            assert_eq!(cached[i], expected, "cached range {i}");
+            assert!(!inside(&cached[i]), "range {i} was copied out");
+        }
+        // The duplicate's later fill replaced the earlier one.
+        assert_eq!(cached[0].as_ptr(), out[3].as_ptr());
+        for i in 1..4 {
+            assert_eq!(out[i].as_ptr(), cached[i].as_ptr(), "range {i}");
+        }
+        let resident: usize = requested[1..]
+            .iter()
+            .map(|r| key(&file, 3 * RANGE, r.start, r.end).weight(RANGE as usize))
+            .sum();
+        assert_eq!(cache.used_for_tests(), resident);
+        drop(out);
+        let [_, first, overlap, last] = <[Bytes; 4]>::try_from(cached).unwrap();
+        for bytes in [first, overlap, last] {
+            cache.clear_for_tests();
+            assert_eq!(Vec::from(bytes).capacity(), RANGE as usize);
+        }
+    }
+
+    /// A reader whose multi-range response truncates its last range only.
+    struct TruncatesLast(Bytes);
+
+    impl AsyncFileReader for TruncatesLast {
+        fn get_bytes(&mut self, range: Range<u64>) -> BoxFuture<'_, Result<Bytes>> {
+            let bytes = self.0.slice(range.start as usize..range.end as usize);
+            futures::future::ready(Ok(bytes)).boxed()
+        }
+
+        fn get_byte_ranges(
+            &mut self,
+            ranges: Vec<Range<u64>>,
+        ) -> BoxFuture<'_, Result<Vec<Bytes>>> {
+            let last = ranges.len().saturating_sub(1);
+            let out = ranges
+                .into_iter()
+                .enumerate()
+                .map(|(i, r)| {
+                    let end = r.end as usize - usize::from(i == last);
+                    self.0.slice(r.start as usize..end)
+                })
+                .collect();
+            futures::future::ready(Ok(out)).boxed()
+        }
+
+        fn get_metadata<'a>(
+            &'a mut self,
+            _: Option<&'a ArrowReaderOptions>,
+        ) -> BoxFuture<'a, Result<Arc<ParquetMetaData>>> {
+            futures::future::ready(Err(ParquetError::General(
+                "unused in data cache tests".into(),
+            )))
+            .boxed()
+        }
+    }
+
+    /// A response that truncates a later range fails the call before any of
+    /// its ranges is inserted or charged to the scan's budget.
+    #[tokio::test]
+    async fn a_truncated_range_inserts_and_charges_nothing() {
+        let file: Arc<str> = Arc::from("s3://bucket/file");
+        let cache = DataCache::new(1 << 20);
+        let metrics = DataMetrics::new(&ExecutionPlanMetricsSet::new(), 0, true);
+        let mut reader = TruncatesLast(fresh_reader(3, false).data);
+        let scan = scan();
+        assert!(cache
+            .read(&mut reader, &file, 3 * RANGE, ranges(3), &scan, &metrics)
+            .await
+            .is_err());
+        for range in ranges(3) {
+            assert!(cache
+                .get(&key(&file, 3 * RANGE, range.start, range.end))
+                .is_none());
+        }
+        assert_eq!(cache.used_for_tests(), 0);
+        assert_eq!(scan.touched.load(Ordering::Relaxed), 0);
+        assert_eq!(guard(&metrics).admission_skips.value(), 0);
     }
 
     /// A slice the cache does not admit stays a slice of its GET buffer for
@@ -765,6 +883,7 @@ mod tests {
             start,
             "the admitted range was copied"
         );
+        assert_eq!(out[0].as_ptr(), cached.as_ptr());
         assert_eq!(out[1].as_ptr() as usize, start + RANGE as usize);
         assert!(cache
             .get(&key(&file, 2 * RANGE, RANGE, 2 * RANGE))
@@ -819,6 +938,24 @@ mod tests {
         let retained = cache.get(&a).unwrap();
         assert_eq!(retained, slice);
         assert_ne!(retained.as_ptr(), slice.as_ptr());
+    }
+
+    /// Only a buffer that is exactly its range is kept; a unique handle to
+    /// part of a larger buffer is copied out rather than shrunk in place.
+    #[test]
+    fn owned_keeps_only_an_exact_buffer() {
+        let exact = Bytes::from(vec![7; 1024]);
+        let ptr = exact.as_ptr();
+        assert_eq!(owned(exact).as_ptr(), ptr);
+        let large = Bytes::from(vec![7; 1024 * 1024]);
+        let start = large.as_ptr() as usize;
+        let part = large.slice(0..1024);
+        drop(large);
+        assert!(part.is_unique());
+        let kept = owned(part);
+        assert_eq!(kept, vec![7; 1024]);
+        assert!(!(start..start + 1024 * 1024).contains(&(kept.as_ptr() as usize)));
+        assert_eq!(Vec::from(kept).capacity(), 1024);
     }
 
     #[test]
