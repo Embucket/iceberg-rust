@@ -45,7 +45,13 @@ use std::{fmt::Write, thread::available_parallelism};
 use tokio::task::JoinSet;
 use tracing::instrument;
 
-use arrow::{datatypes::Schema as ArrowSchema, error::ArrowError, record_batch::RecordBatch};
+use arrow::{
+    array::Decimal128Array,
+    compute::{max, min},
+    datatypes::Schema as ArrowSchema,
+    error::ArrowError,
+    record_batch::RecordBatch,
+};
 use futures::Stream;
 use iceberg_rust_spec::{
     partition::BoundPartitionField,
@@ -54,6 +60,7 @@ use iceberg_rust_spec::{
         partition::Transform,
         schema::Schema,
         sort::{NullOrder, SortDirection, SortOrder},
+        types::{PrimitiveType, Type},
         values::Value,
     },
     table_metadata::{
@@ -94,6 +101,95 @@ use super::partition::partition_record_batch;
 /// Target size of a written data file, per the spec's default for
 /// `write.target-file-size-bytes`.
 const DEFAULT_TARGET_FILE_SIZE_BYTES: usize = 512 * 1024 * 1024;
+
+fn contains_zero_precision_decimal(field_type: &Type) -> bool {
+    match field_type {
+        Type::Primitive(PrimitiveType::Decimal {
+            precision: 0,
+            scale: 0,
+        }) => true,
+        Type::Struct(fields) => fields
+            .iter()
+            .any(|field| contains_zero_precision_decimal(&field.field_type)),
+        Type::List(list) => contains_zero_precision_decimal(&list.element),
+        Type::Map(map) => {
+            contains_zero_precision_decimal(&map.key) || contains_zero_precision_decimal(&map.value)
+        }
+        _ => false,
+    }
+}
+
+/// Find columns that need zero-only validation before Parquet writes.
+/// Nested zero-precision decimal writes are rejected until parent null semantics
+/// can be validated without scanning unrelated values.
+pub fn zero_precision_decimal_columns(schema: &Schema) -> Result<Vec<usize>, ArrowError> {
+    let mut columns = Vec::new();
+    for (index, field) in schema.fields().iter().enumerate() {
+        match &field.field_type {
+            Type::Primitive(PrimitiveType::Decimal {
+                precision: 0,
+                scale: 0,
+            }) => columns.push(index),
+            field_type if contains_zero_precision_decimal(field_type) => {
+                return Err(ArrowError::SchemaError(
+                    "Nested Iceberg decimal(0,0) writes are not supported".to_string(),
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(columns)
+}
+
+/// A nonzero value cannot be stored in an Iceberg decimal(0,0) column.
+#[derive(Debug, thiserror::Error)]
+#[error("Iceberg decimal(0,0) accepts only zero or NULL: {value}")]
+pub struct ZeroPrecisionDecimalOutOfRange {
+    /// The first nonzero value found in the column.
+    pub value: i128,
+}
+
+/// Validate only the exceptional logical decimal(0,0) columns; ordinary
+/// decimal batches never enter this kernel.
+pub fn validate_zero_precision_decimal_batch(
+    columns: &[usize],
+    batch: &RecordBatch,
+) -> Result<(), ArrowError> {
+    for index in columns {
+        let array = batch
+            .columns()
+            .get(*index)
+            .ok_or_else(|| {
+                ArrowError::SchemaError(format!(
+                    "Iceberg decimal(0,0) column index {index} is missing from the batch"
+                ))
+            })?
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .ok_or_else(|| {
+                ArrowError::SchemaError(
+                    "Iceberg decimal(0,0) requires Arrow Decimal128(1,0) storage".to_string(),
+                )
+            })?;
+        if array.precision() != 1 || array.scale() != 0 {
+            return Err(ArrowError::SchemaError(
+                "Iceberg decimal(0,0) requires Arrow Decimal128(1,0) storage".to_string(),
+            ));
+        }
+        if min(array).is_some_and(|value| value != 0) || max(array).is_some_and(|value| value != 0)
+        {
+            let value = array
+                .iter()
+                .flatten()
+                .find(|value| *value != 0)
+                .ok_or_else(|| ArrowError::ComputeError("missing nonzero decimal".to_string()))?;
+            return Err(ArrowError::ExternalError(Box::new(
+                ZeroPrecisionDecimalOutOfRange { value },
+            )));
+        }
+    }
+    Ok(())
+}
 
 /// The on-disk size at which a data file is rolled.
 ///
@@ -277,6 +373,12 @@ async fn store_parquet_partitioned(
     } else {
         schema
     };
+    let zero_precision_columns = zero_precision_decimal_columns(&schema)?;
+    let batches = batches.map(move |batch| {
+        let batch = batch?;
+        validate_zero_precision_decimal_batch(&zero_precision_columns, &batch)?;
+        Ok(batch)
+    });
 
     let partition_spec = Arc::new(
         metadata
@@ -1376,6 +1478,59 @@ mod writer_properties_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::datatypes::{DataType, Field};
+
+    #[test]
+    fn zero_precision_decimal_batch_accepts_only_zero_and_null() {
+        let schema = Schema::builder()
+            .with_struct_field(iceberg_rust_spec::types::StructField::new(
+                1,
+                "zero",
+                false,
+                Type::Primitive(PrimitiveType::Decimal {
+                    precision: 0,
+                    scale: 0,
+                }),
+                None,
+            ))
+            .build()
+            .unwrap();
+        let columns = zero_precision_decimal_columns(&schema).unwrap();
+        assert_eq!(columns, vec![0]);
+        let batch = |values| {
+            RecordBatch::try_new(
+                Arc::new(ArrowSchema::new(vec![Field::new(
+                    "zero",
+                    DataType::Decimal128(1, 0),
+                    true,
+                )])),
+                vec![Arc::new(
+                    Decimal128Array::from(values)
+                        .with_precision_and_scale(1, 0)
+                        .unwrap(),
+                )],
+            )
+            .unwrap()
+        };
+        assert!(
+            validate_zero_precision_decimal_batch(&columns, &batch(vec![Some(0), None])).is_ok()
+        );
+        for value in [1, -1] {
+            let error = validate_zero_precision_decimal_batch(&columns, &batch(vec![Some(value)]))
+                .expect_err("nonzero decimal must be rejected");
+            let ArrowError::ExternalError(source) = error else {
+                panic!("expected typed decimal error");
+            };
+            assert_eq!(
+                source
+                    .downcast_ref::<ZeroPrecisionDecimalOutOfRange>()
+                    .expect("typed decimal error")
+                    .value,
+                value
+            );
+        }
+        assert!(validate_zero_precision_decimal_batch(&[1], &batch(vec![Some(0)])).is_err());
+    }
 
     #[test]
     fn bloom_filter_properties_apply_per_column() {

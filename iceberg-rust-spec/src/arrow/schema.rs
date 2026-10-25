@@ -19,6 +19,16 @@ use crate::error::Error;
 pub const PARQUET_FIELD_ID_META_KEY: &str = "PARQUET:field_id";
 pub const ARROW_EXTENSION_TYPE_NAME_KEY: &str = "ARROW:extension:name";
 pub const PARQUET_VARIANT_EXTENSION_NAME: &str = "arrow.parquet.variant";
+pub const ICEBERG_DECIMAL_ZERO_PRECISION_META_KEY: &str = "embucket:iceberg_decimal_zero_precision";
+
+#[must_use]
+pub fn is_zero_precision_decimal(field: &Field) -> bool {
+    field.data_type() == &DataType::Decimal128(1, 0)
+        && field
+            .metadata()
+            .get(ICEBERG_DECIMAL_ZERO_PRECISION_META_KEY)
+            .is_some_and(|value| value == "true")
+}
 
 fn is_variant(field_type: &Type) -> bool {
     matches!(field_type, Type::Primitive(PrimitiveType::Variant))
@@ -36,11 +46,41 @@ fn arrow_field(
             PARQUET_VARIANT_EXTENSION_NAME.to_string(),
         );
     }
+    if matches!(
+        field_type,
+        Type::Primitive(PrimitiveType::Decimal {
+            precision: 0,
+            scale: 0
+        })
+    ) {
+        metadata.insert(
+            ICEBERG_DECIMAL_ZERO_PRECISION_META_KEY.to_string(),
+            "true".to_string(),
+        );
+    }
     Ok(Field::new(name, field_type.try_into()?, nullable).with_metadata(metadata))
 }
 
 fn iceberg_type(field: &Field) -> Result<Type, Error> {
-    if field.extension_type_name() == Some(PARQUET_VARIANT_EXTENSION_NAME) {
+    if let Some(marker) = field
+        .metadata()
+        .get(ICEBERG_DECIMAL_ZERO_PRECISION_META_KEY)
+    {
+        if marker != "true" {
+            return Err(Error::NotSupported(
+                "Invalid Iceberg decimal(0,0) Arrow marker".to_string(),
+            ));
+        }
+        if field.data_type() != &DataType::Decimal128(1, 0) {
+            return Err(Error::NotSupported(
+                "Iceberg decimal(0,0) requires Arrow Decimal128(1,0) storage".to_string(),
+            ));
+        }
+        Ok(Type::Primitive(PrimitiveType::Decimal {
+            precision: 0,
+            scale: 0,
+        }))
+    } else if field.extension_type_name() == Some(PARQUET_VARIANT_EXTENSION_NAME) {
         if !matches!(field.data_type(), DataType::Struct(_)) {
             return Err(Error::NotSupported(format!(
                 "Arrow {PARQUET_VARIANT_EXTENSION_NAME} extension requires Struct storage"
@@ -122,9 +162,13 @@ impl TryFrom<&Type> for DataType {
                 PrimitiveType::Long => Ok(DataType::Int64),
                 PrimitiveType::Float => Ok(DataType::Float32),
                 PrimitiveType::Double => Ok(DataType::Float64),
-                PrimitiveType::Decimal { precision, scale } => {
-                    Ok(DataType::Decimal128(*precision as u8, *scale as i8))
-                }
+                PrimitiveType::Decimal { precision, scale } => match (*precision, *scale) {
+                    (0, 0) => Ok(DataType::Decimal128(1, 0)),
+                    (0, _) => Err(Error::NotSupported(
+                        "Iceberg decimal precision zero requires scale zero".to_string(),
+                    )),
+                    _ => Ok(DataType::Decimal128(*precision as u8, *scale as i8)),
+                },
                 PrimitiveType::Date => Ok(DataType::Date32),
                 PrimitiveType::Time => Ok(DataType::Time64(TimeUnit::Microsecond)),
                 PrimitiveType::Timestamp => Ok(DataType::Timestamp(TimeUnit::Microsecond, None)),
@@ -410,6 +454,67 @@ fn resolve_field_id(
 mod tests {
     use super::*;
     use crate::spec::types::MapType;
+
+    #[test]
+    fn zero_precision_decimal_keeps_logical_type_and_field_id() {
+        let iceberg = StructType::new(vec![
+            StructField::new(
+                1,
+                "zero",
+                false,
+                Type::Primitive(PrimitiveType::Decimal {
+                    precision: 0,
+                    scale: 0,
+                }),
+                None,
+            ),
+            StructField::new(
+                2,
+                "ordinary",
+                false,
+                Type::Primitive(PrimitiveType::Decimal {
+                    precision: 1,
+                    scale: 0,
+                }),
+                None,
+            ),
+        ]);
+        let arrow: ArrowSchema = (&iceberg).try_into().unwrap();
+        let zero = arrow.field_with_name("zero").unwrap();
+        let ordinary = arrow.field_with_name("ordinary").unwrap();
+        assert_eq!(zero.data_type(), &DataType::Decimal128(1, 0));
+        assert_eq!(ordinary.data_type(), &DataType::Decimal128(1, 0));
+        assert_eq!(get_field_id(zero).unwrap(), 1);
+        assert_eq!(get_field_id(ordinary).unwrap(), 2);
+        assert_eq!(
+            zero.metadata()
+                .get(ICEBERG_DECIMAL_ZERO_PRECISION_META_KEY)
+                .map(String::as_str),
+            Some("true")
+        );
+        assert!(!ordinary
+            .metadata()
+            .contains_key(ICEBERG_DECIMAL_ZERO_PRECISION_META_KEY));
+        assert_eq!(StructType::try_from(&arrow).unwrap(), iceberg);
+    }
+
+    #[test]
+    fn zero_precision_decimal_marker_requires_its_physical_carrier() {
+        let field =
+            Field::new("zero", DataType::Decimal128(2, 0), true).with_metadata(HashMap::from([
+                (PARQUET_FIELD_ID_META_KEY.to_string(), "1".to_string()),
+                (
+                    ICEBERG_DECIMAL_ZERO_PRECISION_META_KEY.to_string(),
+                    "true".to_string(),
+                ),
+            ]));
+        assert!(StructType::try_from(&ArrowSchema::new(vec![field])).is_err());
+        assert!(DataType::try_from(&Type::Primitive(PrimitiveType::Decimal {
+            precision: 0,
+            scale: 1,
+        }))
+        .is_err());
+    }
 
     #[test]
     fn variant_arrow_schema_roundtrip() {

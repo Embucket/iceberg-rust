@@ -15,6 +15,7 @@
 use std::{any::Any, collections::HashSet, sync::Arc};
 
 use crate::error::Error as DatafusionIcebergError;
+use crate::statistics::cast_iceberg_bound;
 use datafusion::{
     arrow::{
         array::{ArrayRef, Int32Array, Int64Array},
@@ -86,7 +87,7 @@ impl PruningStatistics for PruneManifests<'_, '_> {
                 .and_then(|manifest| manifest.partitions.as_ref())
                 .and_then(|partitions| partitions.get(index))
                 .and_then(|partition| partition.lower_bound.as_ref())
-                .and_then(|min| min.clone().cast(&data_type).ok())
+                .and_then(|min| cast_iceberg_bound(min.clone(), &data_type).ok())
                 .map(Value::into_any)
         });
         any_iter_to_array(min_values, &(&data_type).try_into().ok()?).ok()
@@ -107,7 +108,7 @@ impl PruningStatistics for PruneManifests<'_, '_> {
                 .and_then(|manifest| manifest.partitions.as_ref())
                 .and_then(|partitions| partitions.get(index))
                 .and_then(|partition| partition.upper_bound.as_ref())
-                .and_then(|max| max.clone().cast(&data_type).ok())
+                .and_then(|max| cast_iceberg_bound(max.clone(), &data_type).ok())
                 .map(Value::into_any)
         });
         any_iter_to_array(max_values, &(&data_type).try_into().ok()?).ok()
@@ -191,7 +192,7 @@ impl<'table, 'manifests> PrunePartitionedDataFiles<'table, 'manifests> {
             .then(|| entry.data_file().partition().get(column.name()))
             .flatten()
             .and_then(Option::as_ref)
-            .and_then(|value| value.clone().cast(&field_type).ok())
+            .and_then(|value| cast_iceberg_bound(value.clone(), &field_type).ok())
             .map(Value::into_any)
         });
         any_iter_to_array(values, &data_type).ok()
@@ -291,9 +292,7 @@ impl PruningStatistics for PruneDataFiles<'_, '_> {
             }
             match &manifest.1.data_file().lower_bounds() {
                 Some(map) => map.get(&column_id).and_then(|value| {
-                    value
-                        .clone()
-                        .cast(&field.field_type)
+                    cast_iceberg_bound(value.clone(), &field.field_type)
                         .ok()
                         .map(Value::into_any)
                 }),
@@ -316,9 +315,7 @@ impl PruningStatistics for PruneDataFiles<'_, '_> {
             }
             match &manifest.1.data_file().upper_bounds() {
                 Some(map) => map.get(&column_id).and_then(|value| {
-                    value
-                        .clone()
-                        .cast(&field.field_type)
+                    cast_iceberg_bound(value.clone(), &field.field_type)
                         .ok()
                         .map(Value::into_any)
                 }),
@@ -1014,6 +1011,98 @@ mod tests {
         assert_eq!(maximums.value(2), -42);
         let null_counts = pruning.null_counts(&Column::from_name("b")).unwrap();
         assert!(null_counts.is_null(0));
+    }
+
+    #[test]
+    fn zero_precision_decimal_partition_bounds_use_arrow_carrier() {
+        let source = StructField::new(
+            1,
+            "amount",
+            false,
+            Type::Primitive(PrimitiveType::Decimal {
+                precision: 0,
+                scale: 0,
+            }),
+            None,
+        );
+        let partition = PartitionField::new(1, 1000, "amount", Transform::Identity);
+        let fields = [BoundPartitionField::new(&partition, &source)];
+        let zero = Value::Decimal(decimal_from_i128_with_scale(0, 0).unwrap());
+        let invalid = Value::Decimal(decimal_from_i128_with_scale(1, 0).unwrap());
+        let manifest = |value: Value| ManifestListEntry {
+            format_version: FormatVersion::V2,
+            manifest_path: "/data.avro".to_owned(),
+            manifest_length: 1,
+            partition_spec_id: 0,
+            content: ManifestContent::Data,
+            sequence_number: 1,
+            min_sequence_number: 1,
+            added_snapshot_id: 1,
+            added_files_count: Some(1),
+            existing_files_count: Some(0),
+            deleted_files_count: Some(0),
+            added_rows_count: Some(1),
+            existing_rows_count: Some(0),
+            deleted_rows_count: Some(0),
+            partitions: Some(vec![FieldSummary {
+                contains_null: false,
+                contains_nan: None,
+                lower_bound: Some(value.clone()),
+                upper_bound: Some(value),
+            }]),
+            key_metadata: None,
+            first_row_id: None,
+        };
+        let manifests = [manifest(zero.clone()), manifest(invalid.clone())];
+        let manifest_pruning = PruneManifests::new(&fields, 0, &manifests);
+
+        let data_file = |value: Value| {
+            let file = DataFile::builder()
+                .with_content(Content::Data)
+                .with_file_path("/data.parquet".into())
+                .with_file_format(FileFormat::Parquet)
+                .with_partition(Struct::from_iter(vec![("amount".to_owned(), Some(value))]))
+                .with_record_count(1)
+                .with_file_size_in_bytes(1)
+                .with_column_sizes(None)
+                .with_value_counts(None)
+                .with_null_value_counts(None)
+                .with_nan_value_counts(None)
+                .with_distinct_counts(None)
+                .with_lower_bounds(None)
+                .with_upper_bounds(None)
+                .build()
+                .unwrap();
+            ManifestEntry::builder()
+                .with_format_version(FormatVersion::V2)
+                .with_status(Status::Added)
+                .with_data_file(file)
+                .build()
+                .unwrap()
+        };
+        let files = vec![
+            ("current".into(), data_file(zero)),
+            ("current".into(), data_file(invalid)),
+        ];
+        let compatible = HashSet::from(["current"]);
+        let file_pruning = PrunePartitionedDataFiles::new(&fields, &compatible, &files);
+
+        for stats in [
+            &manifest_pruning as &dyn PruningStatistics,
+            &file_pruning as &dyn PruningStatistics,
+        ] {
+            for values in [
+                stats.min_values(&Column::from_name("amount")),
+                stats.max_values(&Column::from_name("amount")),
+            ] {
+                let values = values.unwrap();
+                let decimals = values.as_any().downcast_ref::<Decimal128Array>().unwrap();
+                assert_eq!(decimals.precision(), 1);
+                assert_eq!(decimals.scale(), 0);
+                assert_eq!(decimals.value(0), 0);
+                assert!(decimals.is_null(1));
+            }
+        }
     }
 
     #[test]
