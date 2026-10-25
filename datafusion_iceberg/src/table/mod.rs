@@ -13,7 +13,10 @@ use derive_builder::Builder;
 use futures::stream;
 use futures::{StreamExt, TryStreamExt};
 use iceberg_rust::arrow::partition::partition_record_batch;
-use iceberg_rust::arrow::write::{generate_file_path, generate_partition_path};
+use iceberg_rust::arrow::write::{
+    generate_file_path, generate_partition_path, validate_zero_precision_decimal_batch,
+    zero_precision_decimal_columns,
+};
 use iceberg_rust::file_format::parquet::{
     parquet_to_datafile, parquet_to_datafile_with_partition,
     ICEBERG_ESTIMATE_INT64_DISTINCT_COUNT_META_KEY,
@@ -95,6 +98,7 @@ use datafusion::{
         },
         metrics::MetricsSet,
         projection::ProjectionExec,
+        stream::RecordBatchStreamAdapter,
         union::UnionExec,
         DisplayAs, DisplayFormatType, ExecutionPlan, PhysicalExpr, SendableRecordBatchStream,
     },
@@ -2418,6 +2422,20 @@ async fn write_parquet_files(
     let schema = table
         .current_schema()
         .map_err(DataFusionIcebergError::from)?;
+    let zero_precision_columns = zero_precision_decimal_columns(schema)?;
+    let batches = if zero_precision_columns.is_empty() {
+        batches
+    } else {
+        let batch_schema = batches.schema();
+        Box::pin(RecordBatchStreamAdapter::new(
+            batch_schema,
+            batches.map(move |batch| {
+                let batch = batch?;
+                validate_zero_precision_decimal_batch(&zero_precision_columns, &batch)?;
+                Ok(batch)
+            }),
+        )) as SendableRecordBatchStream
+    };
     let table_arrow_schema = Arc::new(
         TryInto::<ArrowSchema>::try_into(schema.fields()).map_err(DataFusionIcebergError::from)?,
     );

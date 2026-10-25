@@ -8,16 +8,21 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
-    ArrayRef, Date32Array, Decimal128Array, Float32Array, Float64Array, Int32Array, Int64Array,
-    RecordBatch, StringArray, Time64MicrosecondArray, TimestampMicrosecondArray,
+    Array, ArrayRef, Date32Array, Decimal128Array, Float32Array, Float64Array, Int32Array,
+    Int64Array, RecordBatch, StringArray, Time64MicrosecondArray, TimestampMicrosecondArray,
     TimestampNanosecondArray,
 };
 use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema, TimeUnit};
 use datafusion::dataframe::DataFrameWriteOptions;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::prelude::{col, lit, SessionContext};
 use datafusion::scalar::ScalarValue;
 use datafusion_iceberg::catalog::catalog::IcebergCatalog;
+use datafusion_iceberg::table::write_parquet_equality_delete_files;
+use futures::stream;
+use iceberg_rust::arrow::write::write_parquet_partitioned;
 use iceberg_rust::catalog::identifier::Identifier;
+use iceberg_rust::catalog::tabular::Tabular;
 use iceberg_rust::catalog::Catalog;
 use iceberg_rust::error::Error;
 use iceberg_rust::file_format::parquet::parquet_to_datafile;
@@ -33,13 +38,26 @@ use iceberg_rust::spec::types::{PrimitiveType, StructField, Type};
 use iceberg_rust::spec::values::Value;
 use iceberg_rust::table::Table;
 use iceberg_sql_catalog::SqlCatalog;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
+use parquet::data_type::Int32Type;
 use parquet::file::reader::{FileReader, SerializedFileReader};
+use parquet::file::writer::SerializedFileWriter;
+use parquet::schema::parser::parse_message_type;
 use uuid::Uuid;
 
 /// Build an in-memory catalog with a single `public.t(id INT, amount DECIMAL(18,2))`
 /// table and write `unscaled_amounts` as one data file.
 async fn setup(unscaled_amounts: Vec<i128>) -> SessionContext {
+    setup_with_decimal(unscaled_amounts, 18, 2, 18).await
+}
+
+async fn setup_with_decimal(
+    unscaled_amounts: Vec<i128>,
+    iceberg_precision: u32,
+    scale: u32,
+    arrow_precision: u8,
+) -> SessionContext {
     let object_store = ObjectStoreBuilder::memory();
     let catalog: Arc<dyn Catalog> = Arc::new(
         SqlCatalog::new("sqlite://", "test", object_store)
@@ -71,8 +89,8 @@ async fn setup(unscaled_amounts: Vec<i128>) -> SessionContext {
                     name: "amount".to_owned(),
                     required: false,
                     field_type: Type::Primitive(PrimitiveType::Decimal {
-                        precision: 18,
-                        scale: 2,
+                        precision: iceberg_precision,
+                        scale,
                     }),
                     doc: None,
                     initial_default: None,
@@ -94,7 +112,7 @@ async fn setup(unscaled_amounts: Vec<i128>) -> SessionContext {
     let n = unscaled_amounts.len();
     let ids = Int32Array::from((0..n as i32).collect::<Vec<_>>());
     let amount = Decimal128Array::from(unscaled_amounts)
-        .with_precision_and_scale(18, 2)
+        .with_precision_and_scale(arrow_precision, scale as i8)
         .unwrap();
     let data = RecordBatch::try_from_iter(vec![
         ("id", Arc::new(ids) as ArrayRef),
@@ -109,6 +127,170 @@ async fn setup(unscaled_amounts: Vec<i128>) -> SessionContext {
         .unwrap();
 
     ctx
+}
+
+#[tokio::test]
+async fn zero_precision_iceberg_decimal_reads_from_valid_parquet_carrier() {
+    let ctx = setup_with_decimal(vec![0, 0], 0, 0, 1).await;
+    let table = ctx.table("warehouse.public.t").await.unwrap();
+    let amount = table
+        .schema()
+        .field_with_unqualified_name("amount")
+        .unwrap();
+    assert_eq!(amount.data_type(), &DataType::Decimal128(1, 0));
+    assert_eq!(
+        amount
+            .metadata()
+            .get(iceberg_rust::spec::arrow::schema::ICEBERG_DECIMAL_ZERO_PRECISION_META_KEY)
+            .map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
+        count(
+            &ctx,
+            "SELECT count(*) FROM warehouse.public.t WHERE amount = CAST(0 AS DECIMAL(1,0))",
+        )
+        .await,
+        2
+    );
+
+    ctx.sql("INSERT INTO warehouse.public.t VALUES (2, 0), (3, NULL)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        count(&ctx, "SELECT count(*) FROM warehouse.public.t").await,
+        4
+    );
+    assert_eq!(
+        count(
+            &ctx,
+            "SELECT count(*) FROM warehouse.public.t WHERE amount = 0"
+        )
+        .await,
+        3
+    );
+    assert_eq!(
+        count(
+            &ctx,
+            "SELECT count(*) FROM warehouse.public.t WHERE amount IS NULL"
+        )
+        .await,
+        1
+    );
+    let error = async {
+        ctx.sql("INSERT INTO warehouse.public.t VALUES (4, 1)")
+            .await?
+            .collect()
+            .await
+    }
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("only zero or NULL"));
+    assert_eq!(
+        count(&ctx, "SELECT count(*) FROM warehouse.public.t").await,
+        4
+    );
+    let error = async {
+        ctx.sql("INSERT INTO warehouse.public.t VALUES (6, 0), (7, 1)")
+            .await?
+            .collect()
+            .await
+    }
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("only zero or NULL"));
+    assert_eq!(
+        count(&ctx, "SELECT count(*) FROM warehouse.public.t").await,
+        4
+    );
+
+    let invalid = RecordBatch::try_from_iter(vec![
+        ("id", Arc::new(Int32Array::from(vec![5])) as ArrayRef),
+        (
+            "amount",
+            Arc::new(
+                Decimal128Array::from(vec![1])
+                    .with_precision_and_scale(1, 0)
+                    .unwrap(),
+            ) as ArrayRef,
+        ),
+    ])
+    .unwrap();
+    let direct_invalid = invalid.clone();
+    let equality_input = invalid.clone();
+    let error = ctx
+        .read_batch(invalid)
+        .unwrap()
+        .write_table("warehouse.public.t", DataFrameWriteOptions::default())
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("only zero or NULL"));
+    assert_eq!(
+        count(&ctx, "SELECT count(*) FROM warehouse.public.t").await,
+        4
+    );
+
+    let provider = ctx.catalog("warehouse").unwrap();
+    let catalog = provider.downcast_ref::<IcebergCatalog>().unwrap().catalog();
+    let Tabular::Table(table) = catalog
+        .load_tabular(&Identifier::new(&["public".to_string()], "t"))
+        .await
+        .unwrap()
+    else {
+        panic!("expected Iceberg table");
+    };
+    let error = write_parquet_partitioned(&table, stream::iter(vec![Ok(direct_invalid)]), None)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("only zero or NULL"));
+
+    let equality_stream = Box::pin(RecordBatchStreamAdapter::new(
+        equality_input.schema(),
+        stream::iter(vec![Ok(equality_input)]),
+    ));
+    let error =
+        write_parquet_equality_delete_files(&table, equality_stream, &ctx.task_ctx(), &[0], None)
+            .await
+            .unwrap_err();
+    assert!(error.to_string().contains("only zero or NULL"));
+}
+
+#[test]
+fn zero_precision_decimal_reads_int32_parquet_carrier() {
+    let schema = Arc::new(
+        parse_message_type("message schema { OPTIONAL INT32 amount (DECIMAL(1,0)) = 1; }").unwrap(),
+    );
+    let mut bytes = Vec::new();
+    let mut writer = SerializedFileWriter::new(&mut bytes, schema, Default::default()).unwrap();
+    let mut row_group = writer.next_row_group().unwrap();
+    let mut column = row_group.next_column().unwrap().unwrap();
+    column
+        .typed::<Int32Type>()
+        .write_batch(&[0, 0], Some(&[1, 0, 1]), None)
+        .unwrap();
+    column.close().unwrap();
+    row_group.close().unwrap();
+    writer.close().unwrap();
+
+    let mut reader = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes))
+        .unwrap()
+        .build()
+        .unwrap();
+    let batch = reader.next().unwrap().unwrap();
+    let values = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .unwrap();
+    assert_eq!(values.precision(), 1);
+    assert_eq!(values.scale(), 0);
+    assert_eq!(values.len(), 3);
+    assert_eq!(values.value(0), 0);
+    assert!(values.is_null(1));
+    assert_eq!(values.value(2), 0);
 }
 
 async fn scalar_i128(ctx: &SessionContext, sql: &str) -> i128 {

@@ -118,8 +118,29 @@ pub(crate) fn manifest_statistics(schema: &Schema, manifest: &ManifestEntry) -> 
     }
 }
 
+pub(crate) fn cast_iceberg_bound(value: Value, field_type: &Type) -> Result<Value, Error> {
+    if matches!(
+        field_type,
+        Type::Primitive(PrimitiveType::Decimal {
+            precision: 0,
+            scale: 0
+        })
+    ) {
+        if !matches!(&value, Value::Decimal(decimal) if decimal_mantissa(decimal)? == 0) {
+            return Err(Error::InvalidFormat(
+                "Iceberg decimal(0,0) bound must be zero".to_string(),
+            ));
+        }
+        return Ok(value.cast(&Type::Primitive(PrimitiveType::Decimal {
+            precision: 1,
+            scale: 0,
+        }))?);
+    }
+    Ok(value.cast(field_type)?)
+}
+
 fn convert_value_to_scalar_value(value: Value, field_type: &Type) -> Result<ScalarValue, Error> {
-    let value = value.cast(field_type)?;
+    let value = cast_iceberg_bound(value, field_type)?;
     match value {
         Value::Boolean(b) => Ok(ScalarValue::Boolean(Some(b))),
         Value::Int(i) => Ok(ScalarValue::Int32(Some(i))),
@@ -149,7 +170,7 @@ fn convert_value_to_scalar_value(value: Value, field_type: &Type) -> Result<Scal
             // Extract precision and scale from the field type
             let (precision, scale) = match field_type {
                 Type::Primitive(PrimitiveType::Decimal { precision, scale }) => {
-                    (*precision as u8, *scale as i8)
+                    ((*precision).max(1) as u8, *scale as i8)
                 }
                 _ => {
                     // Fallback: use the decimal's own scale and assume max precision
@@ -270,5 +291,20 @@ mod tests {
             convert_value_to_scalar_value(value, &field_type).unwrap(),
             ScalarValue::Decimal128(Some(1234), 10, 2)
         );
+    }
+
+    #[test]
+    fn zero_precision_decimal_bound_uses_physical_precision_one() {
+        let field_type = Type::Primitive(PrimitiveType::Decimal {
+            precision: 0,
+            scale: 0,
+        });
+        let zero = Value::Decimal(decimal_from_i128_with_scale(0, 0).unwrap());
+        assert_eq!(
+            convert_value_to_scalar_value(zero, &field_type).unwrap(),
+            ScalarValue::Decimal128(Some(0), 1, 0)
+        );
+        let nonzero = Value::Decimal(decimal_from_i128_with_scale(1, 0).unwrap());
+        assert!(convert_value_to_scalar_value(nonzero, &field_type).is_err());
     }
 }
