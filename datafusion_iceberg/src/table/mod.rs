@@ -2432,7 +2432,6 @@ async fn write_parquet_files(
     } else {
         WriteLimits::from_schema(schema, &metadata.properties)?
     };
-    let track_generated_paths = !write_limits.is_empty();
     let batches = if zero_precision_columns.is_empty() && write_limits.is_empty() {
         batches
     } else {
@@ -2519,63 +2518,68 @@ async fn write_parquet_files(
     let sink = ParquetSink::new(config, table_parquet_options);
 
     let (demux_task, file_receiver, partition_values_by_path) =
-        start_demuxer_task(metadata, batches, context, track_generated_paths)?;
+        start_demuxer_task(metadata, batches, context)?;
 
     if let Err(error) = sink
         .spawn_writer_tasks_and_join(context, demux_task, file_receiver, object_store.clone())
         .await
     {
-        if matches!(&error, DataFusionError::External(source)
-            if matches!(source.downcast_ref::<DataFusionIcebergError>(),
-                Some(DataFusionIcebergError::DeclaredColumnLengthExceeded { .. })))
-        {
-            cleanup_failed_write_files(&object_store, &partition_values_by_path).await;
-        }
+        cleanup_failed_write_files(&object_store, &partition_values_by_path).await;
         return Err(error);
     }
 
     let files = sink.written();
 
-    let mut datafiles = Vec::with_capacity(files.len());
-
-    for (path, file) in files {
-        let size = object_store
-            .head(&path)
-            .await
-            .map_err(DataFusionIcebergError::from)?
-            .size;
-        let location = bucket.to_string() + "/" + path.as_ref();
-        let datafile = if partition_fields.is_empty() {
-            parquet_to_datafile(
-                &location,
-                size,
-                &file,
-                schema,
-                &partition_fields,
-                equality_ids,
-                &metadata.properties,
-            )
-        } else {
-            let values = partition_values_by_path
-                .read()
-                .map_err(|_| DataFusionError::Internal("Partition map lock poisoned".to_owned()))?
-                .get(&path)
-                .cloned()
-                .ok_or_else(|| DataFusionError::Internal("Missing written partition".to_owned()))?;
-            parquet_to_datafile_with_partition(
-                &location,
-                size,
-                &file,
-                schema,
-                &partition_fields,
-                equality_ids,
-                &metadata.properties,
-                &values,
-            )
-        };
-        datafiles.push(datafile.map_err(DataFusionIcebergError::from)?);
+    let datafiles_result = async {
+        let mut datafiles = Vec::with_capacity(files.len());
+        for (path, file) in files {
+            let size = object_store
+                .head(&path)
+                .await
+                .map_err(DataFusionIcebergError::from)?
+                .size;
+            let location = bucket.to_string() + "/" + path.as_ref();
+            let datafile = if partition_fields.is_empty() {
+                parquet_to_datafile(
+                    &location,
+                    size,
+                    &file,
+                    schema,
+                    &partition_fields,
+                    equality_ids,
+                    &metadata.properties,
+                )
+            } else {
+                let values = partition_values_by_path
+                    .read()
+                    .map_err(|_| {
+                        DataFusionError::Internal("Partition map lock poisoned".to_owned())
+                    })?
+                    .get(&path)
+                    .cloned()
+                    .ok_or_else(|| {
+                        DataFusionError::Internal("Missing written partition".to_owned())
+                    })?;
+                parquet_to_datafile_with_partition(
+                    &location,
+                    size,
+                    &file,
+                    schema,
+                    &partition_fields,
+                    equality_ids,
+                    &metadata.properties,
+                    &values,
+                )
+            };
+            datafiles.push(datafile.map_err(DataFusionIcebergError::from)?);
+        }
+        Ok::<_, DataFusionError>(datafiles)
     }
-    Ok(datafiles)
+    .await;
+    if datafiles_result.is_err() {
+        cleanup_failed_write_files(&object_store, &partition_values_by_path).await;
+    }
+    datafiles_result
 }
 
 type PartitionValuesByPath = Arc<RwLock<HashMap<Path, Vec<Option<Value>>>>>;
@@ -2613,7 +2617,6 @@ pub(crate) fn start_demuxer_task(
     metadata: &TableMetadata,
     data: SendableRecordBatchStream,
     context: &Arc<TaskContext>,
-    track_generated_paths: bool,
 ) -> Result<DemuxerTask, DataFusionError> {
     let (tx, rx) = mpsc::unbounded_channel();
     let partition_values_by_path = Arc::new(RwLock::new(HashMap::new()));
@@ -2625,8 +2628,8 @@ pub(crate) fn start_demuxer_task(
     let task = if partition_spec.fields().is_empty() {
         SpawnedTask::spawn({
             let location = metadata.location.clone();
-            let paths = track_generated_paths.then(|| Arc::clone(&partition_values_by_path));
-            async move { row_count_demuxer(tx, data, context, &location, paths.as_ref()).await }
+            let paths = Arc::clone(&partition_values_by_path);
+            async move { row_count_demuxer(tx, data, context, &location, &paths).await }
         })
     } else {
         // There could be an arbitrarily large number of parallel hive style partitions being written to, so we cannot
@@ -2686,10 +2689,14 @@ async fn partitions_demuxer(
             let (partition_values, batch) = result?;
 
             if let Some(sender) = senders.get_mut(&partition_values) {
-                sender.send(batch).await.unwrap();
+                sender.send(batch).await.map_err(|_| {
+                    DataFusionError::Execution("Error sending RecordBatch to file stream!".into())
+                })?;
             } else {
                 let (sender, reciever) = mpsc::channel(1);
-                sender.send(batch).await.unwrap();
+                sender.send(batch).await.map_err(|_| {
+                    DataFusionError::Execution("Error sending RecordBatch to file stream!".into())
+                })?;
                 senders.push(partition_values.clone(), sender);
                 let partition_path = if table_properties
                     .get(WRITE_OBJECT_STORAGE_ENABLED)
@@ -2733,7 +2740,7 @@ async fn row_count_demuxer(
     mut data: std::pin::Pin<Box<dyn RecordBatchStream + Send + 'static>>,
     context: Arc<TaskContext>,
     table_location: &str,
-    paths_by_partition: Option<&PartitionValuesByPath>,
+    paths_by_partition: &PartitionValuesByPath,
 ) -> Result<(), DataFusionError> {
     let exec_options = &context.session_config().options().execution;
 
@@ -2778,15 +2785,13 @@ async fn row_count_demuxer(
 fn create_new_file_stream(
     data_location: &str,
     tx: &mut mpsc::UnboundedSender<(Path, mpsc::Receiver<RecordBatch>)>,
-    paths_by_partition: Option<&PartitionValuesByPath>,
+    paths_by_partition: &PartitionValuesByPath,
 ) -> Result<mpsc::Sender<RecordBatch>, DataFusionError> {
     let file_path: Path = generate_file_path(data_location, None).into();
-    if let Some(paths_by_partition) = paths_by_partition {
-        paths_by_partition
-            .write()
-            .map_err(|_| DataFusionError::Internal("Partition map lock poisoned".to_owned()))?
-            .insert(file_path.clone(), Vec::new());
-    }
+    paths_by_partition
+        .write()
+        .map_err(|_| DataFusionError::Internal("Partition map lock poisoned".to_owned()))?
+        .insert(file_path.clone(), Vec::new());
     let (tx_file, rx_file) = mpsc::channel(1);
     tx.send((file_path, rx_file)).map_err(|_| {
         DataFusionError::Execution("Error sending RecordBatch to file stream!".into())
@@ -2924,10 +2929,10 @@ mod tests {
         },
         execution::object_store::ObjectStoreUrl,
         physical_plan::stream::RecordBatchStreamAdapter,
-        prelude::SessionContext,
+        prelude::{SessionConfig, SessionContext},
         scalar::ScalarValue,
     };
-    use futures::{stream, TryStreamExt};
+    use futures::{stream, StreamExt, TryStreamExt};
     use iceberg_rust::{
         catalog::tabular::Tabular,
         object_store::ObjectStoreBuilder,
@@ -3072,6 +3077,120 @@ mod tests {
                 .iter()
                 .all(|object| !object.location.as_ref().contains("/data/")),
             "uncommitted data files remain: {objects:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn late_input_error_cleans_previously_written_data_file_without_limits() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let store = ObjectStoreBuilder::memory();
+        let catalog: Arc<dyn Catalog> = Arc::new(
+            SqlCatalog::new("sqlite://", "test", store)
+                .await
+                .expect("catalog"),
+        );
+        let schema = Schema::builder()
+            .with_struct_field(StructField::new(
+                1,
+                "label",
+                false,
+                Type::Primitive(PrimitiveType::String),
+                None,
+            ))
+            .build()
+            .expect("schema");
+        let table = Table::builder()
+            .with_name("late_input_error")
+            .with_location("memory:///test/late_input_error")
+            .with_schema(schema)
+            .build(&["test".to_owned()], catalog)
+            .await
+            .expect("table");
+        let batch_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "label",
+            DataType::Utf8,
+            true,
+        )]));
+        let batches = ["first", "second"]
+            .into_iter()
+            .map(|value| {
+                RecordBatch::try_new(
+                    Arc::clone(&batch_schema),
+                    vec![Arc::new(StringArray::from(vec![value]))],
+                )
+                .expect("batch")
+            })
+            .collect::<Vec<_>>();
+        let object_store = table.object_store();
+        let first_file_observed = Arc::new(AtomicBool::new(false));
+        let input_stream = stream::iter(vec![
+            Ok(batches[0].clone()),
+            Ok(batches[1].clone()),
+            Err(datafusion::common::DataFusionError::Execution(
+                "injected late input error".to_owned(),
+            )),
+        ])
+        .enumerate()
+        .then({
+            let observed = Arc::clone(&first_file_observed);
+            move |(index, batch)| {
+                let store = Arc::clone(&object_store);
+                let observed = Arc::clone(&observed);
+                async move {
+                    if index == 2 {
+                        for _ in 0..500 {
+                            let files = store.list(None).try_collect::<Vec<_>>().await.map_err(
+                                |error| {
+                                    datafusion::common::DataFusionError::ObjectStore(Box::new(
+                                        error,
+                                    ))
+                                },
+                            )?;
+                            if files
+                                .iter()
+                                .any(|file| file.location.as_ref().contains("/data/"))
+                            {
+                                observed.store(true, Ordering::SeqCst);
+                                break;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        }
+                        if !observed.load(Ordering::SeqCst) {
+                            return Err(datafusion::common::DataFusionError::Execution(
+                                "first data file was not materialized before late error".to_owned(),
+                            ));
+                        }
+                    }
+                    batch
+                }
+            }
+        });
+        let input: super::SendableRecordBatchStream =
+            Box::pin(RecordBatchStreamAdapter::new(batch_schema, input_stream));
+        let config = SessionConfig::new()
+            .set_str("datafusion.execution.minimum_parallel_output_files", "1")
+            .set_str("datafusion.execution.soft_max_rows_per_output_file", "1");
+        let context = SessionContext::new_with_config(config).task_ctx();
+        let error = super::write_parquet_data_files(&table, input, &context, None)
+            .await
+            .expect_err("late input error");
+        assert!(
+            error.to_string().contains("injected late input error"),
+            "{error}"
+        );
+        assert!(first_file_observed.load(Ordering::SeqCst));
+        let remaining = table
+            .object_store()
+            .list(None)
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("list objects");
+        assert!(
+            remaining
+                .iter()
+                .all(|file| !file.location.as_ref().contains("/data/")),
+            "uncommitted data files remain: {remaining:?}"
         );
     }
 
