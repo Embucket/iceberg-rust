@@ -3530,6 +3530,7 @@ dependencies = [
  "datafusion",
  "datafusion_iceberg",
  "futures",
+ "futures-timer",
  "iceberg-rust",
  "object_store",
  "serde_json",
