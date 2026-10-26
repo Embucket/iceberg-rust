@@ -46,6 +46,13 @@ pub struct SqlCatalog {
     cache: Arc<RwLock<HashMap<Identifier, (String, TabularMetadata)>>>,
 }
 
+#[derive(Clone, Copy)]
+enum NamespaceState {
+    Current,
+    Legacy,
+    Missing,
+}
+
 pub mod error;
 
 /// How a catalog connects to its database.
@@ -139,6 +146,129 @@ impl SqlCatalog {
             object_store: self.object_store.clone(),
         })
     }
+
+    fn sql_with_binds(&self, postgres: &'static str, sqlite_mysql: &'static str) -> &'static str {
+        match self.pool.connect_options().database_url.scheme() {
+            "postgres" | "postgresql" => postgres,
+            _ => sqlite_mysql,
+        }
+    }
+
+    async fn insert_tabular_reference(
+        &self,
+        identifier: &Identifier,
+        metadata_location: &str,
+    ) -> Result<(), IcebergError> {
+        let namespace = identifier.namespace().to_string();
+        sqlx::query(self.sql_with_binds(
+            "insert into iceberg_tables (catalog_name, table_namespace, table_name, metadata_location) values ($1, $2, $3, $4)",
+            "insert into iceberg_tables (catalog_name, table_namespace, table_name, metadata_location) values (?, ?, ?, ?)",
+        ))
+        .bind(&self.name)
+        .bind(&namespace)
+        .bind(identifier.name())
+        .bind(metadata_location)
+        .execute(&self.pool)
+        .await
+        .map_err(Error::from)?;
+        Ok(())
+    }
+
+    async fn delete_tabular_reference(&self, identifier: &Identifier) -> Result<(), IcebergError> {
+        let namespace = identifier.namespace().to_string();
+        sqlx::query(self.sql_with_binds(
+            "delete from iceberg_tables where catalog_name = $1 and table_namespace = $2 and table_name = $3",
+            "delete from iceberg_tables where catalog_name = ? and table_namespace = ? and table_name = ?",
+        ))
+        .bind(&self.name)
+        .bind(&namespace)
+        .bind(identifier.name())
+        .execute(&self.pool)
+        .await
+        .map_err(Error::from)?;
+        Ok(())
+    }
+
+    async fn lock_namespace_for_mutation(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Any>,
+        namespace: &str,
+    ) -> Result<NamespaceState, IcebergError> {
+        let is_sqlite = self.pool.connect_options().database_url.scheme() == "sqlite";
+        if is_sqlite {
+            // SQLite has no SELECT FOR UPDATE; a write statement takes the writer lock.
+            sqlx::query("update iceberg_namespaces set namespace = namespace where 1 = 0")
+                .execute(&mut **transaction)
+                .await
+                .map_err(Error::from)?;
+        }
+        let row_probe_sql = self.sql_with_binds(
+            "select 1 from iceberg_namespaces where catalog_name = $1 and namespace = $2",
+            "select 1 from iceberg_namespaces where catalog_name = ? and namespace = ?",
+        );
+        let row_sql = if is_sqlite {
+            "select 1 from iceberg_namespaces where catalog_name = ? and namespace = ?"
+        } else {
+            self.sql_with_binds(
+                "select 1 from iceberg_namespaces where catalog_name = $1 and namespace = $2 for update",
+                "select 1 from iceberg_namespaces where catalog_name = ? and namespace = ? for update",
+            )
+        };
+        let property_sql = if is_sqlite {
+            "select 1 from iceberg_namespace_properties where catalog_name = ? and namespace = ? order by property_key limit 1"
+        } else {
+            self.sql_with_binds(
+                "select 1 from iceberg_namespace_properties where catalog_name = $1 and namespace = $2 order by property_key limit 1 for update",
+                "select 1 from iceberg_namespace_properties where catalog_name = ? and namespace = ? order by property_key limit 1 for update",
+            )
+        };
+
+        // Probe without a locking read: MySQL can otherwise gap-lock a missing
+        // identity row and deadlock two writers promoting the same legacy row.
+        let row = sqlx::query(row_probe_sql)
+            .bind(&self.name)
+            .bind(namespace)
+            .fetch_optional(&mut **transaction)
+            .await
+            .map_err(Error::from)?;
+        if row.is_some() {
+            let locked = sqlx::query(row_sql)
+                .bind(&self.name)
+                .bind(namespace)
+                .fetch_optional(&mut **transaction)
+                .await
+                .map_err(Error::from)?;
+            if locked.is_some() {
+                return Ok(NamespaceState::Current);
+            }
+        }
+        let property = sqlx::query(property_sql)
+            .bind(&self.name)
+            .bind(namespace)
+            .fetch_optional(&mut **transaction)
+            .await
+            .map_err(Error::from)?;
+        if property.is_none() {
+            // A concurrent legacy promotion may have removed the last property
+            // while this locking read waited. Recheck its new identity row.
+            let row = sqlx::query(row_sql)
+                .bind(&self.name)
+                .bind(namespace)
+                .fetch_optional(&mut **transaction)
+                .await
+                .map_err(Error::from)?;
+            return Ok(if row.is_some() {
+                NamespaceState::Current
+            } else {
+                NamespaceState::Missing
+            });
+        }
+        // The property row serializes promoters of this namespace. A locking
+        // read of a missing identity row would gap-lock unrelated namespaces
+        // on MySQL's default REPEATABLE READ isolation level.
+        Ok(NamespaceState::Legacy)
+    }
+
     fn default_object_store(&self, bucket: Bucket) -> Arc<dyn object_store::ObjectStore> {
         Arc::new(self.object_store.build(bucket).unwrap())
     }
@@ -158,11 +288,20 @@ impl SqlCatalog {
         previous_metadata_location: &str,
         metadata_location: &str,
     ) -> Result<(), IcebergError> {
-        let catalog_name = &self.name;
         let namespace = identifier.namespace().to_string();
-        let name = identifier.name();
-
-        let result = sqlx::query(&format!("update iceberg_tables set metadata_location = '{metadata_location}', previous_metadata_location = '{previous_metadata_location}' where catalog_name = '{catalog_name}' and table_namespace = '{namespace}' and table_name = '{name}' and metadata_location = '{previous_metadata_location}';")).execute(&self.pool).await.map_err(Error::from)?;
+        let result = sqlx::query(self.sql_with_binds(
+            "update iceberg_tables set metadata_location = $1, previous_metadata_location = $2 where catalog_name = $3 and table_namespace = $4 and table_name = $5 and metadata_location = $6",
+            "update iceberg_tables set metadata_location = ?, previous_metadata_location = ? where catalog_name = ? and table_namespace = ? and table_name = ? and metadata_location = ?",
+        ))
+        .bind(metadata_location)
+        .bind(previous_metadata_location)
+        .bind(&self.name)
+        .bind(&namespace)
+        .bind(identifier.name())
+        .bind(previous_metadata_location)
+        .execute(&self.pool)
+        .await
+        .map_err(Error::from)?;
 
         if result.rows_affected() == 0 {
             self.cache.write().unwrap().remove(identifier);
@@ -224,6 +363,16 @@ fn pool_options_with_setup(
                             );",
                 )
                 .await?;
+            connection
+                .execute(
+                    "create table if not exists iceberg_namespaces (
+                                catalog_name varchar(255) not null,
+                                namespace varchar(255) not null,
+                                legacy_marker varchar(1) not null default '0',
+                                primary key (catalog_name, namespace)
+                            );",
+                )
+                .await?;
             for statement in session_statements.iter() {
                 connection.execute(statement.as_str()).await?;
             }
@@ -259,6 +408,34 @@ fn query_map(row: &AnyRow) -> Result<TableRef, sqlx::Error> {
     })
 }
 
+fn namespace_insert_error(namespace: &str, error: sqlx::Error) -> IcebergError {
+    if matches!(&error, sqlx::Error::Database(database) if database.is_unique_violation()) {
+        IcebergError::CommitConflict(namespace.to_owned())
+    } else {
+        Error::from(error).into()
+    }
+}
+
+fn retryable_namespace_deadlock(error: &IcebergError) -> bool {
+    let IcebergError::External(source) = error else {
+        return false;
+    };
+    let Some(Error::SqlError(sqlx::Error::Database(database))) = source.downcast_ref::<Error>()
+    else {
+        return false;
+    };
+    matches!(database.code().as_deref(), Some("40001" | "40P01"))
+}
+
+async fn backoff_namespace_deadlock(retries: &mut u64, error: &IcebergError) -> bool {
+    if *retries >= 3 || !retryable_namespace_deadlock(error) {
+        return false;
+    }
+    *retries += 1;
+    futures_timer::Delay::new(std::time::Duration::from_millis(10 * *retries)).await;
+    true
+}
+
 #[async_trait]
 impl Catalog for SqlCatalog {
     /// Catalog name
@@ -271,57 +448,103 @@ impl Catalog for SqlCatalog {
         namespace: &Namespace,
         properties: Option<HashMap<String, String>>,
     ) -> Result<HashMap<String, String>, IcebergError> {
-        let catalog_name = self.name.clone();
         let namespace_str = namespace.to_string();
         let properties = properties.unwrap_or_default();
 
-        // Insert namespace properties into the database
-        for (key, value) in &properties {
-            sqlx::query(&format!(
-                "insert into iceberg_namespace_properties (catalog_name, namespace, property_key, property_value) values ('{catalog_name}', '{namespace_str}', '{key}', '{value}');"
-            ))
-            .execute(&self.pool)
-            .await
-            .map_err(Error::from)?;
+        // Older catalogs recorded only properties. The precheck retains their
+        // identity; the namespace row enforces uniqueness for new writers.
+        if self.namespace_exists(namespace).await? {
+            return Err(IcebergError::CommitConflict(namespace_str));
         }
 
-        // If no properties were provided, still create an entry to mark the namespace as existing
-        if properties.is_empty() {
-            sqlx::query(&format!(
-                "insert into iceberg_namespace_properties (catalog_name, namespace, property_key, property_value) values ('{catalog_name}', '{namespace_str}', 'exists', 'true');"
-            ))
-            .execute(&self.pool)
-            .await
-            .map_err(Error::from)?;
+        let mut transaction = self.pool.begin().await.map_err(Error::from)?;
+        sqlx::query(self.sql_with_binds(
+            "insert into iceberg_namespaces (catalog_name, namespace) values ($1, $2)",
+            "insert into iceberg_namespaces (catalog_name, namespace) values (?, ?)",
+        ))
+        .bind(&self.name)
+        .bind(&namespace_str)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| namespace_insert_error(&namespace_str, error))?;
+
+        // Insert namespace properties into the database
+        let insert_property = self.sql_with_binds(
+            "insert into iceberg_namespace_properties (catalog_name, namespace, property_key, property_value) values ($1, $2, $3, $4)",
+            "insert into iceberg_namespace_properties (catalog_name, namespace, property_key, property_value) values (?, ?, ?, ?)",
+        );
+        for (key, value) in &properties {
+            sqlx::query(insert_property)
+                .bind(&self.name)
+                .bind(&namespace_str)
+                .bind(key)
+                .bind(value)
+                .execute(&mut *transaction)
+                .await
+                .map_err(Error::from)?;
         }
+
+        transaction.commit().await.map_err(Error::from)?;
 
         Ok(properties)
     }
     /// Drop a namespace in the catalog
     async fn drop_namespace(&self, namespace: &Namespace) -> Result<(), IcebergError> {
-        let catalog_name = self.name.clone();
         let namespace_str = namespace.to_string();
-
-        sqlx::query(&format!(
-            "delete from iceberg_namespace_properties where catalog_name = '{catalog_name}' and namespace = '{namespace_str}';"
-        ))
-        .execute(&self.pool)
-        .await
-        .map_err(Error::from)?;
-
-        Ok(())
+        let mut retries = 0;
+        loop {
+            let result = async {
+                let mut transaction = self.pool.begin().await.map_err(Error::from)?;
+                if matches!(
+                    self.lock_namespace_for_mutation(&mut transaction, &namespace_str)
+                        .await?,
+                    NamespaceState::Missing
+                ) {
+                    return Ok(());
+                }
+                sqlx::query(self.sql_with_binds(
+                    "delete from iceberg_namespace_properties where catalog_name = $1 and namespace = $2",
+                    "delete from iceberg_namespace_properties where catalog_name = ? and namespace = ?",
+                ))
+                .bind(&self.name)
+                .bind(&namespace_str)
+                .execute(&mut *transaction)
+                .await
+                .map_err(Error::from)?;
+                sqlx::query(self.sql_with_binds(
+                    "delete from iceberg_namespaces where catalog_name = $1 and namespace = $2",
+                    "delete from iceberg_namespaces where catalog_name = ? and namespace = ?",
+                ))
+                .bind(&self.name)
+                .bind(&namespace_str)
+                .execute(&mut *transaction)
+                .await
+                .map_err(Error::from)?;
+                transaction.commit().await.map_err(Error::from)?;
+                Ok(())
+            }
+            .await;
+            if let Err(error) = &result {
+                if backoff_namespace_deadlock(&mut retries, error).await {
+                    continue;
+                }
+            }
+            return result;
+        }
     }
     /// Load the namespace properties from the catalog
     async fn load_namespace(
         &self,
         namespace: &Namespace,
     ) -> Result<HashMap<String, String>, IcebergError> {
-        let catalog_name = self.name.clone();
         let namespace_str = namespace.to_string();
 
-        let rows = sqlx::query(&format!(
-            "select property_key, property_value from iceberg_namespace_properties where catalog_name = '{catalog_name}' and namespace = '{namespace_str}';"
+        let rows = sqlx::query(self.sql_with_binds(
+            "select p.property_key, p.property_value, n.legacy_marker from iceberg_namespace_properties p left join iceberg_namespaces n on n.catalog_name = p.catalog_name and n.namespace = p.namespace where p.catalog_name = $1 and p.namespace = $2",
+            "select p.property_key, p.property_value, n.legacy_marker from iceberg_namespace_properties p left join iceberg_namespaces n on n.catalog_name = p.catalog_name and n.namespace = p.namespace where p.catalog_name = ? and p.namespace = ?",
         ))
+        .bind(&self.name)
+        .bind(&namespace_str)
         .fetch_all(&self.pool)
         .await
         .map_err(Error::from)?;
@@ -329,9 +552,9 @@ impl Catalog for SqlCatalog {
         let mut properties = HashMap::new();
         for row in &rows {
             let key: String = row.try_get(0).map_err(Error::from)?;
-            // Skip the synthetic "exists" marker that create_namespace inserts when
-            // no real properties were provided.
-            if key == "exists" {
+            let marker: Option<String> = row.try_get(2).map_err(Error::from)?;
+            // Older catalogs used this key as an internal existence marker.
+            if key == "exists" && marker.as_deref() != Some("0") {
                 continue;
             }
             let value: String = row.try_get(1).map_err(Error::from)?;
@@ -347,62 +570,152 @@ impl Catalog for SqlCatalog {
         updates: Option<HashMap<String, String>>,
         removals: Option<Vec<String>>,
     ) -> Result<(), IcebergError> {
-        let catalog_name = self.name.clone();
         let namespace_str = namespace.to_string();
-
-        if let Some(removals) = removals {
-            for key in removals {
-                sqlx::query(&format!(
-                    "delete from iceberg_namespace_properties where catalog_name = '{catalog_name}' and namespace = '{namespace_str}' and property_key = '{key}';"
+        let touches_exists = removals
+            .as_ref()
+            .is_some_and(|keys| keys.iter().any(|key| key == "exists"))
+            || updates
+                .as_ref()
+                .is_some_and(|keys| keys.contains_key("exists"));
+        let mut retries = 0;
+        loop {
+            let result: Result<(), IcebergError> = async {
+                let mut transaction = self.pool.begin().await.map_err(Error::from)?;
+                let delete_property = self.sql_with_binds(
+                    "delete from iceberg_namespace_properties where catalog_name = $1 and namespace = $2 and property_key = $3",
+                    "delete from iceberg_namespace_properties where catalog_name = ? and namespace = ? and property_key = ?",
+                );
+        match self
+            .lock_namespace_for_mutation(&mut transaction, &namespace_str)
+            .await?
+        {
+            NamespaceState::Current => {}
+            NamespaceState::Legacy => {
+                let legacy_marker = sqlx::query_scalar::<_, String>(self.sql_with_binds(
+                    "select property_key from iceberg_namespace_properties where catalog_name = $1 and namespace = $2 and property_key = $3",
+                    "select property_key from iceberg_namespace_properties where catalog_name = ? and namespace = ? and property_key = ?",
                 ))
-                .execute(&self.pool)
+                .bind(&self.name)
+                .bind(&namespace_str)
+                .bind("exists")
+                .fetch_optional(&mut *transaction)
                 .await
                 .map_err(Error::from)?;
+                let marker = if legacy_marker.as_deref() == Some("exists") {
+                    "1"
+                } else {
+                    "0"
+                };
+                let insert_identity = match self.pool.connect_options().database_url.scheme() {
+                    "postgres" | "postgresql" => "insert into iceberg_namespaces (catalog_name, namespace, legacy_marker) values ($1, $2, $3) on conflict (catalog_name, namespace) do nothing",
+                    "sqlite" => "insert into iceberg_namespaces (catalog_name, namespace, legacy_marker) values (?, ?, ?) on conflict (catalog_name, namespace) do nothing",
+                    _ => "insert into iceberg_namespaces (catalog_name, namespace, legacy_marker) values (?, ?, ?) on duplicate key update namespace = namespace",
+                };
+                sqlx::query(insert_identity)
+                    .bind(&self.name)
+                    .bind(&namespace_str)
+                    .bind(marker)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(Error::from)?;
+            }
+            NamespaceState::Missing => return Err(IcebergError::CatalogNotFound),
+        }
+
+        if let Some(removals) = removals.as_ref() {
+            for key in removals {
+                sqlx::query(delete_property)
+                    .bind(&self.name)
+                    .bind(&namespace_str)
+                    .bind(key)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(Error::from)?;
             }
         }
 
-        if let Some(updates) = updates {
+        if let Some(updates) = updates.as_ref() {
+            let insert_property = self.sql_with_binds(
+                "insert into iceberg_namespace_properties (catalog_name, namespace, property_key, property_value) values ($1, $2, $3, $4)",
+                "insert into iceberg_namespace_properties (catalog_name, namespace, property_key, property_value) values (?, ?, ?, ?)",
+            );
             for (key, value) in updates {
                 // Delete-then-insert keeps this portable across sqlite/postgres/mysql
                 // (sqlx::any doesn't expose dialect-specific upsert syntax uniformly).
-                sqlx::query(&format!(
-                    "delete from iceberg_namespace_properties where catalog_name = '{catalog_name}' and namespace = '{namespace_str}' and property_key = '{key}';"
-                ))
-                .execute(&self.pool)
-                .await
-                .map_err(Error::from)?;
+                sqlx::query(delete_property)
+                    .bind(&self.name)
+                    .bind(&namespace_str)
+                    .bind(key)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(Error::from)?;
 
-                sqlx::query(&format!(
-                    "insert into iceberg_namespace_properties (catalog_name, namespace, property_key, property_value) values ('{catalog_name}', '{namespace_str}', '{key}', '{value}');"
-                ))
-                .execute(&self.pool)
-                .await
-                .map_err(Error::from)?;
+                sqlx::query(insert_property)
+                    .bind(&self.name)
+                    .bind(&namespace_str)
+                    .bind(key)
+                    .bind(value)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(Error::from)?;
             }
         }
 
-        Ok(())
+        if touches_exists {
+            sqlx::query(self.sql_with_binds(
+                "update iceberg_namespaces set legacy_marker = '0' where catalog_name = $1 and namespace = $2",
+                "update iceberg_namespaces set legacy_marker = '0' where catalog_name = ? and namespace = ?",
+            ))
+            .bind(&self.name)
+            .bind(&namespace_str)
+            .execute(&mut *transaction)
+            .await
+            .map_err(Error::from)?;
+        }
+
+        transaction.commit().await.map_err(Error::from)?;
+                Ok(())
+            }
+            .await;
+            if let Err(error) = &result {
+                if backoff_namespace_deadlock(&mut retries, error).await {
+                    continue;
+                }
+            }
+            return result;
+        }
     }
     /// Check if a namespace exists
     async fn namespace_exists(&self, namespace: &Namespace) -> Result<bool, IcebergError> {
-        let catalog_name = self.name.clone();
         let namespace_str = namespace.to_string();
 
-        let rows = sqlx::query(&format!(
-            "select 1 from iceberg_namespace_properties where catalog_name = '{catalog_name}' and namespace = '{namespace_str}' limit 1;"
+        let row = sqlx::query(self.sql_with_binds(
+            "select 1 where exists (select 1 from iceberg_namespaces where catalog_name = $1 and namespace = $2) or exists (select 1 from iceberg_namespace_properties where catalog_name = $3 and namespace = $4)",
+            "select 1 where exists (select 1 from iceberg_namespaces where catalog_name = ? and namespace = ?) or exists (select 1 from iceberg_namespace_properties where catalog_name = ? and namespace = ?)",
         ))
-        .fetch_all(&self.pool)
+        .bind(&self.name)
+        .bind(&namespace_str)
+        .bind(&self.name)
+        .bind(&namespace_str)
+        .fetch_optional(&self.pool)
         .await
         .map_err(Error::from)?;
 
-        Ok(!rows.is_empty())
+        Ok(row.is_some())
     }
     async fn list_tabulars(&self, namespace: &Namespace) -> Result<Vec<Identifier>, IcebergError> {
-        let name = self.name.clone();
         let namespace = namespace.to_string();
 
         let rows = {
-            sqlx::query(&format!("select table_namespace, table_name, metadata_location, previous_metadata_location from iceberg_tables where catalog_name = '{}' and table_namespace = '{}';",&name, &namespace)).fetch_all(&self.pool).await.map_err(Error::from)?
+            sqlx::query(self.sql_with_binds(
+                "select table_namespace, table_name, metadata_location, previous_metadata_location from iceberg_tables where catalog_name = $1 and table_namespace = $2",
+                "select table_namespace, table_name, metadata_location, previous_metadata_location from iceberg_tables where catalog_name = ? and table_namespace = ?",
+            ))
+            .bind(&self.name)
+            .bind(&namespace)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(Error::from)?
         };
         let iter = rows.iter().map(query_map);
 
@@ -417,12 +730,13 @@ impl Catalog for SqlCatalog {
             .map_err(Error::from)?)
     }
     async fn list_namespaces(&self, _parent: Option<&str>) -> Result<Vec<Namespace>, IcebergError> {
-        let name = self.name.clone();
-
         let rows = {
-            sqlx::query(&format!(
-                "select distinct namespace from iceberg_namespace_properties where catalog_name = '{name}';",
+            sqlx::query(self.sql_with_binds(
+                "select namespace from iceberg_namespaces where catalog_name = $1 union select namespace from iceberg_namespace_properties where catalog_name = $2",
+                "select namespace from iceberg_namespaces where catalog_name = ? union select namespace from iceberg_namespace_properties where catalog_name = ?",
             ))
+            .bind(&self.name)
+            .bind(&self.name)
             .fetch_all(&self.pool)
             .await
             .map_err(Error::from)?
@@ -440,63 +754,46 @@ impl Catalog for SqlCatalog {
             .map_err(Error::from)?)
     }
     async fn tabular_exists(&self, identifier: &Identifier) -> Result<bool, IcebergError> {
-        let catalog_name = self.name.clone();
         let namespace = identifier.namespace().to_string();
-        let name = identifier.name().to_string();
-
-        let rows = {
-            sqlx::query(&format!("select table_namespace, table_name, metadata_location, previous_metadata_location from iceberg_tables where catalog_name = '{}' and table_namespace = '{}' and table_name = '{}';",&catalog_name,
-                &namespace,
-                &name)).fetch_all(&self.pool).await.map_err(Error::from)?
-        };
+        let rows = sqlx::query(self.sql_with_binds(
+            "select table_namespace, table_name, metadata_location, previous_metadata_location from iceberg_tables where catalog_name = $1 and table_namespace = $2 and table_name = $3",
+            "select table_namespace, table_name, metadata_location, previous_metadata_location from iceberg_tables where catalog_name = ? and table_namespace = ? and table_name = ?",
+        ))
+        .bind(&self.name)
+        .bind(&namespace)
+        .bind(identifier.name())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(Error::from)?;
         let mut iter = rows.iter().map(query_map);
 
         Ok(iter.next().is_some())
     }
     async fn drop_table(&self, identifier: &Identifier) -> Result<(), IcebergError> {
-        let catalog_name = self.name.clone();
-        let namespace = identifier.namespace().to_string();
-        let name = identifier.name().to_string();
-
-        sqlx::query(&format!("delete from iceberg_tables where catalog_name = '{}' and table_namespace = '{}' and table_name = '{}';",&catalog_name,
-                &namespace,
-                &name)).execute(&self.pool).await.map_err(Error::from)?;
-        Ok(())
+        self.delete_tabular_reference(identifier).await
     }
     async fn drop_view(&self, identifier: &Identifier) -> Result<(), IcebergError> {
-        let catalog_name = self.name.clone();
-        let namespace = identifier.namespace().to_string();
-        let name = identifier.name().to_string();
-
-        sqlx::query(&format!("delete from iceberg_tables where catalog_name = '{}' and table_namespace = '{}' and table_name = '{}';",&catalog_name,
-                &namespace,
-                &name)).execute(&self.pool).await.map_err(Error::from)?;
-        Ok(())
+        self.delete_tabular_reference(identifier).await
     }
     async fn drop_materialized_view(&self, identifier: &Identifier) -> Result<(), IcebergError> {
-        let catalog_name = self.name.clone();
-        let namespace = identifier.namespace().to_string();
-        let name = identifier.name().to_string();
-
-        sqlx::query(&format!("delete from iceberg_tables where catalog_name = '{}' and table_namespace = '{}' and table_name = '{}';",&catalog_name,
-                &namespace,
-                &name)).execute(&self.pool).await.map_err(Error::from)?;
-        Ok(())
+        self.delete_tabular_reference(identifier).await
     }
     async fn load_tabular(
         self: Arc<Self>,
         identifier: &Identifier,
     ) -> Result<Tabular, IcebergError> {
         let path = {
-            let catalog_name = self.name.clone();
             let namespace = identifier.namespace().to_string();
-            let name = identifier.name().to_string();
-
-            let row = {
-                sqlx::query(&format!("select table_namespace, table_name, metadata_location, previous_metadata_location from iceberg_tables where catalog_name = '{}' and table_namespace = '{}' and table_name = '{}';",&catalog_name,
-                    &namespace,
-                    &name)).fetch_one(&self.pool).await.map_err(|_| IcebergError::CatalogNotFound)?
-            };
+            let row = sqlx::query(self.sql_with_binds(
+                "select table_namespace, table_name, metadata_location, previous_metadata_location from iceberg_tables where catalog_name = $1 and table_namespace = $2 and table_name = $3",
+                "select table_namespace, table_name, metadata_location, previous_metadata_location from iceberg_tables where catalog_name = ? and table_namespace = ? and table_name = ?",
+            ))
+            .bind(&self.name)
+            .bind(&namespace)
+            .bind(identifier.name())
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|_| IcebergError::CatalogNotFound)?;
             let row = query_map(&row).map_err(Error::from)?;
 
             row.metadata_location
@@ -553,14 +850,8 @@ impl Catalog for SqlCatalog {
             .await?;
 
         object_store.put_version_hint(&metadata_location).await.ok();
-        {
-            let catalog_name = self.name.clone();
-            let namespace = identifier.namespace().to_string();
-            let name = identifier.name().to_string();
-            let metadata_location = metadata_location.to_string();
-
-            sqlx::query(&format!("insert into iceberg_tables (catalog_name, table_namespace, table_name, metadata_location) values ('{catalog_name}', '{namespace}', '{name}', '{metadata_location}');")).execute(&self.pool).await.map_err(Error::from)?;
-        }
+        self.insert_tabular_reference(&identifier, &metadata_location)
+            .await?;
         self.cache.write().unwrap().insert(
             identifier.clone(),
             (metadata_location.clone(), metadata.clone().into()),
@@ -593,14 +884,8 @@ impl Catalog for SqlCatalog {
             .await?;
 
         object_store.put_version_hint(&metadata_location).await.ok();
-        {
-            let catalog_name = self.name.clone();
-            let namespace = identifier.namespace().to_string();
-            let name = identifier.name().to_string();
-            let metadata_location = metadata_location.to_string();
-
-            sqlx::query(&format!("insert into iceberg_tables (catalog_name, table_namespace, table_name, metadata_location) values ('{catalog_name}', '{namespace}', '{name}', '{metadata_location}');")).execute(&self.pool).await.map_err(Error::from)?;
-        }
+        self.insert_tabular_reference(&identifier, &metadata_location)
+            .await?;
         self.cache.write().unwrap().insert(
             identifier.clone(),
             (metadata_location.clone(), metadata.clone().into()),
@@ -637,19 +922,28 @@ impl Catalog for SqlCatalog {
             .await?;
         {
             let mut transaction = self.pool.begin().await.map_err(Error::from)?;
-            let catalog_name = self.name.clone();
             let namespace = identifier.namespace().to_string();
-            let name = identifier.name().to_string();
-            let metadata_location = metadata_location.to_string();
-
-            sqlx::query(&format!("insert into iceberg_tables (catalog_name, table_namespace, table_name, metadata_location) values ('{catalog_name}', '{namespace}', '{name}', '{metadata_location}');")).execute(&mut *transaction).await.map_err(Error::from)?;
-
-            let table_catalog_name = self.name.clone();
             let table_namespace = table_identifier.namespace().to_string();
-            let table_name = table_identifier.name().to_string();
-            let table_metadata_location = table_metadata_location.to_string();
-
-            sqlx::query(&format!("insert into iceberg_tables (catalog_name, table_namespace, table_name, metadata_location) values ('{table_catalog_name}', '{table_namespace}', '{table_name}', '{table_metadata_location}');")).execute(&mut *transaction).await.map_err(Error::from)?;
+            let insert = self.sql_with_binds(
+                "insert into iceberg_tables (catalog_name, table_namespace, table_name, metadata_location) values ($1, $2, $3, $4)",
+                "insert into iceberg_tables (catalog_name, table_namespace, table_name, metadata_location) values (?, ?, ?, ?)",
+            );
+            sqlx::query(insert)
+                .bind(&self.name)
+                .bind(&namespace)
+                .bind(identifier.name())
+                .bind(&metadata_location)
+                .execute(&mut *transaction)
+                .await
+                .map_err(Error::from)?;
+            sqlx::query(insert)
+                .bind(&self.name)
+                .bind(&table_namespace)
+                .bind(table_identifier.name())
+                .bind(&table_metadata_location)
+                .execute(&mut *transaction)
+                .await
+                .map_err(Error::from)?;
 
             transaction.commit().await.map_err(Error::from)?;
         }
@@ -878,14 +1172,8 @@ impl Catalog for SqlCatalog {
                 .await?,
         )?;
 
-        {
-            let catalog_name = self.name.clone();
-            let namespace = identifier.namespace().to_string();
-            let name = identifier.name().to_string();
-            let metadata_location = metadata_location.to_string();
-
-            sqlx::query(&format!("insert into iceberg_tables (catalog_name, table_namespace, table_name, metadata_location) values ('{catalog_name}', '{namespace}', '{name}', '{metadata_location}');")).execute(&self.pool).await.map_err(Error::from)?;
-        }
+        self.insert_tabular_reference(&identifier, metadata_location)
+            .await?;
         self.cache.write().unwrap().insert(
             identifier.clone(),
             (metadata_location.to_string(), metadata.clone().into()),
@@ -996,13 +1284,731 @@ pub mod tests {
     };
     use object_store::ObjectStoreExt;
     use testcontainers::{core::ExecCommand, runners::AsyncRunner, ImageExt};
-    use testcontainers_modules::{localstack::LocalStack, postgres::Postgres};
-    use tokio::time::sleep;
+    use testcontainers_modules::{localstack::LocalStack, mysql::Mysql, postgres::Postgres};
+    use tokio::time::{sleep, timeout};
 
     use crate::{SqlCatalog, SqlCatalogOptions};
+    use iceberg_rust::error::Error as IcebergError;
     use iceberg_rust::object_store::store::version_hint_content;
     use sqlx::pool::PoolOptions;
-    use std::{sync::Arc, time::Duration};
+    use std::{collections::HashMap, sync::Arc, time::Duration};
+
+    #[tokio::test]
+    async fn duplicate_namespace_insert_reports_commit_conflict() {
+        let catalog = SqlCatalog::new("sqlite://", "warehouse", ObjectStoreBuilder::memory())
+            .await
+            .unwrap();
+
+        for (name, properties, duplicate_properties) in [
+            (
+                "empty",
+                None,
+                Some(HashMap::from([("owner".to_owned(), "second".to_owned())])),
+            ),
+            (
+                "with_properties",
+                Some(HashMap::from([("owner".to_owned(), "first".to_owned())])),
+                Some(HashMap::from([("region".to_owned(), "second".to_owned())])),
+            ),
+            (
+                "with_exists",
+                Some(HashMap::from([("exists".to_owned(), "user".to_owned())])),
+                Some(HashMap::from([("region".to_owned(), "second".to_owned())])),
+            ),
+        ] {
+            let namespace = Namespace::try_new(&[name.to_owned()]).unwrap();
+            catalog
+                .create_namespace(&namespace, properties.clone())
+                .await
+                .unwrap();
+            let error = catalog
+                .create_namespace(&namespace, duplicate_properties)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, IcebergError::CommitConflict(ref identifier) if identifier == name),
+                "expected typed namespace conflict, got {error:?}"
+            );
+            assert_eq!(
+                catalog.load_namespace(&namespace).await.unwrap(),
+                properties.clone().unwrap_or_default()
+            );
+            let namespace_count: i64 = sqlx::query_scalar(&format!(
+                "select count(*) from iceberg_namespaces where catalog_name = 'warehouse' and namespace = '{name}'"
+            ))
+            .fetch_one(&catalog.pool)
+            .await
+            .unwrap();
+            assert_eq!(namespace_count, 1);
+            catalog
+                .update_namespace(
+                    &namespace,
+                    Some(HashMap::from([("exists".to_owned(), "user".to_owned())])),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                catalog.load_namespace(&namespace).await.unwrap(),
+                properties
+                    .unwrap_or_default()
+                    .into_iter()
+                    .chain([("exists".to_owned(), "user".to_owned())])
+                    .collect()
+            );
+            catalog
+                .update_namespace(&namespace, None, Some(vec!["exists".to_owned()]))
+                .await
+                .unwrap();
+            assert!(catalog.namespace_exists(&namespace).await.unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn namespace_row_unique_violation_maps_to_commit_conflict() {
+        let catalog = SqlCatalog::new("sqlite://", "warehouse", ObjectStoreBuilder::memory())
+            .await
+            .unwrap();
+        let namespace = Namespace::try_new(&["duplicate".to_owned()]).unwrap();
+        catalog.create_namespace(&namespace, None).await.unwrap();
+        let sql_error = sqlx::query("insert into iceberg_namespaces (catalog_name, namespace) values ('warehouse', 'duplicate')")
+            .execute(&catalog.pool)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            super::namespace_insert_error("duplicate", sql_error),
+            IcebergError::CommitConflict(identifier) if identifier == "duplicate"
+        ));
+    }
+
+    #[tokio::test]
+    async fn duplicate_legacy_namespace_without_row_is_rejected() {
+        let catalog = SqlCatalog::new("sqlite://", "warehouse", ObjectStoreBuilder::memory())
+            .await
+            .unwrap();
+        sqlx::query("insert into iceberg_namespace_properties (catalog_name, namespace, property_key, property_value) values ('warehouse', 'legacy', 'owner', 'first')")
+            .execute(&catalog.pool)
+            .await
+            .unwrap();
+        sqlx::query("insert into iceberg_namespace_properties (catalog_name, namespace, property_key, property_value) values ('warehouse', 'legacy', 'exists', 'user')")
+            .execute(&catalog.pool)
+            .await
+            .unwrap();
+        let namespace = Namespace::try_new(&["legacy".to_owned()]).unwrap();
+        let error = catalog
+            .create_namespace(
+                &namespace,
+                Some(HashMap::from([("region".to_owned(), "second".to_owned())])),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, IcebergError::CommitConflict(_)));
+        assert_eq!(
+            catalog.load_namespace(&namespace).await.unwrap(),
+            HashMap::from([("owner".to_owned(), "first".to_owned())])
+        );
+        catalog
+            .update_namespace(&namespace, None, Some(vec!["exists".to_owned()]))
+            .await
+            .unwrap();
+        assert!(catalog.namespace_exists(&namespace).await.unwrap());
+        assert_eq!(
+            catalog.load_namespace(&namespace).await.unwrap(),
+            HashMap::from([("owner".to_owned(), "first".to_owned())])
+        );
+        catalog
+            .update_namespace(&namespace, None, Some(vec!["owner".to_owned()]))
+            .await
+            .unwrap();
+        assert!(catalog.namespace_exists(&namespace).await.unwrap());
+        assert!(catalog.load_namespace(&namespace).await.unwrap().is_empty());
+        let namespace_count: i64 = sqlx::query_scalar(
+            "select count(*) from iceberg_namespaces where catalog_name = 'warehouse' and namespace = 'legacy'",
+        )
+        .fetch_one(&catalog.pool)
+        .await
+        .unwrap();
+        assert_eq!(namespace_count, 1);
+    }
+
+    #[tokio::test]
+    async fn old_property_only_catalog_survives_last_property_removal() {
+        sqlx::any::install_default_drivers();
+        let url = "sqlite:file:legacy_namespace_upgrade?mode=memory&cache=shared";
+        let old_pool = sqlx::AnyPool::connect(url).await.unwrap();
+        sqlx::query("create table iceberg_namespace_properties (catalog_name varchar(255) not null, namespace varchar(255) not null, property_key varchar(255), property_value varchar(255), primary key (catalog_name, namespace, property_key))")
+            .execute(&old_pool)
+            .await
+            .unwrap();
+        sqlx::query("insert into iceberg_namespace_properties (catalog_name, namespace, property_key, property_value) values ('warehouse', 'legacy', 'owner', 'user')")
+            .execute(&old_pool)
+            .await
+            .unwrap();
+        sqlx::query("insert into iceberg_namespace_properties (catalog_name, namespace, property_key, property_value) values ('warehouse', 'empty_legacy', 'exists', 'true')")
+            .execute(&old_pool)
+            .await
+            .unwrap();
+
+        let catalog = SqlCatalog::new(url, "warehouse", ObjectStoreBuilder::memory())
+            .await
+            .unwrap();
+        let namespace = Namespace::try_new(&["legacy".to_owned()]).unwrap();
+        let empty_legacy = Namespace::try_new(&["empty_legacy".to_owned()]).unwrap();
+        assert!(catalog.namespace_exists(&namespace).await.unwrap());
+        assert!(catalog.namespace_exists(&empty_legacy).await.unwrap());
+        assert!(catalog
+            .load_namespace(&empty_legacy)
+            .await
+            .unwrap()
+            .is_empty());
+        catalog
+            .update_namespace(
+                &empty_legacy,
+                Some(HashMap::from([("owner".to_owned(), "new".to_owned())])),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            catalog.load_namespace(&empty_legacy).await.unwrap(),
+            HashMap::from([("owner".to_owned(), "new".to_owned())])
+        );
+        let marker_count: i64 = sqlx::query_scalar("select count(*) from iceberg_namespace_properties where catalog_name = 'warehouse' and namespace = 'empty_legacy' and property_key = 'exists'")
+            .fetch_one(&catalog.pool)
+            .await
+            .unwrap();
+        assert_eq!(marker_count, 1);
+        let marker_flag: String = sqlx::query_scalar("select legacy_marker from iceberg_namespaces where catalog_name = 'warehouse' and namespace = 'empty_legacy'")
+            .fetch_one(&catalog.pool)
+            .await
+            .unwrap();
+        assert_eq!(marker_flag, "1");
+        catalog
+            .update_namespace(
+                &empty_legacy,
+                Some(HashMap::from([("exists".to_owned(), "user".to_owned())])),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            catalog.load_namespace(&empty_legacy).await.unwrap(),
+            HashMap::from([
+                ("owner".to_owned(), "new".to_owned()),
+                ("exists".to_owned(), "user".to_owned()),
+            ])
+        );
+        catalog
+            .update_namespace(&namespace, None, Some(vec!["owner".to_owned()]))
+            .await
+            .unwrap();
+        assert!(catalog.namespace_exists(&namespace).await.unwrap());
+        assert!(catalog.load_namespace(&namespace).await.unwrap().is_empty());
+        assert_eq!(
+            catalog
+                .list_namespaces(None)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|name| name.to_string())
+                .collect::<Vec<_>>(),
+            ["empty_legacy", "legacy"]
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_user_exists_property_survives_unrelated_update() {
+        let catalog = SqlCatalog::new("sqlite://", "warehouse", ObjectStoreBuilder::memory())
+            .await
+            .unwrap();
+        let namespace = Namespace::try_new(&["legacy".to_owned()]).unwrap();
+        sqlx::query("insert into iceberg_namespace_properties (catalog_name, namespace, property_key, property_value) values ('warehouse', 'legacy', 'exists', 'user')")
+            .execute(&catalog.pool)
+            .await
+            .unwrap();
+
+        catalog
+            .update_namespace(
+                &namespace,
+                Some(HashMap::from([("owner".to_owned(), "new".to_owned())])),
+                None,
+            )
+            .await
+            .unwrap();
+        let value: String = sqlx::query_scalar("select property_value from iceberg_namespace_properties where catalog_name = 'warehouse' and namespace = 'legacy' and property_key = 'exists'")
+            .fetch_one(&catalog.pool)
+            .await
+            .unwrap();
+        assert_eq!(value, "user");
+        assert_eq!(
+            catalog.load_namespace(&namespace).await.unwrap(),
+            HashMap::from([("owner".to_owned(), "new".to_owned())])
+        );
+
+        catalog
+            .update_namespace(
+                &namespace,
+                Some(HashMap::from([("exists".to_owned(), "visible".to_owned())])),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            catalog.load_namespace(&namespace).await.unwrap()["exists"],
+            "visible"
+        );
+    }
+
+    #[tokio::test]
+    async fn namespace_values_are_bound_in_sql() {
+        let catalog = SqlCatalog::new("sqlite://", "warehouse", ObjectStoreBuilder::memory())
+            .await
+            .unwrap();
+        let safe = Namespace::try_new(&["safe".to_owned()]).unwrap();
+        let quoted = Namespace::try_new(&["missing' OR 1=1 -- ".to_owned()]).unwrap();
+        catalog.create_namespace(&safe, None).await.unwrap();
+        assert!(!catalog.namespace_exists(&quoted).await.unwrap());
+        catalog
+            .create_namespace(
+                &quoted,
+                Some(HashMap::from([(
+                    "owner's".to_owned(),
+                    "value 'quoted'".to_owned(),
+                )])),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            catalog.load_namespace(&quoted).await.unwrap()["owner's"],
+            "value 'quoted'"
+        );
+        catalog
+            .update_namespace(
+                &quoted,
+                Some(HashMap::from([(
+                    "x' OR 1=1 -- ".to_owned(),
+                    "literal".to_owned(),
+                )])),
+                None,
+            )
+            .await
+            .unwrap();
+        catalog
+            .update_namespace(&quoted, None, Some(vec!["x' OR 1=1 -- ".to_owned()]))
+            .await
+            .unwrap();
+        assert_eq!(
+            catalog.load_namespace(&quoted).await.unwrap(),
+            HashMap::from([("owner's".to_owned(), "value 'quoted'".to_owned())])
+        );
+        catalog.drop_namespace(&quoted).await.unwrap();
+        assert!(!catalog.namespace_exists(&quoted).await.unwrap());
+        assert!(catalog.namespace_exists(&safe).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn tabular_queries_bind_namespace_name_and_metadata_location() {
+        let catalog = SqlCatalog::new("sqlite://", "warehouse", ObjectStoreBuilder::memory())
+            .await
+            .unwrap();
+        let safe = Namespace::try_new(&["safe".to_owned()]).unwrap();
+        let quoted = Namespace::try_new(&["missing' OR 1=1 -- ".to_owned()]).unwrap();
+        let safe_table = iceberg_rust::catalog::identifier::Identifier::new(&safe, "item");
+        let quoted_table = iceberg_rust::catalog::identifier::Identifier::new(&quoted, "item");
+        catalog.create_namespace(&safe, None).await.unwrap();
+        catalog.create_namespace(&quoted, None).await.unwrap();
+        catalog
+            .insert_tabular_reference(&safe_table, "memory://safe")
+            .await
+            .unwrap();
+        catalog
+            .insert_tabular_reference(&quoted_table, "memory://old' location")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            catalog.list_tabulars(&quoted).await.unwrap().as_slice(),
+            std::slice::from_ref(&quoted_table)
+        );
+        assert!(catalog.tabular_exists(&quoted_table).await.unwrap());
+        catalog
+            .swap_metadata_location(
+                &quoted_table,
+                "memory://old' location",
+                "memory://new' location",
+            )
+            .await
+            .unwrap();
+        catalog.drop_table(&quoted_table).await.unwrap();
+        assert!(!catalog.tabular_exists(&quoted_table).await.unwrap());
+        assert!(catalog.tabular_exists(&safe_table).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn empty_and_legacy_namespaces_list_and_drop() {
+        let catalog = SqlCatalog::new("sqlite://", "warehouse", ObjectStoreBuilder::memory())
+            .await
+            .unwrap();
+        let empty = Namespace::try_new(&["empty".to_owned()]).unwrap();
+        let legacy = Namespace::try_new(&["legacy".to_owned()]).unwrap();
+        catalog.create_namespace(&empty, None).await.unwrap();
+        sqlx::query("insert into iceberg_namespace_properties (catalog_name, namespace, property_key, property_value) values ('warehouse', 'legacy', 'owner', 'user')")
+            .execute(&catalog.pool)
+            .await
+            .unwrap();
+
+        let mut names = catalog
+            .list_namespaces(None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|namespace| namespace.to_string())
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(names, ["empty", "legacy"]);
+
+        catalog.drop_namespace(&empty).await.unwrap();
+        catalog.drop_namespace(&legacy).await.unwrap();
+        assert!(!catalog.namespace_exists(&empty).await.unwrap());
+        assert!(!catalog.namespace_exists(&legacy).await.unwrap());
+        assert!(catalog.list_namespaces(None).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_namespace_drop_preserves_properties_and_row() {
+        let catalog = SqlCatalog::new("sqlite://", "warehouse", ObjectStoreBuilder::memory())
+            .await
+            .unwrap();
+        let namespace = Namespace::try_new(&["protected".to_owned()]).unwrap();
+        let properties = HashMap::from([("owner".to_owned(), "user".to_owned())]);
+        catalog
+            .create_namespace(&namespace, Some(properties.clone()))
+            .await
+            .unwrap();
+        sqlx::query("create trigger reject_namespace_delete before delete on iceberg_namespaces when old.namespace = 'protected' begin select raise(abort, 'namespace protected'); end")
+            .execute(&catalog.pool)
+            .await
+            .unwrap();
+        assert!(matches!(
+            catalog.drop_namespace(&namespace).await,
+            Err(IcebergError::External(_))
+        ));
+        assert!(catalog.namespace_exists(&namespace).await.unwrap());
+        assert_eq!(
+            catalog.load_namespace(&namespace).await.unwrap(),
+            properties
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_update_and_drop_do_not_restore_namespace() {
+        let path = std::env::temp_dir().join(format!(
+            "iceberg-sql-namespace-race-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let url = format!("sqlite://{}?mode=rwc", path.display());
+        let first = SqlCatalog::new(&url, "warehouse", ObjectStoreBuilder::memory())
+            .await
+            .unwrap();
+        let second = SqlCatalog::new(&url, "warehouse", ObjectStoreBuilder::memory())
+            .await
+            .unwrap();
+        let probe = Namespace::try_new(&["probe".to_owned()]).unwrap();
+        assert!(!first.namespace_exists(&probe).await.unwrap());
+        assert!(!second.namespace_exists(&probe).await.unwrap());
+
+        for index in 0..16 {
+            let namespace = Namespace::try_new(&[format!("current_{index}")]).unwrap();
+            first
+                .create_namespace(
+                    &namespace,
+                    Some(HashMap::from([("owner".to_owned(), "before".to_owned())])),
+                )
+                .await
+                .unwrap();
+            let (updated, dropped) = tokio::join!(
+                first.update_namespace(
+                    &namespace,
+                    Some(HashMap::from([("owner".to_owned(), "after".to_owned())])),
+                    None,
+                ),
+                second.drop_namespace(&namespace),
+            );
+            assert!(matches!(
+                updated,
+                Ok(()) | Err(IcebergError::CatalogNotFound)
+            ));
+            dropped.unwrap();
+            assert!(!first.namespace_exists(&namespace).await.unwrap());
+        }
+
+        for index in 0..16 {
+            let name = format!("legacy_{index}");
+            sqlx::query("insert into iceberg_namespace_properties (catalog_name, namespace, property_key, property_value) values (?, ?, ?, ?)")
+                .bind("warehouse")
+                .bind(&name)
+                .bind("owner")
+                .bind("before")
+                .execute(&first.pool)
+                .await
+                .unwrap();
+            let namespace = Namespace::try_new(&[name]).unwrap();
+            let (updated, dropped) = tokio::join!(
+                first.update_namespace(
+                    &namespace,
+                    Some(HashMap::from([("owner".to_owned(), "after".to_owned())])),
+                    None,
+                ),
+                second.drop_namespace(&namespace),
+            );
+            assert!(matches!(
+                updated,
+                Ok(()) | Err(IcebergError::CatalogNotFound)
+            ));
+            dropped.unwrap();
+            assert!(!first.namespace_exists(&namespace).await.unwrap());
+        }
+
+        drop(first);
+        drop(second);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    async fn assert_legacy_concurrency_on_locking_catalog(url: &str) {
+        let catalog = Arc::new(
+            SqlCatalog::new(url, "warehouse", ObjectStoreBuilder::memory())
+                .await
+                .unwrap(),
+        );
+        let namespace = Namespace::try_new(&["legacy_drop".to_owned()]).unwrap();
+        let insert_property = catalog.sql_with_binds(
+            "insert into iceberg_namespace_properties (catalog_name, namespace, property_key, property_value) values ($1, $2, $3, $4)",
+            "insert into iceberg_namespace_properties (catalog_name, namespace, property_key, property_value) values (?, ?, ?, ?)",
+        );
+        sqlx::query(insert_property)
+            .bind("warehouse")
+            .bind("legacy_drop")
+            .bind("exists")
+            .bind("true")
+            .execute(&catalog.pool)
+            .await
+            .unwrap();
+
+        let mut promoting = catalog.pool.begin().await.unwrap();
+        sqlx::query(catalog.sql_with_binds(
+            "select property_key from iceberg_namespace_properties where catalog_name = $1 and namespace = $2 for update",
+            "select property_key from iceberg_namespace_properties where catalog_name = ? and namespace = ? for update",
+        ))
+        .bind("warehouse")
+        .bind("legacy_drop")
+        .fetch_one(&mut *promoting)
+        .await
+        .unwrap();
+        sqlx::query(catalog.sql_with_binds(
+            "delete from iceberg_namespace_properties where catalog_name = $1 and namespace = $2",
+            "delete from iceberg_namespace_properties where catalog_name = ? and namespace = ?",
+        ))
+        .bind("warehouse")
+        .bind("legacy_drop")
+        .execute(&mut *promoting)
+        .await
+        .unwrap();
+        sqlx::query(catalog.sql_with_binds(
+            "insert into iceberg_namespaces (catalog_name, namespace, legacy_marker) values ($1, $2, '1')",
+            "insert into iceberg_namespaces (catalog_name, namespace, legacy_marker) values (?, ?, '1')",
+        ))
+        .bind("warehouse")
+        .bind("legacy_drop")
+        .execute(&mut *promoting)
+        .await
+        .unwrap();
+
+        let dropping_catalog = catalog.clone();
+        let dropping_namespace = namespace.clone();
+        let mut dropping =
+            tokio::spawn(async move { dropping_catalog.drop_namespace(&dropping_namespace).await });
+        assert!(timeout(Duration::from_millis(100), &mut dropping)
+            .await
+            .is_err());
+        promoting.commit().await.unwrap();
+        timeout(Duration::from_secs(10), dropping)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(!catalog.namespace_exists(&namespace).await.unwrap());
+
+        for name in ["legacy_a", "legacy_b"] {
+            sqlx::query(insert_property)
+                .bind("warehouse")
+                .bind(name)
+                .bind("owner")
+                .bind("before")
+                .execute(&catalog.pool)
+                .await
+                .unwrap();
+        }
+        let mut first = catalog.pool.begin().await.unwrap();
+        let mut second = catalog.pool.begin().await.unwrap();
+        assert!(matches!(
+            catalog
+                .lock_namespace_for_mutation(&mut first, "legacy_a")
+                .await
+                .unwrap(),
+            super::NamespaceState::Legacy
+        ));
+        assert!(matches!(
+            catalog
+                .lock_namespace_for_mutation(&mut second, "legacy_b")
+                .await
+                .unwrap(),
+            super::NamespaceState::Legacy
+        ));
+        let insert_identity = catalog.sql_with_binds(
+            "insert into iceberg_namespaces (catalog_name, namespace) values ($1, $2)",
+            "insert into iceberg_namespaces (catalog_name, namespace) values (?, ?)",
+        );
+        let (first_insert, second_insert) = timeout(Duration::from_secs(10), async {
+            tokio::join!(
+                sqlx::query(insert_identity)
+                    .bind("warehouse")
+                    .bind("legacy_a")
+                    .execute(&mut *first),
+                sqlx::query(insert_identity)
+                    .bind("warehouse")
+                    .bind("legacy_b")
+                    .execute(&mut *second),
+            )
+        })
+        .await
+        .unwrap();
+        first_insert.unwrap();
+        second_insert.unwrap();
+        first.commit().await.unwrap();
+        second.commit().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_legacy_namespace_locking_races() {
+        let postgres = Postgres::default()
+            .with_db_name("postgres")
+            .with_user("postgres")
+            .with_password("postgres")
+            .start()
+            .await
+            .unwrap();
+        let host = postgres.get_host().await.unwrap();
+        let port = postgres.get_host_port_ipv4(5432).await.unwrap();
+        assert_legacy_concurrency_on_locking_catalog(&format!(
+            "postgres://postgres:postgres@{host}:{port}/postgres"
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn mysql_legacy_namespace_locking_races() {
+        let mysql = Mysql::default().start().await.unwrap();
+        let host = mysql.get_host().await.unwrap();
+        let port = mysql.get_host_port_ipv4(3306).await.unwrap();
+        assert_legacy_concurrency_on_locking_catalog(&format!("mysql://root@{host}:{port}/test"))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn namespace_row_survives_collation_equivalent_property_removal() {
+        let catalog = SqlCatalog::new("sqlite://", "warehouse", ObjectStoreBuilder::memory())
+            .await
+            .unwrap();
+        sqlx::query("drop table iceberg_namespace_properties")
+            .execute(&catalog.pool)
+            .await
+            .unwrap();
+        sqlx::query("create table iceberg_namespace_properties (catalog_name varchar(255) not null, namespace varchar(255) not null, property_key varchar(255) collate rtrim, property_value varchar(255), primary key (catalog_name, namespace, property_key))")
+            .execute(&catalog.pool)
+            .await
+            .unwrap();
+
+        let namespace = Namespace::try_new(&["protected".to_owned()]).unwrap();
+        catalog
+            .create_namespace(
+                &namespace,
+                Some(HashMap::from([("exists ".to_owned(), "user".to_owned())])),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            catalog.load_namespace(&namespace).await.unwrap()["exists "],
+            "user"
+        );
+        catalog
+            .update_namespace(&namespace, None, Some(vec!["exists ".to_owned()]))
+            .await
+            .unwrap();
+        assert!(catalog.namespace_exists(&namespace).await.unwrap());
+        assert!(catalog.load_namespace(&namespace).await.unwrap().is_empty());
+        let namespace_count: i64 = sqlx::query_scalar("select count(*) from iceberg_namespaces where catalog_name = 'warehouse' and namespace = 'protected'")
+            .fetch_one(&catalog.pool)
+            .await
+            .unwrap();
+        assert_eq!(namespace_count, 1);
+
+        let colliding = Namespace::try_new(&["colliding".to_owned()]).unwrap();
+        let error = catalog
+            .create_namespace(
+                &colliding,
+                Some(HashMap::from([
+                    ("exists".to_owned(), "one".to_owned()),
+                    ("exists ".to_owned(), "two".to_owned()),
+                ])),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, IcebergError::External(_)));
+        assert!(!catalog.namespace_exists(&colliding).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn failed_namespace_property_insert_rolls_back_namespace_row_and_properties() {
+        let catalog = SqlCatalog::new("sqlite://", "warehouse", ObjectStoreBuilder::memory())
+            .await
+            .unwrap();
+        sqlx::query("create trigger reject_blocked_property before insert on iceberg_namespace_properties when new.property_key = 'blocked' begin select raise(abort, 'blocked property'); end")
+            .execute(&catalog.pool)
+            .await
+            .unwrap();
+        let namespace = Namespace::try_new(&["atomic".to_owned()]).unwrap();
+        let error = catalog
+            .create_namespace(
+                &namespace,
+                Some(HashMap::from([("blocked".to_owned(), "value".to_owned())])),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, IcebergError::External(_)));
+        assert!(!catalog.namespace_exists(&namespace).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn namespace_insert_non_unique_database_error_remains_external() {
+        let catalog = SqlCatalog::new("sqlite://", "warehouse", ObjectStoreBuilder::memory())
+            .await
+            .unwrap();
+        sqlx::query("create trigger reject_namespace_row before insert on iceberg_namespaces when new.namespace = 'missing_table' begin select raise(abort, 'namespace rejected'); end")
+            .execute(&catalog.pool)
+            .await
+            .unwrap();
+
+        let namespace = Namespace::try_new(&["missing_table".to_owned()]).unwrap();
+        let error = catalog
+            .create_namespace(&namespace, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, IcebergError::External(_)),
+            "expected external SQL error, got {error:?}"
+        );
+        assert!(!catalog.namespace_exists(&namespace).await.unwrap());
+    }
 
     #[tokio::test]
     async fn test_create_update_drop_table() {
