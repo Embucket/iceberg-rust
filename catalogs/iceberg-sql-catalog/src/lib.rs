@@ -1627,8 +1627,8 @@ pub mod tests {
             .unwrap();
 
         assert_eq!(
-            catalog.list_tabulars(&quoted).await.unwrap(),
-            [quoted_table.clone()]
+            catalog.list_tabulars(&quoted).await.unwrap().as_slice(),
+            std::slice::from_ref(&quoted_table)
         );
         assert!(catalog.tabular_exists(&quoted_table).await.unwrap());
         catalog
