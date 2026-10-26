@@ -6,6 +6,33 @@ use datafusion::{arrow::array::RecordBatch, error::DataFusionError};
 use iceberg_rust::error::Error as IcebergError;
 use thiserror::Error;
 
+/// Declared Snowflake-compatible column type for a write-length failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeclaredColumnKind {
+    /// Length is measured in Unicode characters.
+    Varchar,
+    /// Length is measured in bytes.
+    Binary,
+}
+
+impl DeclaredColumnKind {
+    pub(crate) const fn sql_name(self) -> &'static str {
+        match self {
+            Self::Varchar => "VARCHAR",
+            Self::Binary => "BINARY",
+        }
+    }
+}
+
+impl std::fmt::Display for DeclaredColumnKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Varchar => f.write_str("String"),
+            Self::Binary => f.write_str("Binary value"),
+        }
+    }
+}
+
 #[derive(Error, Debug)]
 /// Iceberg error
 pub enum Error {
@@ -15,7 +42,7 @@ pub enum Error {
         /// Name of the column being written.
         column: String,
         /// Snowflake display name of the value type.
-        kind: &'static str,
+        kind: DeclaredColumnKind,
         /// Maximum number of characters or bytes.
         limit: usize,
         /// Bounded value preview, formatted like Snowflake's error.

@@ -2432,6 +2432,7 @@ async fn write_parquet_files(
     } else {
         WriteLimits::from_schema(schema, &metadata.properties)?
     };
+    let track_generated_paths = !write_limits.is_empty();
     let batches = if zero_precision_columns.is_empty() && write_limits.is_empty() {
         batches
     } else {
@@ -2518,10 +2519,20 @@ async fn write_parquet_files(
     let sink = ParquetSink::new(config, table_parquet_options);
 
     let (demux_task, file_receiver, partition_values_by_path) =
-        start_demuxer_task(metadata, batches, context)?;
+        start_demuxer_task(metadata, batches, context, track_generated_paths)?;
 
-    sink.spawn_writer_tasks_and_join(context, demux_task, file_receiver, object_store.clone())
-        .await?;
+    if let Err(error) = sink
+        .spawn_writer_tasks_and_join(context, demux_task, file_receiver, object_store.clone())
+        .await
+    {
+        if matches!(&error, DataFusionError::External(source)
+            if matches!(source.downcast_ref::<DataFusionIcebergError>(),
+                Some(DataFusionIcebergError::DeclaredColumnLengthExceeded { .. })))
+        {
+            cleanup_failed_write_files(&object_store, &partition_values_by_path).await;
+        }
+        return Err(error);
+    }
 
     let files = sink.written();
 
@@ -2568,6 +2579,30 @@ async fn write_parquet_files(
 }
 
 type PartitionValuesByPath = Arc<RwLock<HashMap<Path, Vec<Option<Value>>>>>;
+
+async fn cleanup_failed_write_files(
+    object_store: &Arc<dyn ObjectStore>,
+    paths_by_partition: &PartitionValuesByPath,
+) {
+    let paths = paths_by_partition
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    stream::iter(paths)
+        .for_each_concurrent(16, |path| {
+            let object_store = Arc::clone(object_store);
+            async move {
+                if let Err(error) = object_store.delete(&path).await {
+                    if !matches!(error, object_store::Error::NotFound { .. }) {
+                        tracing::warn!(%path, %error, "could not remove uncommitted Iceberg data file");
+                    }
+                }
+            }
+        })
+        .await;
+}
 type DemuxerTask = (
     SpawnedTask<Result<(), DataFusionError>>,
     DemuxedStreamReceiver,
@@ -2578,6 +2613,7 @@ pub(crate) fn start_demuxer_task(
     metadata: &TableMetadata,
     data: SendableRecordBatchStream,
     context: &Arc<TaskContext>,
+    track_generated_paths: bool,
 ) -> Result<DemuxerTask, DataFusionError> {
     let (tx, rx) = mpsc::unbounded_channel();
     let partition_values_by_path = Arc::new(RwLock::new(HashMap::new()));
@@ -2589,7 +2625,8 @@ pub(crate) fn start_demuxer_task(
     let task = if partition_spec.fields().is_empty() {
         SpawnedTask::spawn({
             let location = metadata.location.clone();
-            async move { row_count_demuxer(tx, data, context, &location).await }
+            let paths = track_generated_paths.then(|| Arc::clone(&partition_values_by_path));
+            async move { row_count_demuxer(tx, data, context, &location, paths.as_ref()).await }
         })
     } else {
         // There could be an arbitrarily large number of parallel hive style partitions being written to, so we cannot
@@ -2696,6 +2733,7 @@ async fn row_count_demuxer(
     mut data: std::pin::Pin<Box<dyn RecordBatchStream + Send + 'static>>,
     context: Arc<TaskContext>,
     table_location: &str,
+    paths_by_partition: Option<&PartitionValuesByPath>,
 ) -> Result<(), DataFusionError> {
     let exec_options = &context.session_config().options().execution;
 
@@ -2712,11 +2750,16 @@ async fn row_count_demuxer(
     while let Some(rb) = data.next().await.transpose()? {
         // ensure we have at least minimum_parallel_files open
         if open_file_streams.len() < minimum_parallel_files {
-            open_file_streams.push(create_new_file_stream(&data_location, &mut tx)?);
+            open_file_streams.push(create_new_file_stream(
+                &data_location,
+                &mut tx,
+                paths_by_partition,
+            )?);
             row_counts.push(0);
         } else if row_counts[next_send_steam] >= max_rows_per_file {
             row_counts[next_send_steam] = 0;
-            open_file_streams[next_send_steam] = create_new_file_stream(&data_location, &mut tx)?;
+            open_file_streams[next_send_steam] =
+                create_new_file_stream(&data_location, &mut tx, paths_by_partition)?;
         }
         row_counts[next_send_steam] += rb.num_rows();
         open_file_streams[next_send_steam]
@@ -2735,10 +2778,17 @@ async fn row_count_demuxer(
 fn create_new_file_stream(
     data_location: &str,
     tx: &mut mpsc::UnboundedSender<(Path, mpsc::Receiver<RecordBatch>)>,
+    paths_by_partition: Option<&PartitionValuesByPath>,
 ) -> Result<mpsc::Sender<RecordBatch>, DataFusionError> {
-    let file_path = generate_file_path(data_location, None);
+    let file_path: Path = generate_file_path(data_location, None).into();
+    if let Some(paths_by_partition) = paths_by_partition {
+        paths_by_partition
+            .write()
+            .map_err(|_| DataFusionError::Internal("Partition map lock poisoned".to_owned()))?
+            .insert(file_path.clone(), Vec::new());
+    }
     let (tx_file, rx_file) = mpsc::channel(1);
-    tx.send((file_path.into(), rx_file)).map_err(|_| {
+    tx.send((file_path, rx_file)).map_err(|_| {
         DataFusionError::Execution("Error sending RecordBatch to file stream!".into())
     })?;
     Ok(tx_file)
@@ -2922,6 +2972,108 @@ mod tests {
         ExecutionPlan, ParquetSource, TableProvider,
     };
     use datafusion::datasource::physical_plan::FileScanConfig;
+
+    #[tokio::test]
+    async fn failed_write_cleanup_removes_only_generated_paths() {
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let generated = object_store::path::Path::from("table/data/generated.parquet");
+        let unrelated = object_store::path::Path::from("table/data/committed.parquet");
+        let payload = object_store::PutPayload::from(bytes::Bytes::from_static(b"data"));
+        store
+            .put(&generated, payload.clone())
+            .await
+            .expect("generated file");
+        store
+            .put(&unrelated, payload)
+            .await
+            .expect("committed file");
+        let paths: super::PartitionValuesByPath = Arc::new(std::sync::RwLock::new(HashMap::from(
+            [(generated.clone(), Vec::new())],
+        )));
+
+        super::cleanup_failed_write_files(&store, &paths).await;
+
+        assert!(matches!(
+            store.head(&generated).await,
+            Err(object_store::Error::NotFound { .. })
+        ));
+        assert!(store.head(&unrelated).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn late_declared_length_failure_leaves_no_uncommitted_data_files() {
+        let store = ObjectStoreBuilder::memory();
+        let catalog: Arc<dyn Catalog> = Arc::new(
+            SqlCatalog::new("sqlite://", "test", store)
+                .await
+                .expect("catalog"),
+        );
+        let schema = Schema::builder()
+            .with_struct_field(StructField::new(
+                1,
+                "label",
+                false,
+                Type::Primitive(PrimitiveType::String),
+                None,
+            ))
+            .build()
+            .expect("schema");
+        let table = Table::builder()
+            .with_name("late_length_failure")
+            .with_location("memory:///test/late_length_failure")
+            .with_schema(schema)
+            .with_property((
+                format!("{}1", super::VARCHAR_LENGTH_PROPERTY_PREFIX),
+                "3".to_owned(),
+            ))
+            .build(&["test".to_owned()], catalog)
+            .await
+            .expect("table");
+        let batch_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "label",
+            DataType::Utf8,
+            true,
+        )]));
+        let batches = ["ok", "abcd"]
+            .into_iter()
+            .map(|value| {
+                RecordBatch::try_new(
+                    Arc::clone(&batch_schema),
+                    vec![Arc::new(StringArray::from(vec![value]))],
+                )
+                .expect("batch")
+            })
+            .collect::<Vec<_>>();
+        let input: super::SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            batch_schema,
+            stream::iter(
+                batches
+                    .into_iter()
+                    .map(Ok::<_, datafusion::common::DataFusionError>),
+            ),
+        ));
+        let context = SessionContext::new().task_ctx();
+        let error = super::write_parquet_data_files(&table, input, &context, None)
+            .await
+            .expect_err("late VARCHAR overflow");
+        assert!(
+            error.to_string().contains("String 'abcd' is too long"),
+            "{error}"
+        );
+        let objects = table
+            .object_store()
+            .list(None)
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("list objects");
+        assert!(
+            objects
+                .iter()
+                .all(|object| !object.location.as_ref().contains("/data/")),
+            "uncommitted data files remain: {objects:?}"
+        );
+    }
 
     #[test]
     fn position_delete_metadata_path_is_not_reencoded() {

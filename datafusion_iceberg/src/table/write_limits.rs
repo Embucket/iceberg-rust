@@ -9,27 +9,12 @@ use datafusion::common::DataFusionError;
 use iceberg_rust::spec::schema::Schema;
 use iceberg_rust::spec::types::{PrimitiveType, Type};
 
-use crate::error::Error;
+use crate::error::{DeclaredColumnKind as Kind, Error};
 
 /// Optional Rustice/Snowflake VARCHAR character limit, keyed by Iceberg field ID.
 pub const VARCHAR_LENGTH_PROPERTY_PREFIX: &str = "embucket.schema.varchar-length.";
 /// Optional Rustice/Snowflake BINARY byte limit, keyed by Iceberg field ID.
 pub const BINARY_LENGTH_PROPERTY_PREFIX: &str = "embucket.schema.binary-length.";
-
-#[derive(Clone, Copy, Debug)]
-enum Kind {
-    Varchar,
-    Binary,
-}
-
-impl Kind {
-    const fn sql_name(self) -> &'static str {
-        match self {
-            Self::Varchar => "VARCHAR",
-            Self::Binary => "BINARY",
-        }
-    }
-}
 
 #[derive(Debug)]
 struct Limit {
@@ -87,7 +72,14 @@ impl WriteLimits {
 
     pub(super) fn validate_batch(&self, batch: &RecordBatch) -> Result<(), DataFusionError> {
         for limit in &self.0 {
-            let array = batch.column(limit.index);
+            let array = batch.columns().get(limit.index).ok_or_else(|| {
+                DataFusionError::Plan(format!(
+                    "Write batch has {} columns but {} requires column {}",
+                    batch.num_columns(),
+                    limit.name,
+                    limit.index
+                ))
+            })?;
             let preview = match (limit.kind, array.data_type()) {
                 (Kind::Varchar, DataType::Utf8) => {
                     first_overlong_string(array.as_string::<i32>(), limit.max).map(string_preview)
@@ -130,10 +122,7 @@ impl WriteLimits {
             if let Some(preview) = preview {
                 return Err(Error::DeclaredColumnLengthExceeded {
                     column: limit.name.clone(),
-                    kind: match limit.kind {
-                        Kind::Varchar => "String",
-                        Kind::Binary => "Binary value",
-                    },
+                    kind: limit.kind,
                     limit: limit.max,
                     preview,
                 }
@@ -195,9 +184,10 @@ mod tests {
     use std::sync::Arc;
 
     use datafusion::arrow::array::{
-        ArrayRef, BinaryArray, BinaryViewArray, StringArray, StringViewArray,
+        ArrayRef, BinaryArray, BinaryViewArray, LargeBinaryArray, LargeStringArray, StringArray,
+        StringViewArray,
     };
-    use datafusion::arrow::datatypes::{Field, Schema as ArrowSchema};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use iceberg_rust::spec::types::{StructField, StructType};
 
     use super::*;
@@ -269,5 +259,114 @@ mod tests {
         assert!(WriteLimits::from_schema(&table_schema(), &HashMap::new())
             .expect("no limits")
             .is_empty());
+    }
+
+    #[test]
+    fn short_batch_returns_schema_error_instead_of_panicking() {
+        let properties =
+            HashMap::from([(format!("{BINARY_LENGTH_PROPERTY_PREFIX}9"), "2".to_owned())]);
+        let limits = WriteLimits::from_schema(&table_schema(), &properties).expect("limits");
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "text",
+            DataType::Utf8,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec!["ok"]))])
+            .expect("valid short batch");
+        let error = limits
+            .validate_batch(&batch)
+            .expect_err("missing second column");
+        assert!(matches!(error, DataFusionError::Plan(_)), "{error}");
+    }
+
+    #[test]
+    fn field_id_limits_follow_renamed_and_reordered_columns() {
+        let schema = Schema::from_struct_type(
+            StructType::new(vec![
+                StructField::new(
+                    9,
+                    "renamed_bytes",
+                    false,
+                    Type::Primitive(PrimitiveType::Binary),
+                    None,
+                ),
+                StructField::new(
+                    7,
+                    "renamed_text",
+                    false,
+                    Type::Primitive(PrimitiveType::String),
+                    None,
+                ),
+            ]),
+            1,
+            None,
+        );
+        let properties =
+            HashMap::from([(format!("{VARCHAR_LENGTH_PROPERTY_PREFIX}7"), "3".to_owned())]);
+        let limits = WriteLimits::from_schema(&schema, &properties).expect("limits");
+        let error = limits
+            .validate_batch(&batch(
+                Arc::new(BinaryArray::from(vec![&b"AB"[..]])),
+                Arc::new(StringArray::from(vec!["abcd"])),
+            ))
+            .expect_err("renamed text field has field ID 7");
+        assert!(error.to_string().contains("String 'abcd'"));
+    }
+
+    #[test]
+    fn large_offset_arrays_observe_limits() {
+        let properties = HashMap::from([
+            (format!("{VARCHAR_LENGTH_PROPERTY_PREFIX}7"), "3".to_owned()),
+            (format!("{BINARY_LENGTH_PROPERTY_PREFIX}9"), "2".to_owned()),
+        ]);
+        let limits = WriteLimits::from_schema(&table_schema(), &properties).expect("limits");
+        limits
+            .validate_batch(&batch(
+                Arc::new(LargeStringArray::from(vec!["ééé"])),
+                Arc::new(LargeBinaryArray::from(vec![&b"AB"[..]])),
+            ))
+            .expect("values fit");
+        let error = limits
+            .validate_batch(&batch(
+                Arc::new(LargeStringArray::from(vec!["ok"])),
+                Arc::new(LargeBinaryArray::from(vec![&b"ABC"[..]])),
+            ))
+            .expect_err("binary exceeds two bytes");
+        assert!(error.to_string().contains("Binary value '414243'"));
+    }
+
+    #[test]
+    #[ignore = "manual performance benchmark; run with --ignored --nocapture"]
+    #[allow(clippy::print_stdout)]
+    fn benchmark_declared_column_length_validation() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const ROWS: usize = 262_144;
+        const ITERATIONS: usize = 20;
+        let properties = HashMap::from([
+            (format!("{VARCHAR_LENGTH_PROPERTY_PREFIX}7"), "3".to_owned()),
+            (format!("{BINARY_LENGTH_PROPERTY_PREFIX}9"), "2".to_owned()),
+        ]);
+        let limits = WriteLimits::from_schema(&table_schema(), &properties).expect("limits");
+        let string_batch = batch(
+            Arc::new(StringArray::from(vec!["abc"; ROWS])),
+            Arc::new(BinaryArray::from(vec![&b"ab"[..]; ROWS])),
+        );
+        let view_batch = batch(
+            Arc::new(StringViewArray::from(vec!["abc"; ROWS])),
+            Arc::new(BinaryViewArray::from(vec![&b"ab"[..]; ROWS])),
+        );
+        for (name, batch) in [("offset", string_batch), ("view", view_batch)] {
+            let start = Instant::now();
+            for _ in 0..ITERATIONS {
+                black_box(limits.validate_batch(black_box(&batch))).expect("valid batch");
+            }
+            let rows = u32::try_from(ROWS * ITERATIONS).expect("benchmark row count fits u32");
+            println!(
+                "{name}: {:.0} rows/s",
+                f64::from(rows) / start.elapsed().as_secs_f64()
+            );
+        }
     }
 }
