@@ -259,6 +259,14 @@ fn query_map(row: &AnyRow) -> Result<TableRef, sqlx::Error> {
     })
 }
 
+fn namespace_insert_error(namespace: &str, error: sqlx::Error) -> IcebergError {
+    if matches!(&error, sqlx::Error::Database(database) if database.is_unique_violation()) {
+        IcebergError::CommitConflict(namespace.to_owned())
+    } else {
+        Error::from(error).into()
+    }
+}
+
 #[async_trait]
 impl Catalog for SqlCatalog {
     /// Catalog name
@@ -275,25 +283,36 @@ impl Catalog for SqlCatalog {
         let namespace_str = namespace.to_string();
         let properties = properties.unwrap_or_default();
 
+        if properties.contains_key("exists") {
+            return Err(IcebergError::InvalidFormat(
+                "exists is a reserved namespace property key".to_owned(),
+            ));
+        }
+        // Older catalogs recorded only real properties. Reject those namespaces before
+        // inserting the marker that provides namespace-level uniqueness for new writes.
+        if self.namespace_exists(namespace).await? {
+            return Err(IcebergError::CommitConflict(namespace_str));
+        }
+
+        let mut transaction = self.pool.begin().await.map_err(Error::from)?;
+        sqlx::query(&format!(
+            "insert into iceberg_namespace_properties (catalog_name, namespace, property_key, property_value) values ('{catalog_name}', '{namespace_str}', 'exists', 'true');"
+        ))
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| namespace_insert_error(&namespace_str, error))?;
+
         // Insert namespace properties into the database
         for (key, value) in &properties {
             sqlx::query(&format!(
                 "insert into iceberg_namespace_properties (catalog_name, namespace, property_key, property_value) values ('{catalog_name}', '{namespace_str}', '{key}', '{value}');"
             ))
-            .execute(&self.pool)
+            .execute(&mut *transaction)
             .await
-            .map_err(Error::from)?;
+            .map_err(|error| namespace_insert_error(&namespace_str, error))?;
         }
 
-        // If no properties were provided, still create an entry to mark the namespace as existing
-        if properties.is_empty() {
-            sqlx::query(&format!(
-                "insert into iceberg_namespace_properties (catalog_name, namespace, property_key, property_value) values ('{catalog_name}', '{namespace_str}', 'exists', 'true');"
-            ))
-            .execute(&self.pool)
-            .await
-            .map_err(Error::from)?;
-        }
+        transaction.commit().await.map_err(Error::from)?;
 
         Ok(properties)
     }
@@ -329,8 +348,7 @@ impl Catalog for SqlCatalog {
         let mut properties = HashMap::new();
         for row in &rows {
             let key: String = row.try_get(0).map_err(Error::from)?;
-            // Skip the synthetic "exists" marker that create_namespace inserts when
-            // no real properties were provided.
+            // Skip the synthetic marker used for namespace-level uniqueness.
             if key == "exists" {
                 continue;
             }
@@ -349,6 +367,18 @@ impl Catalog for SqlCatalog {
     ) -> Result<(), IcebergError> {
         let catalog_name = self.name.clone();
         let namespace_str = namespace.to_string();
+
+        if removals
+            .as_ref()
+            .is_some_and(|keys| keys.iter().any(|key| key == "exists"))
+            || updates
+                .as_ref()
+                .is_some_and(|properties| properties.contains_key("exists"))
+        {
+            return Err(IcebergError::InvalidFormat(
+                "exists is a reserved namespace property key".to_owned(),
+            ));
+        }
 
         if let Some(removals) = removals {
             for key in removals {
@@ -1000,9 +1030,129 @@ pub mod tests {
     use tokio::time::sleep;
 
     use crate::{SqlCatalog, SqlCatalogOptions};
+    use iceberg_rust::error::Error as IcebergError;
     use iceberg_rust::object_store::store::version_hint_content;
     use sqlx::pool::PoolOptions;
-    use std::{sync::Arc, time::Duration};
+    use std::{collections::HashMap, sync::Arc, time::Duration};
+
+    #[tokio::test]
+    async fn duplicate_namespace_insert_reports_commit_conflict() {
+        let catalog = SqlCatalog::new("sqlite://", "warehouse", ObjectStoreBuilder::memory())
+            .await
+            .unwrap();
+
+        for (name, properties, duplicate_properties) in [
+            (
+                "empty",
+                None,
+                Some(HashMap::from([("owner".to_owned(), "second".to_owned())])),
+            ),
+            (
+                "with_properties",
+                Some(HashMap::from([("owner".to_owned(), "first".to_owned())])),
+                Some(HashMap::from([("region".to_owned(), "second".to_owned())])),
+            ),
+        ] {
+            let namespace = Namespace::try_new(&[name.to_owned()]).unwrap();
+            catalog
+                .create_namespace(&namespace, properties.clone())
+                .await
+                .unwrap();
+            let error = catalog
+                .create_namespace(&namespace, duplicate_properties)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, IcebergError::CommitConflict(ref identifier) if identifier == name),
+                "expected typed namespace conflict, got {error:?}"
+            );
+            assert_eq!(
+                catalog.load_namespace(&namespace).await.unwrap(),
+                properties.unwrap_or_default()
+            );
+            let marker_count: i64 = sqlx::query_scalar(&format!(
+                "select count(*) from iceberg_namespace_properties where catalog_name = 'warehouse' and namespace = '{name}' and property_key = 'exists'"
+            ))
+            .fetch_one(&catalog.pool)
+            .await
+            .unwrap();
+            assert_eq!(marker_count, 1);
+            assert!(matches!(
+                catalog
+                    .update_namespace(&namespace, None, Some(vec!["exists".to_owned()]))
+                    .await,
+                Err(IcebergError::InvalidFormat(_))
+            ));
+            assert!(catalog.namespace_exists(&namespace).await.unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_legacy_namespace_without_marker_is_rejected() {
+        let catalog = SqlCatalog::new("sqlite://", "warehouse", ObjectStoreBuilder::memory())
+            .await
+            .unwrap();
+        sqlx::query("insert into iceberg_namespace_properties (catalog_name, namespace, property_key, property_value) values ('warehouse', 'legacy', 'owner', 'first')")
+            .execute(&catalog.pool)
+            .await
+            .unwrap();
+        let namespace = Namespace::try_new(&["legacy".to_owned()]).unwrap();
+        let error = catalog
+            .create_namespace(
+                &namespace,
+                Some(HashMap::from([("region".to_owned(), "second".to_owned())])),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, IcebergError::CommitConflict(_)));
+        assert_eq!(
+            catalog.load_namespace(&namespace).await.unwrap(),
+            HashMap::from([("owner".to_owned(), "first".to_owned())])
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_namespace_property_insert_rolls_back_marker_and_properties() {
+        let catalog = SqlCatalog::new("sqlite://", "warehouse", ObjectStoreBuilder::memory())
+            .await
+            .unwrap();
+        sqlx::query("create trigger reject_blocked_property before insert on iceberg_namespace_properties when new.property_key = 'blocked' begin select raise(abort, 'blocked property'); end")
+            .execute(&catalog.pool)
+            .await
+            .unwrap();
+        let namespace = Namespace::try_new(&["atomic".to_owned()]).unwrap();
+        let error = catalog
+            .create_namespace(
+                &namespace,
+                Some(HashMap::from([("blocked".to_owned(), "value".to_owned())])),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, IcebergError::External(_)));
+        assert!(!catalog.namespace_exists(&namespace).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn namespace_insert_non_unique_database_error_remains_external() {
+        let catalog = SqlCatalog::new("sqlite://", "warehouse", ObjectStoreBuilder::memory())
+            .await
+            .unwrap();
+        sqlx::query("create trigger reject_namespace_marker before insert on iceberg_namespace_properties when new.property_key = 'exists' begin select raise(abort, 'marker rejected'); end")
+            .execute(&catalog.pool)
+            .await
+            .unwrap();
+
+        let namespace = Namespace::try_new(&["missing_table".to_owned()]).unwrap();
+        let error = catalog
+            .create_namespace(&namespace, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, IcebergError::External(_)),
+            "expected external SQL error, got {error:?}"
+        );
+        assert!(!catalog.namespace_exists(&namespace).await.unwrap());
+    }
 
     #[tokio::test]
     async fn test_create_update_drop_table() {
