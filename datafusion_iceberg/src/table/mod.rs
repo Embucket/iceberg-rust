@@ -634,13 +634,18 @@ fn use_parquet_row_filter_pushdown(projected_columns: usize, filter_columns: usi
         && filter_columns <= NARROW_PREDICATE_MAX_COLUMNS
 }
 
+// `table` and `config` are not recorded: the `Debug` of a `Table` includes its catalog, whose
+// REST configuration and default object-store builder hold the bearer token and the storage
+// secret key / session token, and both values are large. Span fields are printed in every log
+// line raised inside the span and exported as span attributes.
 #[allow(clippy::too_many_arguments)]
-#[instrument(name = "datafusion_iceberg::table_scan", level = "debug", skip(arrow_schema, session, filters), fields(
+#[instrument(name = "datafusion_iceberg::table_scan", level = "debug", skip(table, arrow_schema, config, session, filters), fields(
     table_identifier = %table.identifier(),
     snapshot_range = ?snapshot_range,
     projection = ?projection,
     filter_count = filters.len(),
-    limit = ?limit
+    limit = ?limit,
+    has_config = config.is_some()
 ))]
 async fn table_scan(
     table: &Table,
@@ -3210,6 +3215,122 @@ mod tests {
             count_caching_parquet_sources(plan.as_ref()) > 0,
             "expected at least one parquet scan node in the plan"
         );
+    }
+
+    /// Records the name and fields of every span, `Debug`-formatted, enabling everything.
+    #[derive(Clone, Default)]
+    struct SpanFieldCapture {
+        next_id: Arc<std::sync::atomic::AtomicU64>,
+        spans: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    struct FieldText<'a>(&'a mut String);
+
+    impl tracing::field::Visit for FieldText<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            use std::fmt::Write as _;
+            let _ = write!(self.0, " {}={value:?}", field.name());
+        }
+    }
+
+    impl tracing::Subscriber for SpanFieldCapture {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+            Some(tracing::level_filters::LevelFilter::TRACE)
+        }
+
+        fn new_span(&self, span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            let mut text = span.metadata().name().to_owned();
+            span.record(&mut FieldText(&mut text));
+            self.spans.lock().unwrap().push(text);
+            let id = self
+                .next_id
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::span::Id::from_u64(id + 1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, values: &tracing::span::Record<'_>) {
+            let mut text = "record".to_owned();
+            values.record(&mut FieldText(&mut text));
+            self.spans.lock().unwrap().push(text);
+        }
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, _: &tracing::Event<'_>) {}
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// The scan span records the table identifier, not the table: a `Table`'s `Debug`
+    /// includes its catalog and metadata, and with a REST catalog that means the bearer token
+    /// and the default object-store builder's secret key and session token. Span fields reach
+    /// every log line raised inside the span and the exported span attributes.
+    #[tokio::test]
+    async fn table_scan_span_does_not_record_the_table() {
+        const FAKE_SECRET: &str = "fake-secret-access-key-0123456789";
+
+        let catalog: Arc<dyn Catalog> = Arc::new(
+            SqlCatalog::new("sqlite://", "test", ObjectStoreBuilder::memory())
+                .await
+                .unwrap(),
+        );
+        let schema = Schema::builder()
+            .with_struct_field(StructField {
+                id: 1,
+                name: "id".to_string(),
+                required: true,
+                field_type: Type::Primitive(PrimitiveType::Long),
+                doc: None,
+                initial_default: None,
+                write_default: None,
+            })
+            .build()
+            .unwrap();
+        // Stands in for a credential reachable from the table's `Debug`.
+        let table = Table::builder()
+            .with_name("span_secrets")
+            .with_location("memory:///test/span_secrets")
+            .with_schema(schema)
+            .with_property(("s3.secret-access-key".to_owned(), FAKE_SECRET.to_owned()))
+            .build(&["test".to_owned()], catalog)
+            .await
+            .expect("Failed to create table");
+        assert!(format!("{table:?}").contains(FAKE_SECRET));
+        let table = DataFusionTable::from(table);
+        let state = SessionContext::new().state();
+
+        let capture = SpanFieldCapture::default();
+        {
+            let _guard = tracing::subscriber::set_default(capture.clone());
+            table
+                .scan(&state, None, &[], None)
+                .await
+                .expect("Failed to build scan plan");
+        }
+
+        let spans = capture.spans.lock().unwrap();
+        let scan = spans
+            .iter()
+            .find(|span| span.starts_with("datafusion_iceberg::table_scan"))
+            .unwrap_or_else(|| panic!("no table scan span in {spans:?}"));
+        assert!(
+            !scan.contains(" table=") && !scan.contains(" config="),
+            "{scan}"
+        );
+        assert!(
+            scan.contains("table_identifier=test.span_secrets"),
+            "{scan}"
+        );
+        assert!(scan.contains("has_config=false"), "{scan}");
+        for span in spans.iter() {
+            assert!(!span.contains(FAKE_SECRET), "{span}");
+        }
     }
 
     /// `(pushdown_filters, has output ordering)` of every parquet scan node in
