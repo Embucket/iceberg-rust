@@ -17,6 +17,7 @@ runtime-async-std = ["sqlx/runtime-async-std"]
 [dependencies]
 async-trait.workspace = true
 futures.workspace = true
+futures-timer = "3.0"
 iceberg-rust = { path = "../../iceberg-rust", version = "0.10.0" }
 object_store.workspace = true
 serde_json.workspace = true
@@ -31,5 +32,5 @@ datafusion_iceberg = { path = "../../datafusion_iceberg", version = "0.10.0" }
 iceberg-rust = { path = "../../iceberg-rust", version = "0.10.0", features = ["test-utils"] }
 sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "any", "sqlite", "postgres", "mysql"], default-features = false }
 testcontainers = "0.26"
-testcontainers-modules = { version = "0.14", features = ["localstack", "postgres"] }
+testcontainers-modules = { version = "0.14", features = ["localstack", "mysql", "postgres"] }
 tokio = "1"
