@@ -9,6 +9,18 @@ use thiserror::Error;
 #[derive(Error, Debug)]
 /// Iceberg error
 pub enum Error {
+    /// A value exceeds a Snowflake-compatible declared column length.
+    #[error("{kind} '{preview}' is too long and would be truncated")]
+    DeclaredColumnLengthExceeded {
+        /// Name of the column being written.
+        column: String,
+        /// Snowflake display name of the value type.
+        kind: &'static str,
+        /// Maximum number of characters or bytes.
+        limit: usize,
+        /// Bounded value preview, formatted like Snowflake's error.
+        preview: String,
+    },
     /// Datafusion error
     #[error(transparent)]
     Datafusion(#[from] datafusion::error::DataFusionError),

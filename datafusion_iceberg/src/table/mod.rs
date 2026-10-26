@@ -58,6 +58,8 @@ use crate::{
     },
     statistics::manifest_statistics,
 };
+
+mod write_limits;
 use datafusion::arrow::compute::SortOptions;
 use datafusion::common::{JoinSide, NullEquality, Statistics};
 use datafusion::datasource::physical_plan::FileScanConfig;
@@ -127,6 +129,8 @@ use iceberg_rust::{
     },
     table::ManifestPath,
 };
+use write_limits::WriteLimits;
+pub use write_limits::{BINARY_LENGTH_PROPERTY_PREFIX, VARCHAR_LENGTH_PROPERTY_PREFIX};
 
 static DATA_FILE_PATH_COLUMN: &str = "__data_file_path";
 static MANIFEST_FILE_PATH_COLUMN: &str = "__manifest_file_path";
@@ -2423,7 +2427,12 @@ async fn write_parquet_files(
         .current_schema()
         .map_err(DataFusionIcebergError::from)?;
     let zero_precision_columns = zero_precision_decimal_columns(schema)?;
-    let batches = if zero_precision_columns.is_empty() {
+    let write_limits = if equality_ids.is_some() {
+        WriteLimits::default()
+    } else {
+        WriteLimits::from_schema(schema, &metadata.properties)?
+    };
+    let batches = if zero_precision_columns.is_empty() && write_limits.is_empty() {
         batches
     } else {
         let batch_schema = batches.schema();
@@ -2432,6 +2441,7 @@ async fn write_parquet_files(
             batches.map(move |batch| {
                 let batch = batch?;
                 validate_zero_precision_decimal_batch(&zero_precision_columns, &batch)?;
+                write_limits.validate_batch(&batch)?;
                 Ok(batch)
             }),
         )) as SendableRecordBatchStream
