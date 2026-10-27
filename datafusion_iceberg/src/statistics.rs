@@ -82,21 +82,13 @@ fn column_statistics<'a>(
                 .upper_bounds()
                 .as_ref()
                 .and_then(|x| x.get(&id))
-                .and_then(|x| {
-                    Some(Precision::Exact(
-                        convert_value_to_scalar_value(x.clone(), &field.field_type).ok()?,
-                    ))
-                })
+                .and_then(|x| bound_statistic(x.clone(), &field.field_type))
                 .unwrap_or(Precision::Absent),
             min_value: data_file
                 .lower_bounds()
                 .as_ref()
                 .and_then(|x| x.get(&id))
-                .and_then(|x| {
-                    Some(Precision::Exact(
-                        convert_value_to_scalar_value(x.clone(), &field.field_type).ok()?,
-                    ))
-                })
+                .and_then(|x| bound_statistic(x.clone(), &field.field_type))
                 .unwrap_or(Precision::Absent),
             distinct_count: data_file
                 .distinct_counts()
@@ -107,6 +99,22 @@ fn column_statistics<'a>(
             sum_value: Precision::Absent,
             byte_size: Precision::Absent,
         }
+    })
+}
+
+/// A data file's lower or upper bound as a column statistic.
+///
+/// String and binary bounds are only bounds: writers truncate them (the Iceberg default
+/// metrics mode is `truncate(16)`) to a prefix of the minimum and an incremented prefix of
+/// the maximum. They stay usable for pruning but are marked inexact, so `DataFusion` never
+/// answers `MIN`/`MAX` from them without scanning. Other bounds are the column's extremes.
+fn bound_statistic(value: Value, field_type: &Type) -> Option<Precision<ScalarValue>> {
+    let scalar = convert_value_to_scalar_value(value, field_type).ok()?;
+    Some(match field_type {
+        Type::Primitive(PrimitiveType::String | PrimitiveType::Binary) => {
+            Precision::Inexact(scalar)
+        }
+        _ => Precision::Exact(scalar),
     })
 }
 
@@ -241,6 +249,28 @@ fn new_distinct_count(acc: &ColumnStatistics, x: &ColumnStatistics) -> Precision
 mod tests {
     use super::*;
     use iceberg_rust::spec::decimal::decimal_from_i128_with_scale;
+
+    #[test]
+    fn truncatable_bounds_are_inexact_statistics() {
+        let string = Type::Primitive(PrimitiveType::String);
+        let binary = Type::Primitive(PrimitiveType::Binary);
+        let long = Type::Primitive(PrimitiveType::Long);
+        // A `truncate(16)` upper bound: the prefix with its last character incremented.
+        assert_eq!(
+            bound_statistic(Value::String("snowflake_unloae".to_owned()), &string),
+            Some(Precision::Inexact(ScalarValue::Utf8(Some(
+                "snowflake_unloae".to_owned()
+            ))))
+        );
+        assert!(matches!(
+            bound_statistic(Value::Binary(vec![1, 2, 3]), &binary),
+            Some(Precision::Inexact(_))
+        ));
+        assert_eq!(
+            bound_statistic(Value::LongInt(7), &long),
+            Some(Precision::Exact(ScalarValue::Int64(Some(7))))
+        );
+    }
 
     #[test]
     fn converts_precision_38_decimal_bound_to_datafusion() {
