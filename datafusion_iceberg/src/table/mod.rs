@@ -837,16 +837,17 @@ async fn table_scan(
         } else {
             None
         };
-        let manifests_to_prune = partition_pruning_predicate
-            .as_ref()
-            .map(|predicate| {
+        let manifests_to_prune = partition_pruning_predicate.as_ref().map(|predicate| {
+            keep_all_on_prune_error(
                 predicate.prune(&PruneManifests::new(
                     partition_fields,
                     table.metadata().default_spec_id,
                     &manifests,
-                ))
-            })
-            .transpose()?;
+                )),
+                manifests.len(),
+                "manifests",
+            )
+        });
         let data_files: Vec<(ManifestPath, ManifestEntry)> = table
             .datafiles(
                 &manifests,
@@ -877,11 +878,15 @@ async fn table_scan(
                     && compatible_manifests.contains(path.as_str())
             });
             if has_prunable_files {
-                let files_to_keep = predicate.prune(&PrunePartitionedDataFiles::new(
-                    partition_fields,
-                    &compatible_manifests,
-                    &data_files,
-                ))?;
+                let files_to_keep = keep_all_on_prune_error(
+                    predicate.prune(&PrunePartitionedDataFiles::new(
+                        partition_fields,
+                        &compatible_manifests,
+                        &data_files,
+                    )),
+                    data_files.len(),
+                    "partitioned data files",
+                );
                 data_files = data_files
                     .into_iter()
                     .zip(files_to_keep)
@@ -894,8 +899,11 @@ async fn table_scan(
             .with_file_schema(arrow_schema.clone())
             .try_build(physical_predicate)?;
         // After the first pruning stage the data_files are pruned again based on the pruning statistics in the manifest files.
-        let files_to_prune =
-            pruning_predicate.prune(&PruneDataFiles::new(schema, &arrow_schema, &data_files))?;
+        let files_to_prune = keep_all_on_prune_error(
+            pruning_predicate.prune(&PruneDataFiles::new(schema, &arrow_schema, &data_files)),
+            data_files.len(),
+            "data files",
+        );
 
         let mut statistics = statistics_from_datafiles(schema, &data_files);
         for _ in 0..usize::from(enable_row_id_column)
@@ -1571,6 +1579,20 @@ fn scan_manifest_entry(entry: &ManifestEntry, scan_changed_data_files: bool) -> 
         entry.data_file().content(),
         scan_changed_data_files,
     )
+}
+
+/// Keeps every container when pruning fails to evaluate on the bounds, as Parquet row-group
+/// pruning does: a bound the predicate cannot evaluate (a cast out of range, for example)
+/// must not fail a query whose rows would evaluate fine.
+fn keep_all_on_prune_error(
+    kept: Result<Vec<bool>, DataFusionError>,
+    containers: usize,
+    what: &str,
+) -> Vec<bool> {
+    kept.unwrap_or_else(|error| {
+        tracing::debug!(%error, what, "Iceberg pruning failed; keeping every container");
+        vec![true; containers]
+    })
 }
 
 fn prepare_changed_data_files(
