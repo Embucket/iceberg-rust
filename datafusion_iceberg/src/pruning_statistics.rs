@@ -15,7 +15,7 @@
 use std::{any::Any, collections::HashSet, sync::Arc};
 
 use crate::error::Error as DatafusionIcebergError;
-use crate::statistics::cast_iceberg_bound;
+use crate::statistics::{cast_iceberg_bound, may_hold_nan};
 use datafusion::{
     arrow::{
         array::{ArrayRef, Int32Array, Int64Array},
@@ -107,6 +107,13 @@ impl PruningStatistics for PruneManifests<'_, '_> {
                 .then_some(manifest)
                 .and_then(|manifest| manifest.partitions.as_ref())
                 .and_then(|partitions| partitions.get(index))
+                // The upper bound excludes NaN, which sorts above every number.
+                .filter(|partition| {
+                    !matches!(
+                        data_type,
+                        Type::Primitive(PrimitiveType::Float | PrimitiveType::Double)
+                    ) || partition.contains_nan == Some(false)
+                })
                 .and_then(|partition| partition.upper_bound.as_ref())
                 .and_then(|max| cast_iceberg_bound(max.clone(), &data_type).ok())
                 .map(Value::into_any)
@@ -310,7 +317,14 @@ impl PruningStatistics for PruneDataFiles<'_, '_> {
             .ok()?
             .data_type();
         let max_values = self.files.iter().map(|manifest| {
-            if !Self::can_prune_column(&manifest.1, column_id) {
+            // The upper bound excludes NaN, which sorts above every number.
+            if !Self::can_prune_column(&manifest.1, column_id)
+                || may_hold_nan(
+                    manifest.1.data_file().nan_value_counts().as_ref(),
+                    column_id,
+                    &field.field_type,
+                )
+            {
                 return None;
             }
             match &manifest.1.data_file().upper_bounds() {
@@ -1492,6 +1506,106 @@ mod tests {
         assert_eq!(min_values.len(), 2);
         assert_eq!(min_values.value(0), -42);
         assert!(min_values.is_null(1));
+    }
+
+    #[test]
+    fn float_upper_bounds_prune_only_nan_free_files() {
+        use datafusion::arrow::array::Float64Array;
+        use iceberg_rust::spec::manifest::AvroMap;
+        use std::collections::HashMap;
+        let schema = Schema::from_struct_type(
+            StructType::new(vec![StructField::new(
+                1,
+                "k",
+                false,
+                Type::Primitive(PrimitiveType::Double),
+                None,
+            )]),
+            1,
+            None,
+        );
+        let arrow_schema = ArrowSchema::new(vec![Field::new("k", DataType::Float64, true)]);
+        let entry = |nan_count: Option<i64>| {
+            let bound = Value::Double(1.0_f64.into());
+            let file = DataFile::builder()
+                .with_content(Content::Data)
+                .with_file_path("/data.parquet".into())
+                .with_file_format(FileFormat::Parquet)
+                .with_partition(Struct::from_iter(Vec::<(String, Option<Value>)>::new()))
+                .with_record_count(2)
+                .with_file_size_in_bytes(1)
+                .with_column_sizes(None)
+                .with_value_counts(None)
+                .with_null_value_counts(None)
+                .with_nan_value_counts(nan_count.map(|count| AvroMap(HashMap::from([(1, count)]))))
+                .with_distinct_counts(None)
+                .with_lower_bounds(Some(HashMap::from([(1, bound.clone())])))
+                .with_upper_bounds(Some(HashMap::from([(1, bound)])))
+                .build()
+                .unwrap();
+            ManifestEntry::builder()
+                .with_format_version(FormatVersion::V2)
+                .with_status(Status::Added)
+                .with_data_file(file)
+                .build()
+                .unwrap()
+        };
+        let files = vec![
+            ("unknown".into(), entry(None)),
+            ("nan".into(), entry(Some(1))),
+            ("clean".into(), entry(Some(0))),
+        ];
+        let pruning = PruneDataFiles::new(&schema, &arrow_schema, &files);
+        let max_values = pruning.max_values(&Column::from_name("k")).unwrap();
+        let max_values = max_values.as_any().downcast_ref::<Float64Array>().unwrap();
+        // `k > 2` must keep a file whose NaN rows lie above its NaN-free upper bound.
+        assert!(max_values.is_null(0));
+        assert!(max_values.is_null(1));
+        assert_eq!(max_values.value(2), 1.0);
+        // NaN sorts above every number, so the lower bound still bounds every file.
+        let min_values = pruning.min_values(&Column::from_name("k")).unwrap();
+        assert_eq!(min_values.null_count(), 0);
+    }
+
+    #[test]
+    fn float_partition_upper_bounds_need_contains_nan_false() {
+        use datafusion::arrow::array::Float64Array;
+        let source = StructField::new(1, "k", false, Type::Primitive(PrimitiveType::Double), None);
+        let partition = PartitionField::new(1, 1000, "k", Transform::Identity);
+        let fields = [BoundPartitionField::new(&partition, &source)];
+        let manifest = |contains_nan: Option<bool>| ManifestListEntry {
+            format_version: FormatVersion::V2,
+            manifest_path: "/data.avro".to_owned(),
+            manifest_length: 1,
+            partition_spec_id: 0,
+            content: ManifestContent::Data,
+            sequence_number: 1,
+            min_sequence_number: 1,
+            added_snapshot_id: 1,
+            added_files_count: Some(1),
+            existing_files_count: Some(0),
+            deleted_files_count: Some(0),
+            added_rows_count: Some(1),
+            existing_rows_count: Some(0),
+            deleted_rows_count: Some(0),
+            partitions: Some(vec![FieldSummary {
+                contains_null: false,
+                contains_nan,
+                lower_bound: Some(Value::Double(1.0_f64.into())),
+                upper_bound: Some(Value::Double(1.0_f64.into())),
+            }]),
+            key_metadata: None,
+            first_row_id: None,
+        };
+        let manifests = [manifest(None), manifest(Some(true)), manifest(Some(false))];
+        let pruning = PruneManifests::new(&fields, 0, &manifests);
+        let max_values = pruning.max_values(&Column::from_name("k")).unwrap();
+        let max_values = max_values.as_any().downcast_ref::<Float64Array>().unwrap();
+        assert!(max_values.is_null(0));
+        assert!(max_values.is_null(1));
+        assert_eq!(max_values.value(2), 1.0);
+        let min_values = pruning.min_values(&Column::from_name("k")).unwrap();
+        assert_eq!(min_values.null_count(), 0);
     }
 
     /// Helper: invoke `DateTransform` directly with a transform name and scalar value.

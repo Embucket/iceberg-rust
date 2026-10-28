@@ -7,7 +7,7 @@ use iceberg_rust::error::Error;
 use iceberg_rust::file_format::parquet::estimate_distinct_count;
 use iceberg_rust::spec::{
     decimal::{decimal_mantissa, decimal_scale},
-    manifest::{ManifestEntry, Status},
+    manifest::{AvroMap, ManifestEntry, Status},
     schema::Schema,
     types::{PrimitiveType, Type},
     values::Value,
@@ -78,12 +78,19 @@ fn column_statistics<'a>(
                 .and_then(|x| x.get(&id))
                 .map(|x| Precision::Exact(*x as usize))
                 .unwrap_or(Precision::Absent),
-            max_value: data_file
-                .upper_bounds()
-                .as_ref()
-                .and_then(|x| x.get(&id))
-                .and_then(|x| bound_statistic(x.clone(), &field.field_type))
-                .unwrap_or(Precision::Absent),
+            // Iceberg bounds exclude NaN, and NaN sorts above every number (as in Snowflake),
+            // so a float column's upper bound only bounds the file when it is known NaN-free.
+            max_value: if may_hold_nan(data_file.nan_value_counts().as_ref(), id, &field.field_type)
+            {
+                Precision::Absent
+            } else {
+                data_file
+                    .upper_bounds()
+                    .as_ref()
+                    .and_then(|x| x.get(&id))
+                    .and_then(|x| bound_statistic(x.clone(), &field.field_type))
+                    .unwrap_or(Precision::Absent)
+            },
             min_value: data_file
                 .lower_bounds()
                 .as_ref()
@@ -100,6 +107,21 @@ fn column_statistics<'a>(
             byte_size: Precision::Absent,
         }
     })
+}
+
+/// Whether a float or double column of a data file may hold NaN: its NaN count is not recorded
+/// (writers that skip NaN counting leave it out) or is positive.
+pub(crate) fn may_hold_nan(
+    nan_value_counts: Option<&AvroMap<i64>>,
+    id: i32,
+    field_type: &Type,
+) -> bool {
+    matches!(
+        field_type,
+        Type::Primitive(PrimitiveType::Float | PrimitiveType::Double)
+    ) && nan_value_counts
+        .and_then(|counts| counts.get(&id))
+        .is_none_or(|count| *count > 0)
 }
 
 /// A data file's lower or upper bound as a column statistic.
@@ -249,6 +271,23 @@ fn new_distinct_count(acc: &ColumnStatistics, x: &ColumnStatistics) -> Precision
 mod tests {
     use super::*;
     use iceberg_rust::spec::decimal::decimal_from_i128_with_scale;
+
+    #[test]
+    fn float_upper_bound_needs_a_zero_nan_count() {
+        use std::collections::HashMap;
+        let double = Type::Primitive(PrimitiveType::Double);
+        let float = Type::Primitive(PrimitiveType::Float);
+        let long = Type::Primitive(PrimitiveType::Long);
+        let counts = |count: i64| AvroMap(HashMap::from([(1, count)]));
+        // Not recorded (the writer skips NaN counting) or positive: the bound may exclude NaN rows.
+        assert!(may_hold_nan(None, 1, &double));
+        assert!(may_hold_nan(Some(&counts(0)), 2, &double));
+        assert!(may_hold_nan(Some(&counts(3)), 1, &float));
+        // Recorded as zero: the upper bound bounds every row.
+        assert!(!may_hold_nan(Some(&counts(0)), 1, &double));
+        // Only float types can hold NaN.
+        assert!(!may_hold_nan(None, 1, &long));
+    }
 
     #[test]
     fn truncatable_bounds_are_inexact_statistics() {
