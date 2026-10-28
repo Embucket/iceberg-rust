@@ -7,7 +7,7 @@ use iceberg_rust::error::Error;
 use iceberg_rust::file_format::parquet::estimate_distinct_count;
 use iceberg_rust::spec::{
     decimal::{decimal_mantissa, decimal_scale},
-    manifest::{ManifestEntry, Status},
+    manifest::{AvroMap, ManifestEntry, Status},
     schema::Schema,
     types::{PrimitiveType, Type},
     values::Value,
@@ -78,25 +78,24 @@ fn column_statistics<'a>(
                 .and_then(|x| x.get(&id))
                 .map(|x| Precision::Exact(*x as usize))
                 .unwrap_or(Precision::Absent),
-            max_value: data_file
-                .upper_bounds()
-                .as_ref()
-                .and_then(|x| x.get(&id))
-                .and_then(|x| {
-                    Some(Precision::Exact(
-                        convert_value_to_scalar_value(x.clone(), &field.field_type).ok()?,
-                    ))
-                })
-                .unwrap_or(Precision::Absent),
+            // Iceberg bounds exclude NaN, which Snowflake orders above every number, so a float
+            // column's upper bound only bounds the file when the file is known NaN-free.
+            max_value: if may_hold_nan(data_file.nan_value_counts().as_ref(), id, &field.field_type)
+            {
+                Precision::Absent
+            } else {
+                data_file
+                    .upper_bounds()
+                    .as_ref()
+                    .and_then(|x| x.get(&id))
+                    .and_then(|x| bound_statistic(x.clone(), &field.field_type))
+                    .unwrap_or(Precision::Absent)
+            },
             min_value: data_file
                 .lower_bounds()
                 .as_ref()
                 .and_then(|x| x.get(&id))
-                .and_then(|x| {
-                    Some(Precision::Exact(
-                        convert_value_to_scalar_value(x.clone(), &field.field_type).ok()?,
-                    ))
-                })
+                .and_then(|x| bound_statistic(x.clone(), &field.field_type))
                 .unwrap_or(Precision::Absent),
             distinct_count: data_file
                 .distinct_counts()
@@ -107,6 +106,46 @@ fn column_statistics<'a>(
             sum_value: Precision::Absent,
             byte_size: Precision::Absent,
         }
+    })
+}
+
+/// Whether a float or double column of a data file may hold NaN: its NaN count is not recorded
+/// (writers that skip NaN counting leave it out) or is positive.
+pub(crate) fn may_hold_nan(
+    nan_value_counts: Option<&AvroMap<i64>>,
+    id: i32,
+    field_type: &Type,
+) -> bool {
+    matches!(
+        field_type,
+        Type::Primitive(PrimitiveType::Float | PrimitiveType::Double)
+    ) && nan_value_counts
+        .and_then(|counts| counts.get(&id))
+        .is_none_or(|count| *count > 0)
+}
+
+/// A data file's lower or upper bound as a column statistic.
+///
+/// String and binary bounds are only bounds: writers truncate them (the Iceberg default
+/// metrics mode is `truncate(16)`) to a prefix of the minimum and an incremented prefix of
+/// the maximum. A float bound of zero is only a bound too: Parquet writers record a zero
+/// minimum as `-0.0` and a zero maximum as `+0.0` whatever the sign of the stored zeros. Such
+/// bounds are marked inexact, so `DataFusion` never answers `MIN`/`MAX` from them without
+/// scanning, and its open-time file pruner skips them; planning-time pruning still uses them.
+/// Other bounds are the column's extremes.
+fn bound_statistic(value: Value, field_type: &Type) -> Option<Precision<ScalarValue>> {
+    let zero_float = match &value {
+        Value::Float(number) => number.0 == 0.0,
+        Value::Double(number) => number.0 == 0.0,
+        _ => false,
+    };
+    let scalar = convert_value_to_scalar_value(value, field_type).ok()?;
+    Some(match field_type {
+        Type::Primitive(PrimitiveType::String | PrimitiveType::Binary) => {
+            Precision::Inexact(scalar)
+        }
+        _ if zero_float => Precision::Inexact(scalar),
+        _ => Precision::Exact(scalar),
     })
 }
 
@@ -241,6 +280,109 @@ fn new_distinct_count(acc: &ColumnStatistics, x: &ColumnStatistics) -> Precision
 mod tests {
     use super::*;
     use iceberg_rust::spec::decimal::decimal_from_i128_with_scale;
+
+    #[test]
+    fn float_upper_bound_needs_a_zero_nan_count() {
+        use std::collections::HashMap;
+        let double = Type::Primitive(PrimitiveType::Double);
+        let float = Type::Primitive(PrimitiveType::Float);
+        let long = Type::Primitive(PrimitiveType::Long);
+        let counts = |count: i64| AvroMap(HashMap::from([(1, count)]));
+        // Not recorded (the writer skips NaN counting) or positive: the bound may exclude NaN rows.
+        assert!(may_hold_nan(None, 1, &double));
+        assert!(may_hold_nan(Some(&counts(0)), 2, &double));
+        assert!(may_hold_nan(Some(&counts(3)), 1, &float));
+        // Recorded as zero: the upper bound bounds every row.
+        assert!(!may_hold_nan(Some(&counts(0)), 1, &double));
+        // Only float types can hold NaN.
+        assert!(!may_hold_nan(None, 1, &long));
+    }
+
+    #[test]
+    fn truncatable_bounds_are_inexact_statistics() {
+        let string = Type::Primitive(PrimitiveType::String);
+        let binary = Type::Primitive(PrimitiveType::Binary);
+        let long = Type::Primitive(PrimitiveType::Long);
+        // A `truncate(16)` upper bound: the prefix with its last character incremented.
+        assert_eq!(
+            bound_statistic(Value::String("snowflake_unloae".to_owned()), &string),
+            Some(Precision::Inexact(ScalarValue::Utf8(Some(
+                "snowflake_unloae".to_owned()
+            ))))
+        );
+        assert!(matches!(
+            bound_statistic(Value::Binary(vec![1, 2, 3]), &binary),
+            Some(Precision::Inexact(_))
+        ));
+        assert_eq!(
+            bound_statistic(Value::LongInt(7), &long),
+            Some(Precision::Exact(ScalarValue::Int64(Some(7))))
+        );
+        // Parquet writers record a zero minimum as -0.0 whatever the stored zeros' sign.
+        let double = Type::Primitive(PrimitiveType::Double);
+        assert_eq!(
+            bound_statistic(Value::Double((-0.0_f64).into()), &double),
+            Some(Precision::Inexact(ScalarValue::Float64(Some(-0.0))))
+        );
+        assert_eq!(
+            bound_statistic(Value::Double(1.5_f64.into()), &double),
+            Some(Precision::Exact(ScalarValue::Float64(Some(1.5))))
+        );
+    }
+
+    #[test]
+    fn float_maximum_is_a_statistic_only_for_nan_free_files() {
+        use iceberg_rust::spec::{
+            manifest::{Content, DataFile, FileFormat},
+            table_metadata::FormatVersion,
+            types::{StructField, StructType},
+            values::Struct,
+        };
+        use std::collections::HashMap;
+        let schema = Schema::from_struct_type(
+            StructType::new(vec![StructField::new(
+                1,
+                "k",
+                false,
+                Type::Primitive(PrimitiveType::Double),
+                None,
+            )]),
+            1,
+            None,
+        );
+        let statistics = |nan_count: Option<i64>| {
+            let file = DataFile::builder()
+                .with_content(Content::Data)
+                .with_file_path("/data.parquet".into())
+                .with_file_format(FileFormat::Parquet)
+                .with_partition(Struct::from_iter(Vec::<(String, Option<Value>)>::new()))
+                .with_record_count(3)
+                .with_file_size_in_bytes(1)
+                .with_column_sizes(None)
+                .with_value_counts(None)
+                .with_null_value_counts(Some(AvroMap(HashMap::from([(1, 0)]))))
+                .with_nan_value_counts(nan_count.map(|count| AvroMap(HashMap::from([(1, count)]))))
+                .with_distinct_counts(None)
+                .with_lower_bounds(Some(HashMap::from([(1, Value::Double(1.0_f64.into()))])))
+                .with_upper_bounds(Some(HashMap::from([(1, Value::Double(1.0_f64.into()))])))
+                .build()
+                .unwrap();
+            let entry = ManifestEntry::builder()
+                .with_format_version(FormatVersion::V2)
+                .with_status(Status::Added)
+                .with_data_file(file)
+                .build()
+                .unwrap();
+            manifest_statistics(&schema, &entry).column_statistics[0].clone()
+        };
+        let one = Precision::Exact(ScalarValue::Float64(Some(1.0)));
+        // {1.0, NaN, 1.0} without a NaN count: MAX is NaN, and min = max must not make k a constant.
+        let unknown = statistics(None);
+        assert_eq!(unknown.min_value, one);
+        assert_eq!(unknown.max_value, Precision::Absent);
+        assert_eq!(statistics(Some(1)).max_value, Precision::Absent);
+        assert_eq!(statistics(Some(0)).max_value, one);
+    }
 
     #[test]
     fn converts_precision_38_decimal_bound_to_datafusion() {
