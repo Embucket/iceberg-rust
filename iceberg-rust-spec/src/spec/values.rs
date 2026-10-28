@@ -1317,6 +1317,14 @@ fn sub_string(left: &str, right: &str) -> u64 {
 mod tests {
 
     use super::*;
+
+    #[test]
+    fn into_any_boxes_plain_floats() {
+        let float = Value::Float(1.5_f32.into()).into_any();
+        assert_eq!(float.downcast_ref::<f32>(), Some(&1.5));
+        let double = Value::Double(2.5_f64.into()).into_any();
+        assert_eq!(double.downcast_ref::<f64>(), Some(&2.5));
+    }
     use crate::{
         spec::types::{ListType, MapType, StructType},
         types::StructField,

@@ -78,8 +78,8 @@ fn column_statistics<'a>(
                 .and_then(|x| x.get(&id))
                 .map(|x| Precision::Exact(*x as usize))
                 .unwrap_or(Precision::Absent),
-            // Iceberg bounds exclude NaN, and NaN sorts above every number (as in Snowflake),
-            // so a float column's upper bound only bounds the file when it is known NaN-free.
+            // Iceberg bounds exclude NaN, which Snowflake orders above every number, so a float
+            // column's upper bound only bounds the file when the file is known NaN-free.
             max_value: if may_hold_nan(data_file.nan_value_counts().as_ref(), id, &field.field_type)
             {
                 Precision::Absent
@@ -128,14 +128,23 @@ pub(crate) fn may_hold_nan(
 ///
 /// String and binary bounds are only bounds: writers truncate them (the Iceberg default
 /// metrics mode is `truncate(16)`) to a prefix of the minimum and an incremented prefix of
-/// the maximum. They stay usable for pruning but are marked inexact, so `DataFusion` never
-/// answers `MIN`/`MAX` from them without scanning. Other bounds are the column's extremes.
+/// the maximum. A float bound of zero is only a bound too: Parquet writers record a zero
+/// minimum as `-0.0` and a zero maximum as `+0.0` whatever the sign of the stored zeros. Such
+/// bounds are marked inexact, so `DataFusion` never answers `MIN`/`MAX` from them without
+/// scanning, and its open-time file pruner skips them; planning-time pruning still uses them.
+/// Other bounds are the column's extremes.
 fn bound_statistic(value: Value, field_type: &Type) -> Option<Precision<ScalarValue>> {
+    let zero_float = match &value {
+        Value::Float(number) => number.0 == 0.0,
+        Value::Double(number) => number.0 == 0.0,
+        _ => false,
+    };
     let scalar = convert_value_to_scalar_value(value, field_type).ok()?;
     Some(match field_type {
         Type::Primitive(PrimitiveType::String | PrimitiveType::Binary) => {
             Precision::Inexact(scalar)
         }
+        _ if zero_float => Precision::Inexact(scalar),
         _ => Precision::Exact(scalar),
     })
 }
@@ -309,6 +318,70 @@ mod tests {
             bound_statistic(Value::LongInt(7), &long),
             Some(Precision::Exact(ScalarValue::Int64(Some(7))))
         );
+        // Parquet writers record a zero minimum as -0.0 whatever the stored zeros' sign.
+        let double = Type::Primitive(PrimitiveType::Double);
+        assert_eq!(
+            bound_statistic(Value::Double((-0.0_f64).into()), &double),
+            Some(Precision::Inexact(ScalarValue::Float64(Some(-0.0))))
+        );
+        assert_eq!(
+            bound_statistic(Value::Double(1.5_f64.into()), &double),
+            Some(Precision::Exact(ScalarValue::Float64(Some(1.5))))
+        );
+    }
+
+    #[test]
+    fn float_maximum_is_a_statistic_only_for_nan_free_files() {
+        use iceberg_rust::spec::{
+            manifest::{Content, DataFile, FileFormat},
+            table_metadata::FormatVersion,
+            types::{StructField, StructType},
+            values::Struct,
+        };
+        use std::collections::HashMap;
+        let schema = Schema::from_struct_type(
+            StructType::new(vec![StructField::new(
+                1,
+                "k",
+                false,
+                Type::Primitive(PrimitiveType::Double),
+                None,
+            )]),
+            1,
+            None,
+        );
+        let statistics = |nan_count: Option<i64>| {
+            let file = DataFile::builder()
+                .with_content(Content::Data)
+                .with_file_path("/data.parquet".into())
+                .with_file_format(FileFormat::Parquet)
+                .with_partition(Struct::from_iter(Vec::<(String, Option<Value>)>::new()))
+                .with_record_count(3)
+                .with_file_size_in_bytes(1)
+                .with_column_sizes(None)
+                .with_value_counts(None)
+                .with_null_value_counts(Some(AvroMap(HashMap::from([(1, 0)]))))
+                .with_nan_value_counts(nan_count.map(|count| AvroMap(HashMap::from([(1, count)]))))
+                .with_distinct_counts(None)
+                .with_lower_bounds(Some(HashMap::from([(1, Value::Double(1.0_f64.into()))])))
+                .with_upper_bounds(Some(HashMap::from([(1, Value::Double(1.0_f64.into()))])))
+                .build()
+                .unwrap();
+            let entry = ManifestEntry::builder()
+                .with_format_version(FormatVersion::V2)
+                .with_status(Status::Added)
+                .with_data_file(file)
+                .build()
+                .unwrap();
+            manifest_statistics(&schema, &entry).column_statistics[0].clone()
+        };
+        let one = Precision::Exact(ScalarValue::Float64(Some(1.0)));
+        // {1.0, NaN, 1.0} without a NaN count: MAX is NaN, and min = max must not make k a constant.
+        let unknown = statistics(None);
+        assert_eq!(unknown.min_value, one);
+        assert_eq!(unknown.max_value, Precision::Absent);
+        assert_eq!(statistics(Some(1)).max_value, Precision::Absent);
+        assert_eq!(statistics(Some(0)).max_value, one);
     }
 
     #[test]
