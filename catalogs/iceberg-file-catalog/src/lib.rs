@@ -36,6 +36,12 @@ use percent_encoding::percent_decode_str;
 
 use crate::error::Error;
 
+#[cfg(test)]
+type NamespaceWorkerPause = (
+    tokio::sync::oneshot::Sender<()>,
+    std::sync::mpsc::Receiver<()>,
+);
+
 #[derive(Debug)]
 pub struct FileCatalog {
     path: String,
@@ -58,6 +64,10 @@ pub struct FileCatalog {
     >,
     #[cfg(test)]
     drop_lock_reached: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    namespace_create_pause: StdMutex<Option<NamespaceWorkerPause>>,
+    #[cfg(test)]
+    namespace_drop_pause: StdMutex<Option<NamespaceWorkerPause>>,
 }
 
 type MutationLock = tokio::sync::Mutex<()>;
@@ -189,6 +199,10 @@ impl FileCatalog {
             create_after_write_pause: StdMutex::new(None),
             #[cfg(test)]
             drop_lock_reached: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            namespace_create_pause: StdMutex::new(None),
+            #[cfg(test)]
+            namespace_drop_pause: StdMutex::new(None),
         })
     }
 
@@ -217,28 +231,57 @@ impl Catalog for FileCatalog {
                 let directory = store
                     .path_to_filesystem(&self.catalog_root_path().join(name))
                     .map_err(IcebergError::from)?;
-                tokio::task::spawn_blocking(move || std::fs::create_dir_all(directory))
-                    .await
-                    .map_err(|error| IcebergError::External(Box::new(error)))?
-                    .map_err(|error| IcebergError::External(Box::new(error)))?;
+                let catalog_guard = self.catalog_mutation_lock().write_owned().await;
+                #[cfg(test)]
+                let pause = self.namespace_create_pause.lock().unwrap().take();
+                // A cancelled waiter cannot stop an already-started filesystem job.
+                // Keep the mutation lock with the actual IO, not its awaiter.
+                tokio::task::spawn_blocking(move || {
+                    let _catalog_guard = catalog_guard;
+                    #[cfg(test)]
+                    pause_namespace_worker(pause)?;
+                    std::fs::create_dir_all(directory)
+                })
+                .await
+                .map_err(|error| IcebergError::External(Box::new(error)))?
+                .map_err(|error| IcebergError::External(Box::new(error)))?;
             }
         }
         Ok(HashMap::new())
     }
     /// Drop a namespace in the catalog
     async fn drop_namespace(&self, namespace: &Namespace) -> Result<(), IcebergError> {
-        let catalog_lock = self.catalog_mutation_lock();
-        let _catalog_guard = catalog_lock.write().await;
+        let catalog_guard = self.catalog_mutation_lock().write_owned().await;
+        if let ObjectStoreBuilder::Filesystem(store) = &self.object_store {
+            if let Some(name) = durable_local_namespace_name(namespace) {
+                let directory = store
+                    .path_to_filesystem(&self.catalog_root_path().join(name))
+                    .map_err(IcebergError::from)?;
+                let cache = Arc::clone(&self.cache);
+                let target = name.to_owned();
+                #[cfg(test)]
+                let pause = self.namespace_drop_pause.lock().unwrap().take();
+                return tokio::task::spawn_blocking(move || {
+                    let _catalog_guard = catalog_guard;
+                    #[cfg(test)]
+                    pause_namespace_worker(pause)?;
+                    remove_namespace_directory(&directory)?;
+                    cache
+                        .write()
+                        .map_err(|_| std::io::Error::other("Namespace cache lock is poisoned"))?
+                        .retain(|id, _| id.namespace().first() != Some(&target));
+                    Ok::<(), std::io::Error>(())
+                })
+                .await
+                .map_err(|error| IcebergError::External(Box::new(error)))?
+                .map_err(|error| IcebergError::External(Box::new(error)));
+            }
+        }
+        let _catalog_guard = catalog_guard;
         let bucket = Bucket::from_path(&self.path)?;
         let object_store = self.object_store.build(bucket)?;
 
-        let local_durable = matches!(self.object_store, ObjectStoreBuilder::Filesystem(_))
-            && durable_local_namespace_name(namespace).is_some();
-        let prefix = if local_durable {
-            self.catalog_root_path().join(namespace[0].as_str())
-        } else {
-            ObjectPath::from(strip_prefix(&self.namespace_path(&namespace[0])))
-        };
+        let prefix = ObjectPath::from(strip_prefix(&self.namespace_path(&namespace[0])));
         let paths: Vec<_> = object_store
             .list(Some(&prefix))
             .map_ok(|x| x.location)
@@ -251,18 +294,6 @@ impl Catalog for FileCatalog {
                 .delete(&path)
                 .await
                 .map_err(IcebergError::from)?;
-        }
-
-        if local_durable {
-            if let ObjectStoreBuilder::Filesystem(store) = &self.object_store {
-                let directory = store
-                    .path_to_filesystem(&prefix)
-                    .map_err(IcebergError::from)?;
-                tokio::task::spawn_blocking(move || remove_empty_directory_tree(&directory))
-                    .await
-                    .map_err(|error| IcebergError::External(Box::new(error)))?
-                    .map_err(|error| IcebergError::External(Box::new(error)))?;
-            }
         }
 
         let target = namespace[0].clone();
@@ -1057,29 +1088,23 @@ impl FileCatalog {
     }
 }
 
-fn remove_empty_directory_tree(directory: &Path) -> std::io::Result<()> {
-    let metadata = match std::fs::symlink_metadata(directory) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error),
-    };
-    if !metadata.is_dir() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "Namespace path is not a directory",
-        ));
-    }
-    for entry in std::fs::read_dir(directory)? {
-        let entry = entry?;
-        if entry.file_type()?.is_dir() {
-            remove_empty_directory_tree(&entry.path())?;
-        }
-    }
-    match std::fs::remove_dir(directory) {
+fn remove_namespace_directory(directory: &Path) -> std::io::Result<()> {
+    match std::fs::remove_dir_all(directory) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
     }
+}
+
+#[cfg(test)]
+fn pause_namespace_worker(pause: Option<NamespaceWorkerPause>) -> std::io::Result<()> {
+    if let Some((entered, resume)) = pause {
+        let _ = entered.send(());
+        resume
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::TimedOut, error))?;
+    }
+    Ok(())
 }
 
 fn durable_local_namespace_name(namespace: &Namespace) -> Option<&str> {
@@ -1259,6 +1284,10 @@ impl CatalogList for FileCatalogList {
             create_after_write_pause: StdMutex::new(None),
             #[cfg(test)]
             drop_lock_reached: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            namespace_create_pause: StdMutex::new(None),
+            #[cfg(test)]
+            namespace_drop_pause: StdMutex::new(None),
         }))
     }
     async fn list_catalogs(&self) -> Vec<String> {
@@ -1298,6 +1327,7 @@ pub mod tests {
         catalog::{
             commit::{CommitTable, TableRequirement, TableUpdate},
             create::CreateTableBuilder,
+            identifier::Identifier,
             namespace::Namespace,
             tabular::Tabular,
             Catalog,
@@ -1313,14 +1343,18 @@ pub mod tests {
         },
     };
     use object_store::{path::Path as ObjectPath, ObjectStoreExt};
-    use std::{collections::HashMap, sync::Arc, time::Duration};
+    use std::{
+        collections::HashMap,
+        sync::{Arc, Mutex as StdMutex},
+        time::Duration,
+    };
     use testcontainers::{core::ExecCommand, runners::AsyncRunner, ImageExt};
     use testcontainers_modules::localstack::LocalStack;
     use tokio::time::sleep;
     // use testcontainers::{core::ExecCommand, runners::AsyncRunner, ImageExt};
     // use testcontainers_modules::localstack::LocalStack;
 
-    use crate::FileCatalog;
+    use crate::{FileCatalog, NamespaceWorkerPause};
 
     fn simple_table_schema() -> Schema {
         Schema::builder()
@@ -1393,6 +1427,133 @@ pub mod tests {
         let reopened = FileCatalog::new(&path, store).await.unwrap();
         assert!(!reopened.namespace_exists(&namespace).await.unwrap());
         assert!(!temp.path().join("catalog/EMPTY").exists());
+    }
+
+    fn filesystem_namespace_directory(
+        catalog: &FileCatalog,
+        namespace: &Namespace,
+    ) -> std::path::PathBuf {
+        let ObjectStoreBuilder::Filesystem(store) = &catalog.object_store else {
+            panic!("filesystem test catalog required");
+        };
+        store
+            .path_to_filesystem(&catalog.catalog_root_path().join(namespace[0].as_str()))
+            .unwrap()
+    }
+
+    fn namespace_worker_gate(
+        pause: &StdMutex<Option<NamespaceWorkerPause>>,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (entered, waiting) = tokio::sync::oneshot::channel();
+        let (resume, release) = std::sync::mpsc::channel();
+        *pause.lock().unwrap() = Some((entered, release));
+        (waiting, resume)
+    }
+
+    #[tokio::test]
+    async fn cancelled_namespace_create_keeps_blocking_worker_lock_until_drop() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("encoded catalog %");
+        let path = url::Url::from_directory_path(&root).unwrap().to_string();
+        let store = ObjectStoreBuilder::filesystem("/");
+        let creator = Arc::new(FileCatalog::new(&path, store.clone()).await.unwrap());
+        let dropper = FileCatalog::new(&path, store).await.unwrap();
+        let namespace = Namespace::try_new(&["MixedCase".to_owned()]).unwrap();
+        let directory = filesystem_namespace_directory(&creator, &namespace);
+        let (entered, resume) = namespace_worker_gate(&creator.namespace_create_pause);
+        let create = tokio::spawn({
+            let creator = Arc::clone(&creator);
+            let namespace = namespace.clone();
+            async move { creator.create_namespace(&namespace, None).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered)
+            .await
+            .unwrap()
+            .unwrap();
+        create.abort();
+        assert!(create.await.unwrap_err().is_cancelled());
+        assert!(dropper.catalog_mutation_lock().try_write_owned().is_err());
+        let mut drop = Box::pin(dropper.drop_namespace(&namespace));
+        assert!(futures::poll!(drop.as_mut()).is_pending());
+        resume.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), drop)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!directory.exists());
+        assert!(!dropper.namespace_exists(&namespace).await.unwrap());
+        dropper.drop_namespace(&namespace).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_namespace_drop_keeps_blocking_worker_lock_until_recreate() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("encoded catalog %");
+        let path = url::Url::from_directory_path(&root).unwrap().to_string();
+        let store = ObjectStoreBuilder::filesystem("/");
+        let dropper = Arc::new(FileCatalog::new(&path, store.clone()).await.unwrap());
+        let creator = FileCatalog::new(&path, store).await.unwrap();
+        let namespace = Namespace::try_new(&["APP".to_owned()]).unwrap();
+        let directory = filesystem_namespace_directory(&dropper, &namespace);
+        dropper.create_namespace(&namespace, None).await.unwrap();
+        CreateTableBuilder::default()
+            .with_name("OLD_ITEMS")
+            .with_schema(simple_table_schema())
+            .build(&namespace, dropper.clone())
+            .await
+            .unwrap();
+        let identifier = Identifier::new(&namespace, "OLD_ITEMS");
+        assert!(dropper.cache.read().unwrap().contains_key(&identifier));
+        assert!(directory.join("OLD_ITEMS").is_dir());
+        let (entered, resume) = namespace_worker_gate(&dropper.namespace_drop_pause);
+        let dropping = tokio::spawn({
+            let dropper = Arc::clone(&dropper);
+            let namespace = namespace.clone();
+            async move { dropper.drop_namespace(&namespace).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered)
+            .await
+            .unwrap()
+            .unwrap();
+        dropping.abort();
+        assert!(dropping.await.unwrap_err().is_cancelled());
+        assert!(creator.catalog_mutation_lock().try_write_owned().is_err());
+        let mut creating = Box::pin(creator.create_namespace(&namespace, None));
+        assert!(futures::poll!(creating.as_mut()).is_pending());
+        resume.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), creating)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(directory.is_dir());
+        assert!(!directory.join("OLD_ITEMS").exists());
+        assert!(!dropper.cache.read().unwrap().contains_key(&identifier));
+        assert!(creator.namespace_exists(&namespace).await.unwrap());
+        assert!(creator.list_tabulars(&namespace).await.unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn filesystem_namespace_drop_does_not_follow_nested_symlinks() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("catalog");
+        let path = url::Url::from_directory_path(&root).unwrap().to_string();
+        let catalog = FileCatalog::new(&path, ObjectStoreBuilder::filesystem("/"))
+            .await
+            .unwrap();
+        let namespace = Namespace::try_new(&["APP".to_owned()]).unwrap();
+        let directory = filesystem_namespace_directory(&catalog, &namespace);
+        catalog.create_namespace(&namespace, None).await.unwrap();
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("keep"), b"untouched").unwrap();
+        std::os::unix::fs::symlink(&outside, directory.join("external")).unwrap();
+        catalog.drop_namespace(&namespace).await.unwrap();
+        assert!(!directory.exists());
+        assert_eq!(std::fs::read(outside.join("keep")).unwrap(), b"untouched");
     }
 
     #[tokio::test]
