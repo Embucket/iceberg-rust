@@ -104,6 +104,27 @@ and its gates are bypassed; the data cache has its own independent capacity.
 Retained parsed metadata remains byte-capped; in-flight reads
 and query-owned metadata still require separate memory headroom.
 
+# Pre-touch
+
+On S3, a data-range `GET` of an object that was requested less than about a
+second earlier gets its response headers roughly twice as fast as one to an
+object left untouched for ten seconds or more. Measured on the deployed service
+(TPC-H SF100, same run, same image): data `GET` headers p50 ≈ 30–45 ms after a
+footer read of the same file versus ≈ 85–90 ms otherwise. A cache hit removes
+exactly that footer read, so warm scans pay the slow first touch on every data
+file.
+
+With `ICEBERG_PARQUET_PRE_TOUCH_MAX_IN_FLIGHT` set above `0` (read once per
+process; default `0`, off), a cache hit therefore issues one 8-byte ranged `GET`
+of the file's tail. With `file_stream_open_ahead` the hit happens while the
+previous file is still being read, so the touch lands before that file's data
+reads start. The touch holds no buffer beyond its 8 bytes. It never delays the
+hit: it runs as a task owned by the reader (aborted when the reader drops, no
+detached task), takes a slot of a process-wide semaphore without waiting, and is
+skipped when every slot is taken. Its outcome is ignored, because the data read
+that follows reports any real error. `parquet_pre_touches` and
+`parquet_pre_touch_skipped` count both cases.
+
 [`ParquetSource`]: datafusion::datasource::physical_plan::parquet::source::ParquetSource
 */
 
@@ -114,6 +135,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 use crate::parquet_data_cache::{DataCache, DataMetrics, ScanAdmission, DATA_CACHE};
 use bytes::Bytes;
+use datafusion::common::runtime::SpawnedTask;
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::physical_plan::parquet::{
     DefaultParquetFileReaderFactory, ParquetFileReaderFactory,
@@ -126,10 +148,18 @@ use datafusion::physical_plan::metrics::{Count, ExecutionPlanMetricsSet, MetricB
 use futures::future::BoxFuture;
 use futures::FutureExt;
 use lru::LruCache;
-use object_store::ObjectStore;
-use tokio::sync::Mutex as AsyncMutex;
+use object_store::path::Path as ObjectPath;
+use object_store::{ObjectStore, ObjectStoreExt};
+use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 
 const DEFAULT_CAP_MB: usize = 64;
+
+/// Bytes requested by one pre-touch: the file tail, as the footer read it
+/// replaces would start with.
+const PRE_TOUCH_BYTES: u64 = 8;
+
+/// Upper bound on `ICEBERG_PARQUET_PRE_TOUCH_MAX_IN_FLIGHT`.
+const PRE_TOUCH_MAX_IN_FLIGHT_CAP: usize = 1024;
 
 /// Upper bound on the number of distinct nonblocking per-file gates kept live
 /// at once. The gate map is an LRU capped here so it stays bounded no matter how
@@ -238,6 +268,10 @@ struct CacheMetrics {
     page_index_suppressed: Count,
     /// Independent loads used instead of waiting for another input's loader.
     contention_bypasses: Count,
+    /// Tail `GET`s started on a cache hit. See the module docs, "Pre-touch".
+    pre_touches: Count,
+    /// Cache hits that started no pre-touch because every slot was taken.
+    pre_touch_skipped: Count,
 }
 
 impl CacheMetrics {
@@ -251,6 +285,9 @@ impl CacheMetrics {
                 .counter("parquet_metadata_cache_page_index_suppressed", partition),
             contention_bypasses: MetricBuilder::new(metrics)
                 .counter("parquet_metadata_cache_contention_bypasses", partition),
+            pre_touches: MetricBuilder::new(metrics).counter("parquet_pre_touches", partition),
+            pre_touch_skipped: MetricBuilder::new(metrics)
+                .counter("parquet_pre_touch_skipped", partition),
         }
     }
 }
@@ -258,9 +295,10 @@ impl CacheMetrics {
 /// The parsed-footer LRU together with nonblocking per-file load gates.
 ///
 /// A single instance backs the whole process ([`CACHE`]); the tests construct
-/// isolated instances (including disabled ones) to drive [`load`] deterministically.
+/// isolated instances (including disabled ones) to drive
+/// [`load_reporting_hit`] deterministically.
 ///
-/// [`load`]: MetadataCache::load
+/// [`load_reporting_hit`]: MetadataCache::load_reporting_hit
 struct MetadataCache {
     /// Parsed footers, byte-capped. `None` when caching is disabled (cap `0`),
     /// in which case lookups, inserts, and load gates are all
@@ -398,15 +436,8 @@ impl MetadataCache {
         gate
     }
 
-    /// Resolve the footer for `key`: serve it from cache, or fetch+parse it
-    /// through `reader` on a miss, without depending on another reader's polling.
-    ///
-    /// When caching is disabled the fetch is issued straight through with no
-    /// gate and no lock. Contenders never wait for an in-flight loader: it may
-    /// be a prefetched input that the query parent has stopped polling. They
-    /// recheck the cache, then load independently when necessary. The trade is
-    /// duplicate cold I/O, not a cross-input dependency or detached background
-    /// task. Synchronous LRU locks are never held across the metadata await.
+    /// [`load_reporting_hit`](Self::load_reporting_hit) without the hit flag.
+    #[cfg(test)]
     async fn load(
         &self,
         reader: &mut (dyn AsyncFileReader + Send),
@@ -415,21 +446,45 @@ impl MetadataCache {
         size: u64,
         metrics: &CacheMetrics,
     ) -> ParquetResult<Arc<ParquetMetaData>> {
+        let (meta, _hit) = self
+            .load_reporting_hit(reader, options, key, size, metrics)
+            .await?;
+        Ok(meta)
+    }
+
+    /// Resolve the footer for `key`: serve it from cache, or fetch+parse it
+    /// through `reader` on a miss, without depending on another reader's polling.
+    /// The flag is `true` when the footer came from the cache.
+    ///
+    /// When caching is disabled the fetch is issued straight through with no
+    /// gate and no lock. Contenders never wait for an in-flight loader: it may
+    /// be a prefetched input that the query parent has stopped polling. They
+    /// recheck the cache, then load independently when necessary. The trade is
+    /// duplicate cold I/O, not a cross-input dependency or detached background
+    /// task. Synchronous LRU locks are never held across the metadata await.
+    async fn load_reporting_hit(
+        &self,
+        reader: &mut (dyn AsyncFileReader + Send),
+        options: Option<&ArrowReaderOptions>,
+        key: &str,
+        size: u64,
+        metrics: &CacheMetrics,
+    ) -> ParquetResult<(Arc<ParquetMetaData>, bool)> {
         if let Some(meta) = self.get(key, size) {
             metrics.hits.add(1);
-            return Ok(meta);
+            return Ok((meta, true));
         }
         if !self.enabled() {
             // Disabled cache: no gate, no lock overhead — read straight through.
             metrics.misses.add(1);
-            return reader.get_metadata(options).await;
+            return Ok((reader.get_metadata(options).await?, false));
         }
         let gate = self.inflight_gate(key);
         let permit = gate.try_lock().ok();
         // A racing reader may have populated the cache since our first lookup.
         if let Some(meta) = self.get(key, size) {
             metrics.hits.add(1);
-            return Ok(meta);
+            return Ok((meta, true));
         }
         if permit.is_none() {
             metrics.contention_bypasses.add(1);
@@ -448,7 +503,7 @@ impl MetadataCache {
         metrics
             .evictions
             .add(self.put(key, size, Arc::clone(&meta)));
-        Ok(meta)
+        Ok((meta, false))
     }
 }
 
@@ -498,6 +553,29 @@ fn clamp_metadata_size_hint(hint: Option<usize>, file_size: u64) -> Option<usize
     Some(hint.min(usize::try_from(file_size).unwrap_or(usize::MAX)))
 }
 
+/// Pre-touch concurrency limit, from `ICEBERG_PARQUET_PRE_TOUCH_MAX_IN_FLIGHT`
+/// (read once per process; absent or `0` disables pre-touch, the shipped default).
+/// See the module docs, "Pre-touch".
+static PRE_TOUCH_MAX_IN_FLIGHT: LazyLock<usize> = LazyLock::new(|| {
+    parse_pre_touch_max_in_flight(
+        std::env::var("ICEBERG_PARQUET_PRE_TOUCH_MAX_IN_FLIGHT")
+            .ok()
+            .as_deref(),
+    )
+});
+
+/// The process-wide pre-touch slots, `None` while pre-touch is disabled.
+static PRE_TOUCH_SLOTS: LazyLock<Option<Arc<Semaphore>>> = LazyLock::new(|| {
+    let max = *PRE_TOUCH_MAX_IN_FLIGHT;
+    (max > 0).then(|| Arc::new(Semaphore::new(max)))
+});
+
+fn parse_pre_touch_max_in_flight(raw: Option<&str>) -> usize {
+    raw.and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(0)
+        .min(PRE_TOUCH_MAX_IN_FLIGHT_CAP)
+}
+
 /// The caller's options with the page-index policy raised to `Optional`, or
 /// `None` to leave the caller's options untouched.
 ///
@@ -543,6 +621,7 @@ static CACHE: LazyLock<MetadataCache> = LazyLock::new(|| {
         configured = raw.is_some(),
         page_index_cached = *CACHE_PAGE_INDEX,
         metadata_size_hint_bytes = *METADATA_SIZE_HINT,
+        pre_touch_max_in_flight = *PRE_TOUCH_MAX_IN_FLIGHT,
         "parquet metadata cache initialized"
     );
     MetadataCache::new(cap_mb.saturating_mul(1024 * 1024))
@@ -583,6 +662,11 @@ pub(crate) struct CachingParquetFileReaderFactory {
     /// Shared by every reader of this scan; `None` while the data cache is
     /// disabled, in which case data reads go straight to the inner reader.
     data_scan: Option<Arc<ScanAdmission>>,
+    /// The store the inner factory reads from, for pre-touches.
+    store: Arc<dyn ObjectStore>,
+    /// The process-wide [`PRE_TOUCH_SLOTS`] outside tests; `None` disables
+    /// pre-touch.
+    pre_touch_slots: Option<Arc<Semaphore>>,
 }
 
 impl CachingParquetFileReaderFactory {
@@ -590,6 +674,7 @@ impl CachingParquetFileReaderFactory {
     /// `key_prefix` (the scan's object-store URL).
     pub(crate) fn new(store: Arc<dyn ObjectStore>, key_prefix: &str) -> Self {
         Self::with_data_cache(store, key_prefix, &DATA_CACHE)
+            .with_pre_touch_slots(PRE_TOUCH_SLOTS.clone())
     }
 
     fn with_data_cache(
@@ -598,11 +683,18 @@ impl CachingParquetFileReaderFactory {
         data_cache: &'static DataCache,
     ) -> Self {
         Self {
-            inner: Arc::new(DefaultParquetFileReaderFactory::new(store)),
+            inner: Arc::new(DefaultParquetFileReaderFactory::new(Arc::clone(&store))),
             key_prefix: Arc::from(key_prefix),
             data_cache,
             data_scan: data_cache.enabled().then(Arc::default),
+            store,
+            pre_touch_slots: None,
         }
+    }
+
+    fn with_pre_touch_slots(mut self, slots: Option<Arc<Semaphore>>) -> Self {
+        self.pre_touch_slots = slots;
+        self
     }
 }
 
@@ -614,12 +706,36 @@ impl ParquetFileReaderFactory for CachingParquetFileReaderFactory {
         metadata_size_hint: Option<usize>,
         metrics: &ExecutionPlanMetricsSet,
     ) -> datafusion::error::Result<Box<dyn AsyncFileReader + Send>> {
+        Ok(Box::new(self.caching_reader(
+            partition_index,
+            partitioned_file,
+            metadata_size_hint,
+            metrics,
+        )?))
+    }
+}
+
+impl CachingParquetFileReaderFactory {
+    /// [`ParquetFileReaderFactory::create_reader`] without the box, so tests
+    /// can reach the reader's pre-touch.
+    fn caching_reader(
+        &self,
+        partition_index: usize,
+        partitioned_file: PartitionedFile,
+        metadata_size_hint: Option<usize>,
+        metrics: &ExecutionPlanMetricsSet,
+    ) -> datafusion::error::Result<CachingMetadataReader> {
         let key = format!(
             "{}{}",
             self.key_prefix,
             partitioned_file.object_meta.location.as_ref()
         );
         let size = partitioned_file.object_meta.size;
+        let pre_touch = self.pre_touch_slots.as_ref().map(|slots| PreTouch {
+            store: Arc::clone(&self.store),
+            location: partitioned_file.object_meta.location.clone(),
+            slots: Arc::clone(slots),
+        });
         let cache_metrics = CacheMetrics::new(metrics, partition_index);
         let data_metrics = DataMetrics::new(metrics, partition_index, self.data_scan.is_some());
         let inner = self.inner.create_reader(
@@ -628,7 +744,7 @@ impl ParquetFileReaderFactory for CachingParquetFileReaderFactory {
             metadata_size_hint,
             metrics,
         )?;
-        Ok(Box::new(CachingMetadataReader {
+        Ok(CachingMetadataReader {
             inner,
             key: Arc::from(key),
             size,
@@ -636,8 +752,17 @@ impl ParquetFileReaderFactory for CachingParquetFileReaderFactory {
             data_metrics,
             data_cache: self.data_cache,
             data_scan: self.data_scan.clone(),
-        }))
+            pre_touch,
+            touch: None,
+        })
     }
+}
+
+/// What a reader needs to pre-touch its file. See the module docs, "Pre-touch".
+struct PreTouch {
+    store: Arc<dyn ObjectStore>,
+    location: ObjectPath,
+    slots: Arc<Semaphore>,
 }
 
 /// [`AsyncFileReader`] decorator that serves `get_metadata` from the
@@ -650,6 +775,38 @@ struct CachingMetadataReader {
     data_metrics: DataMetrics,
     data_cache: &'static DataCache,
     data_scan: Option<Arc<ScanAdmission>>,
+    /// `None` while pre-touch is disabled.
+    pre_touch: Option<PreTouch>,
+    /// This file's pre-touch, aborted if still running when the reader drops.
+    touch: Option<SpawnedTask<()>>,
+}
+
+impl CachingMetadataReader {
+    /// Start this file's pre-touch: at most one per reader, never waiting for
+    /// a slot.
+    fn start_pre_touch(&mut self) {
+        let Some(pre_touch) = self.pre_touch.as_ref() else {
+            return;
+        };
+        // Spawning needs a runtime; a reader polled outside one skips the touch.
+        if self.touch.is_some() || self.size == 0 || tokio::runtime::Handle::try_current().is_err()
+        {
+            return;
+        }
+        let Ok(slot) = Arc::clone(&pre_touch.slots).try_acquire_owned() else {
+            self.metrics.pre_touch_skipped.add(1);
+            return;
+        };
+        let store = Arc::clone(&pre_touch.store);
+        let location = pre_touch.location.clone();
+        let range = self.size.saturating_sub(PRE_TOUCH_BYTES)..self.size;
+        self.metrics.pre_touches.add(1);
+        self.touch = Some(SpawnedTask::spawn(async move {
+            let _slot = slot;
+            // Ignored: the data reads that follow report any real error.
+            let _ = store.get_range(&location, range).await;
+        }));
+    }
 }
 
 impl AsyncFileReader for CachingMetadataReader {
@@ -702,15 +859,22 @@ impl AsyncFileReader for CachingMetadataReader {
         &'a mut self,
         options: Option<&'a ArrowReaderOptions>,
     ) -> BoxFuture<'a, ParquetResult<Arc<ParquetMetaData>>> {
-        CACHE
-            .load(
-                &mut *self.inner,
-                options,
-                &self.key,
-                self.size,
-                &self.metrics,
-            )
-            .boxed()
+        async move {
+            let (meta, hit) = CACHE
+                .load_reporting_hit(
+                    &mut *self.inner,
+                    options,
+                    &self.key,
+                    self.size,
+                    &self.metrics,
+                )
+                .await?;
+            if hit {
+                self.start_pre_touch();
+            }
+            Ok(meta)
+        }
+        .boxed()
     }
 }
 
@@ -1020,6 +1184,8 @@ mod tests {
         heads: AtomicUsize,
         /// `(end of column-chunk data, file size)` per registered location.
         layouts: Mutex<std::collections::HashMap<String, (u64, u64)>>,
+        /// The range of every GET, in arrival order.
+        ranges: Mutex<Vec<Option<GetRange>>>,
     }
 
     /// GET counts accumulated since the previous [`GetProbe::take`].
@@ -1070,9 +1236,15 @@ mod tests {
                 return None;
             }
             self.record(location, options.range.as_ref());
+            self.ranges.lock().unwrap().push(options.range.clone());
             let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_in_flight.fetch_max(now, Ordering::SeqCst);
             Some(InFlight(&self.in_flight))
+        }
+
+        /// GET ranges since the previous call.
+        fn take_ranges(&self) -> Vec<Option<GetRange>> {
+            std::mem::take(&mut *self.ranges.lock().unwrap())
         }
 
         /// Counts since the previous call; resets them for the next measurement.
@@ -1251,6 +1423,155 @@ mod tests {
             Arc::ptr_eq(&cold, &warm),
             "warm scan returns the cached Arc"
         );
+    }
+
+    #[test]
+    fn pre_touch_max_in_flight_parses_off_by_default_and_caps() {
+        assert_eq!(parse_pre_touch_max_in_flight(None), 0);
+        assert_eq!(parse_pre_touch_max_in_flight(Some("0")), 0);
+        assert_eq!(parse_pre_touch_max_in_flight(Some("off")), 0);
+        assert_eq!(parse_pre_touch_max_in_flight(Some(" 16 ")), 16);
+        assert_eq!(
+            parse_pre_touch_max_in_flight(Some("1000000")),
+            PRE_TOUCH_MAX_IN_FLIGHT_CAP
+        );
+    }
+
+    /// A store over one freshly written parquet file whose GETs are counted and
+    /// held for `delay`, plus the file's size.
+    async fn pre_touch_store(
+        path: &str,
+        delay: Option<Duration>,
+    ) -> (Arc<dyn ObjectStore>, Arc<GetProbe>, u64) {
+        let inner = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let size = write_parquet(&inner, path).await;
+        let probe = Arc::<GetProbe>::default();
+        let store = Arc::new(CountingStore {
+            inner,
+            gets: Arc::default(),
+            delay,
+            probe: Arc::clone(&probe),
+            copy_bodies: false,
+        }) as Arc<dyn ObjectStore>;
+        (store, probe, size)
+    }
+
+    /// Cold load through one reader, then a fresh reader for the hit. Returns
+    /// that reader; the cold load's GETs are already taken from `probe`.
+    async fn warm_reader(
+        factory: &CachingParquetFileReaderFactory,
+        probe: &GetProbe,
+        path: &str,
+        size: u64,
+        metrics: &ExecutionPlanMetricsSet,
+    ) -> CachingMetadataReader {
+        let mut cold = factory
+            .caching_reader(0, partitioned_file(path, size), None, metrics)
+            .unwrap();
+        cold.get_metadata(None).await.unwrap();
+        assert!(cold.touch.is_none(), "a miss reads the footer, so no touch");
+        probe.take_ranges();
+        factory
+            .caching_reader(0, partitioned_file(path, size), None, metrics)
+            .unwrap()
+    }
+
+    fn metric(metrics: &ExecutionPlanMetricsSet, name: &str) -> usize {
+        metrics
+            .clone_inner()
+            .sum_by_name(name)
+            .map_or(0, |v| v.as_usize())
+    }
+
+    /// A hit starts exactly one 8-byte GET of the file tail and returns the
+    /// cached footer without waiting for it.
+    #[tokio::test]
+    async fn pre_touch_on_hit_reads_the_file_tail_once() {
+        let _shared = PROCESS_CACHE_LOCK.read().await;
+        if !process_cache_enabled() {
+            return;
+        }
+        let path = "db/tbl/data/pre-touch-hit.parquet";
+        let (store, probe, size) = pre_touch_store(path, None).await;
+        let factory =
+            CachingParquetFileReaderFactory::new(store, "iceberg-rust://pre-touch-hit-test/")
+                .with_pre_touch_slots(Some(Arc::new(Semaphore::new(4))));
+        let metrics = ExecutionPlanMetricsSet::new();
+        let mut reader = warm_reader(&factory, &probe, path, size, &metrics).await;
+
+        reader.get_metadata(None).await.unwrap();
+        // A second footer request on the same reader adds no touch.
+        reader.get_metadata(None).await.unwrap();
+        reader
+            .touch
+            .take()
+            .expect("hit starts a touch")
+            .join()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            probe.take_ranges(),
+            vec![Some(GetRange::Bounded(size - PRE_TOUCH_BYTES..size))]
+        );
+        assert_eq!(metric(&metrics, "parquet_pre_touches"), 1);
+        assert_eq!(metric(&metrics, "parquet_pre_touch_skipped"), 0);
+    }
+
+    /// With every slot taken a hit skips the touch instead of waiting for one.
+    #[tokio::test]
+    async fn pre_touch_skips_when_no_slot_is_free() {
+        let _shared = PROCESS_CACHE_LOCK.read().await;
+        if !process_cache_enabled() {
+            return;
+        }
+        let path = "db/tbl/data/pre-touch-full.parquet";
+        let (store, probe, size) = pre_touch_store(path, None).await;
+        let factory =
+            CachingParquetFileReaderFactory::new(store, "iceberg-rust://pre-touch-full-test/")
+                .with_pre_touch_slots(Some(Arc::new(Semaphore::new(0))));
+        let metrics = ExecutionPlanMetricsSet::new();
+        let mut reader = warm_reader(&factory, &probe, path, size, &metrics).await;
+
+        reader.get_metadata(None).await.unwrap();
+
+        assert!(reader.touch.is_none());
+        assert!(probe.take_ranges().is_empty());
+        assert_eq!(metric(&metrics, "parquet_pre_touches"), 0);
+        assert_eq!(metric(&metrics, "parquet_pre_touch_skipped"), 1);
+    }
+
+    /// Dropping the reader aborts a touch still in flight and frees its slot.
+    #[tokio::test]
+    async fn pre_touch_is_cancelled_when_the_reader_drops() {
+        let _shared = PROCESS_CACHE_LOCK.read().await;
+        if !process_cache_enabled() {
+            return;
+        }
+        let path = "db/tbl/data/pre-touch-drop.parquet";
+        // Long enough that the touch is still pending when the reader drops;
+        // the cold load pays it too, once.
+        let (store, probe, size) = pre_touch_store(path, Some(Duration::from_millis(300))).await;
+        let slots = Arc::new(Semaphore::new(1));
+        let factory =
+            CachingParquetFileReaderFactory::new(store, "iceberg-rust://pre-touch-drop-test/")
+                .with_pre_touch_slots(Some(Arc::clone(&slots)));
+        let metrics = ExecutionPlanMetricsSet::new();
+        let mut reader = warm_reader(&factory, &probe, path, size, &metrics).await;
+
+        reader.get_metadata(None).await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while probe.in_flight.load(Ordering::SeqCst) == 0 {
+            assert!(Instant::now() < deadline, "the touch never started");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(slots.available_permits(), 0, "the touch holds the slot");
+
+        drop(reader);
+        while probe.in_flight.load(Ordering::SeqCst) != 0 || slots.available_permits() != 1 {
+            assert!(Instant::now() < deadline, "the touch outlived its reader");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 
     /// Build a counting store over a freshly written parquet file, returning the
