@@ -1290,6 +1290,27 @@ impl SqlCatalogList {
 
         Ok(SqlCatalogList { pool, object_store })
     }
+
+    /// List catalogs with persisted tables or namespaces, including legacy
+    /// property-only namespaces. A catalog with neither is not persisted.
+    ///
+    /// Unlike [`CatalogList::list_catalogs`], this reports database and decoding
+    /// failures rather than treating an unavailable store as an empty catalog list.
+    pub async fn try_list_catalogs(&self) -> Result<Vec<String>, Error> {
+        let rows = sqlx::query(
+            "select catalog_name from iceberg_tables \
+             union select catalog_name from iceberg_namespaces \
+             union select catalog_name from iceberg_namespace_properties",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut catalogs = rows
+            .iter()
+            .map(|row| row.try_get::<String, _>(0))
+            .collect::<Result<Vec<_>, sqlx::Error>>()?;
+        catalogs.sort_unstable();
+        Ok(catalogs)
+    }
 }
 
 #[async_trait]
@@ -1307,18 +1328,7 @@ impl CatalogList for SqlCatalogList {
         }))
     }
     async fn list_catalogs(&self) -> Vec<String> {
-        let rows = {
-            sqlx::query("select distinct catalog_name from iceberg_tables;")
-                .fetch_all(&self.pool)
-                .await
-                .map_err(Error::from)
-                .unwrap_or_default()
-        };
-        let iter = rows.iter().map(|row| row.try_get::<String, _>(0));
-
-        iter.collect::<Result<_, sqlx::Error>>()
-            .map_err(Error::from)
-            .unwrap_or_default()
+        self.try_list_catalogs().await.unwrap_or_default()
     }
 }
 
@@ -1335,7 +1345,7 @@ pub mod tests {
         planner::{iceberg_transform, IcebergQueryPlanner},
     };
     use iceberg_rust::{
-        catalog::{namespace::Namespace, Catalog},
+        catalog::{namespace::Namespace, Catalog, CatalogList},
         object_store::ObjectStoreBuilder,
         spec::util::strip_prefix,
     };
@@ -1349,6 +1359,152 @@ pub mod tests {
     use iceberg_rust::object_store::store::version_hint_content;
     use sqlx::pool::PoolOptions;
     use std::{collections::HashMap, sync::Arc, time::Duration};
+
+    async fn assert_catalog_discovery_includes_empty_namespaces(url: &str) {
+        let catalog = SqlCatalog::new(url, "unused", ObjectStoreBuilder::memory())
+            .await
+            .unwrap();
+        let catalogs = catalog.catalog_list();
+        assert!(catalogs.list_catalogs().await.is_empty());
+
+        let empty = catalog.duplicate("namespace_only");
+        let public = Namespace::try_new(&["public".to_owned()]).unwrap();
+        let second = Namespace::try_new(&["second".to_owned()]).unwrap();
+        empty.create_namespace(&public, None).await.unwrap();
+        assert_eq!(catalogs.list_catalogs().await, ["namespace_only"]);
+        assert_eq!(
+            catalogs.try_list_catalogs().await.unwrap(),
+            ["namespace_only"]
+        );
+        empty
+            .create_namespace(
+                &second,
+                Some(HashMap::from([("owner".to_owned(), "alice".to_owned())])),
+            )
+            .await
+            .unwrap();
+
+        // Older versions persisted namespaces only through their properties.
+        for key in ["owner", "team"] {
+            sqlx::query(catalog.sql_with_binds(
+                "insert into iceberg_namespace_properties (catalog_name, namespace, property_key, property_value) values ($1, $2, $3, $4)",
+                "insert into iceberg_namespace_properties (catalog_name, namespace, property_key, property_value) values (?, ?, ?, ?)",
+            ))
+            .bind("legacy_properties")
+            .bind("public")
+            .bind(key)
+            .bind("legacy")
+            .execute(&catalog.pool)
+            .await
+            .unwrap();
+        }
+        // A legacy table reference need not have a namespace identity row.
+        sqlx::query(catalog.sql_with_binds(
+            "insert into iceberg_tables (catalog_name, table_namespace, table_name, metadata_location) values ($1, $2, $3, $4)",
+            "insert into iceberg_tables (catalog_name, table_namespace, table_name, metadata_location) values (?, ?, ?, ?)",
+        ))
+        .bind("table_only")
+        .bind("public")
+        .bind("items")
+        .bind("memory://warehouse/items/metadata/v1.json")
+        .execute(&catalog.pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            catalogs.list_catalogs().await,
+            ["legacy_properties", "namespace_only", "table_only"]
+        );
+        assert_eq!(
+            catalogs.try_list_catalogs().await.unwrap(),
+            ["legacy_properties", "namespace_only", "table_only"]
+        );
+        empty.drop_namespace(&public).await.unwrap();
+        assert_eq!(
+            catalogs.list_catalogs().await,
+            ["legacy_properties", "namespace_only", "table_only"]
+        );
+        empty.drop_namespace(&second).await.unwrap();
+        assert_eq!(
+            catalogs.list_catalogs().await,
+            ["legacy_properties", "table_only"]
+        );
+        catalog
+            .duplicate("legacy_properties")
+            .drop_namespace(&public)
+            .await
+            .unwrap();
+        assert_eq!(catalogs.list_catalogs().await, ["table_only"]);
+        catalog.pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn catalog_discovery_includes_empty_namespaces() {
+        assert_catalog_discovery_includes_empty_namespaces("sqlite://").await;
+    }
+
+    #[tokio::test]
+    async fn postgres_catalog_discovery_includes_empty_namespaces() {
+        let postgres = Postgres::default()
+            .with_db_name("postgres")
+            .with_user("postgres")
+            .with_password("postgres")
+            .start()
+            .await
+            .unwrap();
+        let host = postgres.get_host().await.unwrap();
+        let port = postgres.get_host_port_ipv4(5432).await.unwrap();
+        assert_catalog_discovery_includes_empty_namespaces(&format!(
+            "postgres://postgres:postgres@{host}:{port}/postgres"
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn mysql_catalog_discovery_includes_empty_namespaces() {
+        let mysql = Mysql::default().start().await.unwrap();
+        let host = mysql.get_host().await.unwrap();
+        let port = mysql.get_host_port_ipv4(3306).await.unwrap();
+        assert_catalog_discovery_includes_empty_namespaces(&format!(
+            "mysql://root@{host}:{port}/test"
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn catalog_discovery_reports_pool_closed() {
+        let catalog = SqlCatalog::new("sqlite://", "warehouse", ObjectStoreBuilder::memory())
+            .await
+            .unwrap();
+        let catalogs = catalog.catalog_list();
+        catalog.pool.close().await;
+        assert!(matches!(
+            catalogs.try_list_catalogs().await,
+            Err(crate::error::Error::SqlError(sqlx::Error::PoolClosed))
+        ));
+        // Preserve the existing infallible trait's error behavior.
+        assert!(catalogs.list_catalogs().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn catalog_discovery_reports_query_failure() {
+        let catalog = SqlCatalog::new("sqlite://", "warehouse", ObjectStoreBuilder::memory())
+            .await
+            .unwrap();
+        let namespace = Namespace::try_new(&["public".to_owned()]).unwrap();
+        catalog.create_namespace(&namespace, None).await.unwrap();
+        let catalogs = catalog.catalog_list();
+        assert_eq!(catalogs.try_list_catalogs().await.unwrap(), ["warehouse"]);
+        sqlx::query("drop table iceberg_namespaces")
+            .execute(&catalog.pool)
+            .await
+            .unwrap();
+        assert!(matches!(
+            catalogs.try_list_catalogs().await,
+            Err(crate::error::Error::SqlError(sqlx::Error::Database(_)))
+        ));
+        catalog.pool.close().await;
+    }
 
     #[tokio::test]
     async fn duplicate_namespace_insert_reports_commit_conflict() {
