@@ -52,6 +52,34 @@ pub struct SqlCatalog {
     cache: Arc<RwLock<HashMap<Identifier, (String, TabularMetadata)>>>,
     #[cfg(test)]
     namespace_create_barrier: Option<Arc<tokio::sync::Barrier>>,
+    #[cfg(test)]
+    namespace_mutation_pause: Option<Arc<NamespaceMutationPause>>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct NamespaceMutationPause {
+    namespace: String,
+    continuation: std::sync::Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
+}
+
+#[cfg(test)]
+impl NamespaceMutationPause {
+    async fn after_missing_identity(&self, namespace: &str) {
+        if self.namespace != namespace {
+            return;
+        }
+        let continuation = self.continuation.lock().unwrap().take();
+        if let Some((entered, resume)) = continuation {
+            let _ = entered.send(());
+            let _ = resume.await;
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -147,6 +175,8 @@ impl SqlCatalog {
             cache: Arc::new(RwLock::new(HashMap::new())),
             #[cfg(test)]
             namespace_create_barrier: None,
+            #[cfg(test)]
+            namespace_mutation_pause: None,
         })
     }
 
@@ -241,6 +271,10 @@ impl SqlCatalog {
             .fetch_optional(&mut **transaction)
             .await
             .map_err(Error::from)?;
+        #[cfg(test)]
+        if let (None, Some(pause)) = (&row, &self.namespace_mutation_pause) {
+            pause.after_missing_identity(namespace).await;
+        }
         if row.is_some() {
             let locked = sqlx::query(row_sql)
                 .bind(&self.name)
@@ -1212,6 +1246,8 @@ impl SqlCatalog {
             cache: Arc::new(RwLock::new(HashMap::new())),
             #[cfg(test)]
             namespace_create_barrier: None,
+            #[cfg(test)]
+            namespace_mutation_pause: None,
         }
     }
 }
@@ -1266,6 +1302,8 @@ impl CatalogList for SqlCatalogList {
             cache: Arc::new(RwLock::new(HashMap::new())),
             #[cfg(test)]
             namespace_create_barrier: None,
+            #[cfg(test)]
+            namespace_mutation_pause: None,
         }))
     }
     async fn list_catalogs(&self) -> Vec<String> {
@@ -1383,17 +1421,11 @@ pub mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn concurrent_namespace_create_from_two_pools_has_one_winner() {
-        let path = std::env::temp_dir().join(format!(
-            "iceberg-sql-namespace-create-race-{}.db",
-            uuid::Uuid::new_v4()
-        ));
-        let url = format!("sqlite://{}?mode=rwc", path.display());
+    async fn assert_concurrent_namespace_create_from_two_pools(url: &str) {
         let options =
             SqlCatalogOptions::new().with_pool_options(PoolOptions::new().max_connections(1));
         let mut first = SqlCatalog::new_with_options(
-            &url,
+            url,
             "warehouse",
             ObjectStoreBuilder::memory(),
             options.clone(),
@@ -1401,7 +1433,7 @@ pub mod tests {
         .await
         .unwrap();
         let mut second =
-            SqlCatalog::new_with_options(&url, "warehouse", ObjectStoreBuilder::memory(), options)
+            SqlCatalog::new_with_options(url, "warehouse", ObjectStoreBuilder::memory(), options)
                 .await
                 .unwrap();
 
@@ -1434,6 +1466,8 @@ pub mod tests {
             })
             .await
             .unwrap();
+            first.namespace_create_barrier = None;
+            second.namespace_create_barrier = None;
             let (winner, conflict) = match (first_result, second_result) {
                 (Ok(properties), Err(error)) => {
                     assert_eq!(properties, first_properties.unwrap_or_default());
@@ -1451,19 +1485,21 @@ pub mod tests {
             );
             assert_eq!(first.load_namespace(&namespace).await.unwrap(), winner);
             assert_eq!(second.load_namespace(&namespace).await.unwrap(), winner);
-            let identity_count: i64 = sqlx::query_scalar(
+            let identity_count: i64 = sqlx::query_scalar(first.sql_with_binds(
+                "select count(*) from iceberg_namespaces where catalog_name = $1 and namespace = $2",
                 "select count(*) from iceberg_namespaces where catalog_name = ? and namespace = ?",
-            )
-            .bind("warehouse")
+            ))
+            .bind(&first.name)
             .bind(name)
             .fetch_one(&first.pool)
             .await
             .unwrap();
             assert_eq!(identity_count, 1);
-            let property_count: i64 = sqlx::query_scalar(
+            let property_count: i64 = sqlx::query_scalar(first.sql_with_binds(
+                "select count(*) from iceberg_namespace_properties where catalog_name = $1 and namespace = $2",
                 "select count(*) from iceberg_namespace_properties where catalog_name = ? and namespace = ?",
-            )
-            .bind("warehouse")
+            ))
+            .bind(&first.name)
             .bind(name)
             .fetch_one(&first.pool)
             .await
@@ -1473,7 +1509,45 @@ pub mod tests {
 
         first.pool.close().await;
         second.pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_namespace_create_from_two_pools_has_one_winner() {
+        let path = std::env::temp_dir().join(format!(
+            "iceberg-sql-namespace-create-race-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let url = format!("sqlite://{}?mode=rwc", path.display());
+        assert_concurrent_namespace_create_from_two_pools(&url).await;
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_concurrent_namespace_create_from_two_pools_has_one_winner() {
+        let postgres = Postgres::default()
+            .with_db_name("postgres")
+            .with_user("postgres")
+            .with_password("postgres")
+            .start()
+            .await
+            .unwrap();
+        let host = postgres.get_host().await.unwrap();
+        let port = postgres.get_host_port_ipv4(5432).await.unwrap();
+        assert_concurrent_namespace_create_from_two_pools(&format!(
+            "postgres://postgres:postgres@{host}:{port}/postgres"
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn mysql_concurrent_namespace_create_from_two_pools_has_one_winner() {
+        let mysql = Mysql::default().start().await.unwrap();
+        let host = mysql.get_host().await.unwrap();
+        let port = mysql.get_host_port_ipv4(3306).await.unwrap();
+        assert_concurrent_namespace_create_from_two_pools(&format!(
+            "mysql://root@{host}:{port}/test"
+        ))
+        .await;
     }
 
     #[tokio::test]
@@ -1887,12 +1961,29 @@ pub mod tests {
     }
 
     async fn assert_legacy_concurrency_on_locking_catalog(url: &str) {
-        let catalog = Arc::new(
-            SqlCatalog::new(url, "warehouse", ObjectStoreBuilder::memory())
-                .await
-                .unwrap(),
-        );
         let namespace = Namespace::try_new(&["legacy_drop".to_owned()]).unwrap();
+        let (probe_entered, missing_identity_probed) = tokio::sync::oneshot::channel();
+        let (resume_drop, resumed) = tokio::sync::oneshot::channel();
+        let mut catalog = SqlCatalog::new(url, "warehouse", ObjectStoreBuilder::memory())
+            .await
+            .unwrap();
+        catalog.namespace_mutation_pause = Some(Arc::new(super::NamespaceMutationPause {
+            namespace: namespace.to_string(),
+            continuation: std::sync::Mutex::new(Some((probe_entered, resumed))),
+        }));
+        let catalog = Arc::new(catalog);
+        // Both transactions must use initialized connections, not run setup while
+        // the promoting transaction already holds its namespace/property locks.
+        let mut warmed = Vec::new();
+        for _ in 0..2 {
+            let mut connection = catalog.pool.acquire().await.unwrap();
+            sqlx::query("select 1")
+                .execute(&mut *connection)
+                .await
+                .unwrap();
+            warmed.push(connection);
+        }
+        drop(warmed);
         let insert_property = catalog.sql_with_binds(
             "insert into iceberg_namespace_properties (catalog_name, namespace, property_key, property_value) values ($1, $2, $3, $4)",
             "insert into iceberg_namespace_properties (catalog_name, namespace, property_key, property_value) values (?, ?, ?, ?)",
@@ -1937,12 +2028,20 @@ pub mod tests {
 
         let dropping_catalog = catalog.clone();
         let dropping_namespace = namespace.clone();
-        let mut dropping =
+        let dropping =
             tokio::spawn(async move { dropping_catalog.drop_namespace(&dropping_namespace).await });
-        assert!(timeout(Duration::from_millis(100), &mut dropping)
+        timeout(Duration::from_secs(10), missing_identity_probed)
             .await
-            .is_err());
+            .expect("DROP must complete its missing-identity probe")
+            .expect("missing-identity probe notification");
+        assert!(
+            !dropping.is_finished(),
+            "DROP is parked before its property query"
+        );
+        // The initial probe saw no identity. Commit removal of the last legacy
+        // property and promotion before allowing DROP's locking read to continue.
         promoting.commit().await.unwrap();
+        resume_drop.send(()).expect("resume DROP after promotion");
         timeout(Duration::from_secs(10), dropping)
             .await
             .unwrap()
