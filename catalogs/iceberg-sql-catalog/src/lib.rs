@@ -38,12 +38,20 @@ use sqlx::{
 
 use crate::error::Error;
 
+/// A SQL-backed catalog with namespace identities stored separately from properties.
+///
+/// Property-only namespaces from older versions remain readable and are promoted
+/// when updated. Stop older writable catalog instances before upgrading: they do
+/// not recognize the new identity rows, so mixed-version writes or a downgrade
+/// can lose namespace visibility or leave stale identities after a drop.
 #[derive(Debug)]
 pub struct SqlCatalog {
     name: String,
     pool: AnyPool,
     object_store: ObjectStoreBuilder,
     cache: Arc<RwLock<HashMap<Identifier, (String, TabularMetadata)>>>,
+    #[cfg(test)]
+    namespace_create_barrier: Option<Arc<tokio::sync::Barrier>>,
 }
 
 #[derive(Clone, Copy)]
@@ -137,6 +145,8 @@ impl SqlCatalog {
             pool,
             object_store,
             cache: Arc::new(RwLock::new(HashMap::new())),
+            #[cfg(test)]
+            namespace_create_barrier: None,
         })
     }
 
@@ -455,6 +465,11 @@ impl Catalog for SqlCatalog {
         // identity; the namespace row enforces uniqueness for new writers.
         if self.namespace_exists(namespace).await? {
             return Err(IcebergError::CommitConflict(namespace_str));
+        }
+
+        #[cfg(test)]
+        if let Some(barrier) = &self.namespace_create_barrier {
+            barrier.wait().await;
         }
 
         let mut transaction = self.pool.begin().await.map_err(Error::from)?;
@@ -1195,6 +1210,8 @@ impl SqlCatalog {
             pool: self.pool.clone(),
             object_store: self.object_store.clone(),
             cache: Arc::new(RwLock::new(HashMap::new())),
+            #[cfg(test)]
+            namespace_create_barrier: None,
         }
     }
 }
@@ -1247,6 +1264,8 @@ impl CatalogList for SqlCatalogList {
             pool: self.pool.clone(),
             object_store: self.object_store.clone(),
             cache: Arc::new(RwLock::new(HashMap::new())),
+            #[cfg(test)]
+            namespace_create_barrier: None,
         }))
     }
     async fn list_catalogs(&self) -> Vec<String> {
@@ -1362,6 +1381,99 @@ pub mod tests {
                 .unwrap();
             assert!(catalog.namespace_exists(&namespace).await.unwrap());
         }
+    }
+
+    #[tokio::test]
+    async fn concurrent_namespace_create_from_two_pools_has_one_winner() {
+        let path = std::env::temp_dir().join(format!(
+            "iceberg-sql-namespace-create-race-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let url = format!("sqlite://{}?mode=rwc", path.display());
+        let options =
+            SqlCatalogOptions::new().with_pool_options(PoolOptions::new().max_connections(1));
+        let mut first = SqlCatalog::new_with_options(
+            &url,
+            "warehouse",
+            ObjectStoreBuilder::memory(),
+            options.clone(),
+        )
+        .await
+        .unwrap();
+        let mut second =
+            SqlCatalog::new_with_options(&url, "warehouse", ObjectStoreBuilder::memory(), options)
+                .await
+                .unwrap();
+
+        for (name, first_properties, second_properties) in [
+            ("empty", None, None),
+            (
+                "empty_and_properties",
+                None,
+                Some(HashMap::from([("region".to_owned(), "second".to_owned())])),
+            ),
+            (
+                "disjoint_properties",
+                Some(HashMap::from([("owner".to_owned(), "first".to_owned())])),
+                Some(HashMap::from([("region".to_owned(), "second".to_owned())])),
+            ),
+        ] {
+            let namespace = Namespace::try_new(&[name.to_owned()]).unwrap();
+            // Warm both independent pools before forcing both CREATE prechecks
+            // to finish, so only the identity insert can decide the winner.
+            assert!(!first.namespace_exists(&namespace).await.unwrap());
+            assert!(!second.namespace_exists(&namespace).await.unwrap());
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+            first.namespace_create_barrier = Some(barrier.clone());
+            second.namespace_create_barrier = Some(barrier);
+            let (first_result, second_result) = timeout(Duration::from_secs(10), async {
+                tokio::join!(
+                    first.create_namespace(&namespace, first_properties.clone()),
+                    second.create_namespace(&namespace, second_properties.clone()),
+                )
+            })
+            .await
+            .unwrap();
+            let (winner, conflict) = match (first_result, second_result) {
+                (Ok(properties), Err(error)) => {
+                    assert_eq!(properties, first_properties.unwrap_or_default());
+                    (properties, error)
+                }
+                (Err(error), Ok(properties)) => {
+                    assert_eq!(properties, second_properties.unwrap_or_default());
+                    (properties, error)
+                }
+                results => panic!("expected exactly one successful CREATE, got {results:?}"),
+            };
+            assert!(
+                matches!(conflict, IcebergError::CommitConflict(ref identifier) if identifier == name),
+                "expected typed namespace conflict, got {conflict:?}"
+            );
+            assert_eq!(first.load_namespace(&namespace).await.unwrap(), winner);
+            assert_eq!(second.load_namespace(&namespace).await.unwrap(), winner);
+            let identity_count: i64 = sqlx::query_scalar(
+                "select count(*) from iceberg_namespaces where catalog_name = ? and namespace = ?",
+            )
+            .bind("warehouse")
+            .bind(name)
+            .fetch_one(&first.pool)
+            .await
+            .unwrap();
+            assert_eq!(identity_count, 1);
+            let property_count: i64 = sqlx::query_scalar(
+                "select count(*) from iceberg_namespace_properties where catalog_name = ? and namespace = ?",
+            )
+            .bind("warehouse")
+            .bind(name)
+            .fetch_one(&first.pool)
+            .await
+            .unwrap();
+            assert_eq!(property_count, i64::try_from(winner.len()).unwrap());
+        }
+
+        first.pool.close().await;
+        second.pool.close().await;
+        std::fs::remove_file(path).unwrap();
     }
 
     #[tokio::test]
