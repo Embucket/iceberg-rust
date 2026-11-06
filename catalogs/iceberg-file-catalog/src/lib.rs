@@ -1514,15 +1514,13 @@ pub mod tests {
         for namespace in &namespaces {
             reopened.drop_namespace(namespace).await.unwrap();
         }
-        assert!(
-            FileCatalog::new(&path, store)
-                .await
-                .unwrap()
-                .list_namespaces(None)
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        assert!(FileCatalog::new(&path, store)
+            .await
+            .unwrap()
+            .list_namespaces(None)
+            .await
+            .unwrap()
+            .is_empty());
         assert!(
             native_root.is_dir(),
             "namespace DROP keeps the catalog root"
@@ -1546,12 +1544,10 @@ pub mod tests {
             );
         }
         assert!(super::durable_local_namespace_name(&Namespace::empty()).is_none());
-        assert!(
-            super::durable_local_namespace_name(
-                &Namespace::try_new(&["a".to_owned(), "b".to_owned()]).unwrap()
-            )
-            .is_none()
-        );
+        assert!(super::durable_local_namespace_name(
+            &Namespace::try_new(&["a".to_owned(), "b".to_owned()]).unwrap()
+        )
+        .is_none());
     }
 
     fn namespace_worker_gate(
