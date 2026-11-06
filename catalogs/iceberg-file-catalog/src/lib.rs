@@ -1114,7 +1114,9 @@ fn durable_local_namespace_name(namespace: &Namespace) -> Option<&str> {
     let mut characters = name.chars();
     let first = characters.next()?;
     if (first.is_ascii_alphabetic() || first == '_')
-        && characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
+        && characters.all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '_' | '.' | ' ')
+        })
     {
         Some(name)
     } else {
@@ -1441,6 +1443,113 @@ pub mod tests {
             .unwrap()
     }
 
+    #[tokio::test]
+    async fn filesystem_quoted_empty_namespaces_survive_reopen_without_sibling_collisions() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("encoded root % .");
+        let path = url::Url::from_directory_path(&root).unwrap().to_string();
+        let store = ObjectStoreBuilder::filesystem("/");
+        let catalog = FileCatalog::new(&path, store.clone()).await.unwrap();
+        let names = [
+            "a.b",
+            "a",
+            "a.b.backup",
+            "Quoted Name",
+            "Quoted",
+            "_part. name",
+        ];
+        let namespaces = names
+            .iter()
+            .map(|name| Namespace::try_new(&[(*name).to_owned()]).unwrap())
+            .collect::<Vec<_>>();
+        let ObjectStoreBuilder::Filesystem(filesystem) = &catalog.object_store else {
+            unreachable!();
+        };
+        let native_root = filesystem
+            .path_to_filesystem(&catalog.catalog_root_path())
+            .unwrap();
+        for namespace in &namespaces {
+            catalog.create_namespace(namespace, None).await.unwrap();
+            let directory = filesystem_namespace_directory(&catalog, namespace);
+            assert_eq!(directory.parent(), Some(native_root.as_path()));
+            assert_eq!(directory.file_name().unwrap(), namespace[0].as_str());
+            assert!(
+                directory.is_dir(),
+                "{} must exist while empty",
+                namespace[0]
+            );
+        }
+        let mut entries = std::fs::read_dir(&native_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect::<Vec<_>>();
+        entries.sort();
+        let mut expected = names.map(ToOwned::to_owned).to_vec();
+        expected.sort();
+        assert_eq!(entries, expected);
+        let reopened = FileCatalog::new(&path, store.clone()).await.unwrap();
+        let listed = reopened.list_namespaces(None).await.unwrap();
+        assert_eq!(listed.len(), namespaces.len());
+        for namespace in &namespaces {
+            assert_eq!(namespace.len(), 1, "a dot is part of the exact component");
+            assert!(listed.contains(namespace));
+            assert!(reopened.namespace_exists(namespace).await.unwrap());
+            assert!(reopened.list_tabulars(namespace).await.unwrap().is_empty());
+        }
+        for index in [0, 3] {
+            reopened.drop_namespace(&namespaces[index]).await.unwrap();
+        }
+        let reopened = FileCatalog::new(&path, store.clone()).await.unwrap();
+        for (index, namespace) in namespaces.iter().enumerate() {
+            let removed = [0, 3].contains(&index);
+            assert_eq!(
+                reopened.namespace_exists(namespace).await.unwrap(),
+                !removed
+            );
+            assert_eq!(
+                filesystem_namespace_directory(&reopened, namespace).exists(),
+                !removed
+            );
+        }
+        for namespace in &namespaces {
+            reopened.drop_namespace(namespace).await.unwrap();
+        }
+        assert!(FileCatalog::new(&path, store)
+            .await
+            .unwrap()
+            .list_namespaces(None)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(
+            native_root.is_dir(),
+            "namespace DROP keeps the catalog root"
+        );
+    }
+
+    #[test]
+    fn durable_namespace_subset_never_admits_traversal_or_encoded_components() {
+        for name in ["a.b", "Quoted Name", "_part. name", "APP", "a..b", "a "] {
+            let namespace = Namespace::try_new(&[name.to_owned()]).unwrap();
+            assert_eq!(super::durable_local_namespace_name(&namespace), Some(name));
+        }
+        for name in [
+            ".", "..", ".hidden", " quoted", "1name", "a/b", "a\\b", "a/../b", "a\0b", "a\nb",
+            "a\rb", "a\tb", "a\u{7f}b", "a%2Eb", "a%20b", "a-b", "é",
+        ] {
+            let namespace = Namespace::try_new(&[name.to_owned()]).unwrap();
+            assert!(
+                super::durable_local_namespace_name(&namespace).is_none(),
+                "{name:?}"
+            );
+        }
+        assert!(super::durable_local_namespace_name(&Namespace::empty()).is_none());
+        assert!(super::durable_local_namespace_name(
+            &Namespace::try_new(&["a".to_owned(), "b".to_owned()]).unwrap()
+        )
+        .is_none());
+    }
+
     fn namespace_worker_gate(
         pause: &StdMutex<Option<NamespaceWorkerPause>>,
     ) -> (
@@ -1451,6 +1560,42 @@ pub mod tests {
         let (resume, release) = std::sync::mpsc::channel();
         *pause.lock().unwrap() = Some((entered, release));
         (waiting, resume)
+    }
+
+    #[tokio::test]
+    async fn cancelled_namespace_create_with_quoted_component_keeps_worker_lock() {
+        for name in ["a.b", "Quoted Name"] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("encoded catalog %");
+            let path = url::Url::from_directory_path(&root).unwrap().to_string();
+            let store = ObjectStoreBuilder::filesystem("/");
+            let creator = Arc::new(FileCatalog::new(&path, store.clone()).await.unwrap());
+            let dropper = FileCatalog::new(&path, store).await.unwrap();
+            let namespace = Namespace::try_new(&[name.to_owned()]).unwrap();
+            let directory = filesystem_namespace_directory(&creator, &namespace);
+            let (entered, resume) = namespace_worker_gate(&creator.namespace_create_pause);
+            let create = tokio::spawn({
+                let creator = Arc::clone(&creator);
+                let namespace = namespace.clone();
+                async move { creator.create_namespace(&namespace, None).await }
+            });
+            tokio::time::timeout(Duration::from_secs(5), entered)
+                .await
+                .unwrap()
+                .unwrap();
+            create.abort();
+            assert!(create.await.unwrap_err().is_cancelled());
+            assert!(dropper.catalog_mutation_lock().try_write_owned().is_err());
+            let mut dropping = Box::pin(dropper.drop_namespace(&namespace));
+            assert!(futures::poll!(dropping.as_mut()).is_pending());
+            resume.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), dropping)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!directory.exists());
+            assert!(!dropper.namespace_exists(&namespace).await.unwrap());
+        }
     }
 
     #[tokio::test]
