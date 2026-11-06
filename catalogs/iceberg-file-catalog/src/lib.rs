@@ -1114,7 +1114,9 @@ fn durable_local_namespace_name(namespace: &Namespace) -> Option<&str> {
     let mut characters = name.chars();
     let first = characters.next()?;
     if (first.is_ascii_alphabetic() || first == '_')
-        && characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
+        && characters.all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '_' | '.' | ' ')
+        })
     {
         Some(name)
     } else {

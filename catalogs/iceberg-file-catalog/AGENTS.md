@@ -10,6 +10,10 @@
 - Keep non-filesystem behavior and table/query fast paths unchanged when fixing
   local namespace lifecycle. Process-local locks do not establish distributed
   atomicity or stop external data writers.
+- Durable empty filesystem namespaces admit exactly one component matching
+  `[A-Za-z_][A-Za-z0-9_. ]*`. Keep dots/spaces inside that component; never admit
+  separators, controls, encoded spellings or traversal components. Preserve the
+  existing behavior outside this bounded durable subset.
 - Cancellation tests must pause inside the actual blocking worker, await the
   caller's cancellation, and independently verify the lock is still held. Bound
   both worker pauses and async waits; a single pending poll is not proof.

@@ -4,8 +4,11 @@ Filesystem and object-store-backed Iceberg catalog.
 
 ## Local Namespace Mutations
 
-For filesystem namespaces containing one ordinary identifier
-(`[A-Za-z_][A-Za-z0-9_]*`), CREATE and DROP run as blocking filesystem jobs.
+For filesystem namespaces containing one exact component matching
+`[A-Za-z_][A-Za-z0-9_. ]*`, CREATE and DROP run as blocking filesystem jobs.
+This includes quoted SQL schema names such as `a.b` and `Quoted Name`: dots and
+spaces remain inside that single component. Separators, NUL/control characters,
+percent-encoded spellings, `.` and `..` do not enter this durable subset.
 The existing process-local catalog mutation lock is owned by the actual job,
 through directory changes and DROP's cache cleanup. Cancelling its asynchronous
 waiter does not release that lock while the filesystem job can still mutate.
@@ -22,7 +25,8 @@ durable namespace-incarnation fencing, or namespace-property persistence. It doe
 not fence data writers outside the catalog protocol or another component's late
 display-marker writes.
 
-The `cancelled_namespace_*` and
+The `filesystem_quoted_empty_namespaces_*`, `durable_namespace_subset_*`,
+`cancelled_namespace_*` and
 `filesystem_namespace_drop_does_not_follow_nested_symlinks` tests exercise real
 blocking jobs, separate catalog instances, encoded roots, populated deletion,
 cache cleanup and recreation. Their pauses and waits are bounded.
