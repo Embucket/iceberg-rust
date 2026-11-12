@@ -105,6 +105,11 @@ pub enum Operation {
     }, // /// Remove or replace rows in existing data files
     /// Commit an empty snapshot without reading or rewriting existing manifests.
     Truncate { branch: Option<String> },
+    /// Replace every active data/delete manifest with newly written data files.
+    RewriteAll {
+        branch: Option<String>,
+        data_files: Vec<DataFile>,
+    },
     // NewRowDelta,
     // /// Delete files in the table and commit
     // NewDelete,
@@ -142,6 +147,79 @@ impl Operation {
         }
 
         match self {
+            Operation::RewriteAll { branch, data_files } => {
+                if data_files
+                    .iter()
+                    .any(|file| *file.content() != Content::Data)
+                {
+                    return Err(Error::NotSupported(
+                        "rewrite_all accepts only data files with old deletes already applied"
+                            .to_owned(),
+                    ));
+                }
+                if data_files.is_empty() {
+                    return Box::pin(
+                        Operation::Truncate { branch }.execute(table_metadata, object_store),
+                    )
+                    .await;
+                }
+
+                let old_snapshot = table_metadata.current_snapshot(branch.as_deref())?;
+                let ref_name = branch.unwrap_or_else(|| "main".to_owned());
+                let mut empty_view = table_metadata.clone();
+                empty_view.refs.remove(&ref_name);
+                if ref_name == "main" {
+                    empty_view.current_snapshot_id = None;
+                    // Main's empty-snapshot lookup rejects a nonempty history map.
+                    // Only this private view is cleared; no metadata removals are emitted.
+                    empty_view.snapshots.clear();
+                }
+                let additional_summary = append_summary(&data_files);
+                let (_, mut updates) = Box::pin(
+                    Operation::Append {
+                        branch: Some(ref_name.clone()),
+                        data_files,
+                        delete_files: Vec::new(),
+                        additional_summary,
+                    }
+                    .execute(&empty_view, object_store),
+                )
+                .await?;
+
+                // Reuse native manifest and lineage allocation, but never publish the
+                // private view's parent, operation, or absent-ref requirement.
+                for update in &mut updates {
+                    if let TableUpdate::AddSnapshot { snapshot } = update {
+                        let mut summary = snapshot.summary().clone();
+                        summary.operation = SnapshotOperation::Overwrite;
+                        let mut builder = SnapshotBuilder::default();
+                        builder
+                            .with_snapshot_id(*snapshot.snapshot_id())
+                            .with_timestamp_ms(*snapshot.timestamp_ms())
+                            .with_sequence_number(*snapshot.sequence_number())
+                            .with_schema_id(*table_metadata.current_schema()?.schema_id())
+                            .with_manifest_list(snapshot.manifest_list().clone())
+                            .with_summary(summary);
+                        if let Some(parent) = old_snapshot {
+                            builder.with_parent_snapshot_id(*parent.snapshot_id());
+                        }
+                        if let Some(first_row_id) = *snapshot.first_row_id() {
+                            builder.with_first_row_id(first_row_id);
+                        }
+                        if let Some(added_rows) = *snapshot.added_rows() {
+                            builder.with_added_rows(added_rows);
+                        }
+                        *snapshot = builder.build()?;
+                    }
+                }
+                Ok((
+                    Some(TableRequirement::AssertRefSnapshotId {
+                        r#ref: ref_name,
+                        snapshot_id: old_snapshot.map(|snapshot| *snapshot.snapshot_id()),
+                    }),
+                    updates,
+                ))
+            }
             Operation::Truncate { branch } => {
                 let old_snapshot = table_metadata.current_snapshot(branch.as_deref())?;
                 let snapshot_id = generate_snapshot_id();
