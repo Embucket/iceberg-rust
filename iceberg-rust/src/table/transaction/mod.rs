@@ -49,8 +49,9 @@ pub(crate) static SET_SNAPSHOT_REF_INDEX: usize = 7;
 pub(crate) static EXPIRE_SNAPSHOTS_INDEX: usize = 8;
 pub(crate) static REPLACE_SORT_ORDER_INDEX: usize = 9;
 pub(crate) static TRUNCATE_INDEX: usize = 10;
+pub(crate) static REWRITE_ALL_INDEX: usize = 11;
 
-pub(crate) static NUM_OPERATIONS: usize = 11;
+pub(crate) static NUM_OPERATIONS: usize = 12;
 
 fn reject_spec_change_with_file_write(
     operations: &[Option<Operation>],
@@ -76,6 +77,7 @@ fn reject_spec_change_with_file_write(
                     .iter()
                     .any(|group| !group.data_files.is_empty() || !group.delete_files.is_empty()),
                 Operation::Replace { files, .. } => !files.is_empty(),
+                Operation::RewriteAll { data_files, .. } => !data_files.is_empty(),
                 Operation::Overwrite {
                     data_files,
                     files_to_overwrite,
@@ -356,6 +358,36 @@ impl<'table> TableTransaction<'table> {
         });
         self
     }
+
+    /// Atomically replaces the target branch's entire contents with `files`.
+    ///
+    /// The caller must supply ALL surviving rows in new data files, with all old
+    /// equality deletes, position deletes, and deletion vectors already applied.
+    /// No old data or delete manifests are retained in the new snapshot. Delete
+    /// files are not accepted as input. Multiple calls combine the replacement
+    /// files; an empty replacement commits an empty snapshot via [`Self::truncate`].
+    ///
+    /// This publishes one overwrite snapshot with the original snapshot as its
+    /// parent. V3 row IDs follow native append allocation, not row-preserving
+    /// rewrite semantics. Historical snapshots and immutable files are not removed.
+    /// This operation cannot be combined with another data write in one transaction.
+    ///
+    /// Prepared commits retain the original snapshot fence and must not be rebased
+    /// onto a newer table state without recomputing the replacement files.
+    #[must_use]
+    pub fn rewrite_all(mut self, files: Vec<DataFile>) -> Self {
+        if let Some(Operation::RewriteAll { data_files, .. }) =
+            self.operations[REWRITE_ALL_INDEX].as_mut()
+        {
+            data_files.extend(files);
+        } else {
+            self.operations[REWRITE_ALL_INDEX] = Some(Operation::RewriteAll {
+                branch: self.branch.clone(),
+                data_files: files,
+            });
+        }
+        self
+    }
     /// Replaces all data files in the table with new ones
     ///
     /// This operation removes all existing data files and replaces them with the provided
@@ -559,12 +591,28 @@ impl<'table> TableTransaction<'table> {
                 APPEND_SEQUENCE_GROUPS_INDEX,
                 REPLACE_INDEX,
                 OVERWRITE_INDEX,
+                REWRITE_ALL_INDEX,
             ]
             .iter()
             .any(|&index| self.operations[index].is_some())
         {
             return Err(Error::NotSupported(
                 "TRUNCATE cannot be combined with another data write in one Iceberg transaction"
+                    .to_owned(),
+            ));
+        }
+        if self.operations[REWRITE_ALL_INDEX].is_some()
+            && [
+                APPEND_INDEX,
+                APPEND_SEQUENCE_GROUPS_INDEX,
+                REPLACE_INDEX,
+                OVERWRITE_INDEX,
+            ]
+            .iter()
+            .any(|&index| self.operations[index].is_some())
+        {
+            return Err(Error::NotSupported(
+                "rewrite_all cannot be combined with another data write in one Iceberg transaction"
                     .to_owned(),
             ));
         }
@@ -583,7 +631,8 @@ impl<'table> TableTransaction<'table> {
             }],
             Vec::new(),
         );
-        if self.operations[TRUNCATE_INDEX].is_some() {
+        if self.operations[TRUNCATE_INDEX].is_some() || self.operations[REWRITE_ALL_INDEX].is_some()
+        {
             // Snapshot sequence numbers are table-global, even when the target
             // ref is not. Reject commits based on another ref's stale state.
             requirements.extend(base_metadata.refs.iter().map(|(name, reference)| {
@@ -684,7 +733,7 @@ mod tests {
 
     use super::{
         reject_spec_change_with_file_write, Operation, APPEND_INDEX, APPEND_SEQUENCE_GROUPS_INDEX,
-        NUM_OPERATIONS, OVERWRITE_INDEX, REPLACE_INDEX, SET_DEFAULT_SPEC_INDEX,
+        NUM_OPERATIONS, OVERWRITE_INDEX, REPLACE_INDEX, REWRITE_ALL_INDEX, SET_DEFAULT_SPEC_INDEX,
     };
     use crate::error::Error;
     use rstest::rstest;
@@ -727,6 +776,13 @@ mod tests {
                     data_files: Vec::new(),
                     files_to_overwrite: Default::default(),
                     additional_summary: None,
+                },
+            ),
+            (
+                REWRITE_ALL_INDEX,
+                Operation::RewriteAll {
+                    branch: None,
+                    data_files: Vec::new(),
                 },
             ),
         ];
