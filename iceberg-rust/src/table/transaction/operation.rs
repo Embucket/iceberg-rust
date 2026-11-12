@@ -148,6 +148,19 @@ impl Operation {
 
         match self {
             Operation::RewriteAll { branch, data_files } => {
+                let ref_name = branch.as_deref().unwrap_or("main").to_owned();
+                let retention = match table_metadata.refs.get(&ref_name) {
+                    Some(SnapshotReference {
+                        retention: SnapshotRetention::Tag { .. },
+                        ..
+                    }) => {
+                        return Err(Error::NotSupported(format!(
+                            "rewrite_all cannot target snapshot tag {ref_name}"
+                        )));
+                    }
+                    Some(reference) => reference.retention.clone(),
+                    None => SnapshotRetention::default(),
+                };
                 if data_files
                     .iter()
                     .any(|file| *file.content() != Content::Data)
@@ -157,59 +170,69 @@ impl Operation {
                             .to_owned(),
                     ));
                 }
-                if data_files.is_empty() {
-                    return Box::pin(
-                        Operation::Truncate { branch }.execute(table_metadata, object_store),
-                    )
-                    .await;
-                }
 
                 let old_snapshot = table_metadata.current_snapshot(branch.as_deref())?;
-                let ref_name = branch.unwrap_or_else(|| "main".to_owned());
-                let mut empty_view = table_metadata.clone();
-                empty_view.refs.remove(&ref_name);
-                if ref_name == "main" {
-                    empty_view.current_snapshot_id = None;
-                    // Main's empty-snapshot lookup rejects a nonempty history map.
-                    // Only this private view is cleared; no metadata removals are emitted.
-                    empty_view.snapshots.clear();
-                }
-                let additional_summary = append_summary(&data_files);
-                let (_, mut updates) = Box::pin(
-                    Operation::Append {
-                        branch: Some(ref_name.clone()),
-                        data_files,
-                        delete_files: Vec::new(),
-                        additional_summary,
+                let mut updates = if data_files.is_empty() {
+                    let (_, updates) = Box::pin(
+                        Operation::Truncate { branch }.execute(table_metadata, object_store),
+                    )
+                    .await?;
+                    updates
+                } else {
+                    let mut empty_view = table_metadata.clone();
+                    empty_view.refs.remove(&ref_name);
+                    if ref_name == "main" {
+                        empty_view.current_snapshot_id = None;
+                        // Main's empty-snapshot lookup rejects a nonempty history map.
+                        // Only this private view is cleared; no metadata removals are emitted.
+                        empty_view.snapshots.clear();
                     }
-                    .execute(&empty_view, object_store),
-                )
-                .await?;
+                    let additional_summary = append_summary(&data_files);
+                    let (_, mut updates) = Box::pin(
+                        Operation::Append {
+                            branch: Some(ref_name.clone()),
+                            data_files,
+                            delete_files: Vec::new(),
+                            additional_summary,
+                        }
+                        .execute(&empty_view, object_store),
+                    )
+                    .await?;
 
-                // Reuse native manifest and lineage allocation, but never publish the
-                // private view's parent, operation, or absent-ref requirement.
+                    // Reuse native manifest and lineage allocation, but never publish the
+                    // private view's parent, operation, or absent-ref requirement.
+                    for update in &mut updates {
+                        if let TableUpdate::AddSnapshot { snapshot } = update {
+                            let mut summary = snapshot.summary().clone();
+                            summary.operation = SnapshotOperation::Overwrite;
+                            let mut builder = SnapshotBuilder::default();
+                            builder
+                                .with_snapshot_id(*snapshot.snapshot_id())
+                                .with_timestamp_ms(*snapshot.timestamp_ms())
+                                .with_sequence_number(*snapshot.sequence_number())
+                                .with_schema_id(*table_metadata.current_schema()?.schema_id())
+                                .with_manifest_list(snapshot.manifest_list().clone())
+                                .with_summary(summary);
+                            if let Some(parent) = old_snapshot {
+                                builder.with_parent_snapshot_id(*parent.snapshot_id());
+                            }
+                            if let Some(first_row_id) = *snapshot.first_row_id() {
+                                builder.with_first_row_id(first_row_id);
+                            }
+                            if let Some(added_rows) = *snapshot.added_rows() {
+                                builder.with_added_rows(added_rows);
+                            }
+                            *snapshot = builder.build()?;
+                        }
+                    }
+                    updates
+                };
                 for update in &mut updates {
-                    if let TableUpdate::AddSnapshot { snapshot } = update {
-                        let mut summary = snapshot.summary().clone();
-                        summary.operation = SnapshotOperation::Overwrite;
-                        let mut builder = SnapshotBuilder::default();
-                        builder
-                            .with_snapshot_id(*snapshot.snapshot_id())
-                            .with_timestamp_ms(*snapshot.timestamp_ms())
-                            .with_sequence_number(*snapshot.sequence_number())
-                            .with_schema_id(*table_metadata.current_schema()?.schema_id())
-                            .with_manifest_list(snapshot.manifest_list().clone())
-                            .with_summary(summary);
-                        if let Some(parent) = old_snapshot {
-                            builder.with_parent_snapshot_id(*parent.snapshot_id());
-                        }
-                        if let Some(first_row_id) = *snapshot.first_row_id() {
-                            builder.with_first_row_id(first_row_id);
-                        }
-                        if let Some(added_rows) = *snapshot.added_rows() {
-                            builder.with_added_rows(added_rows);
-                        }
-                        *snapshot = builder.build()?;
+                    if let TableUpdate::SetSnapshotRef {
+                        snapshot_reference, ..
+                    } = update
+                    {
+                        snapshot_reference.retention = retention.clone();
                     }
                 }
                 Ok((

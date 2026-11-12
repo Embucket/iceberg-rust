@@ -26,7 +26,7 @@ use iceberg_rust_spec::types::{PrimitiveType, StructField, Type};
 use iceberg_rust_spec::util::strip_prefix;
 use iceberg_rust_spec::values::{Struct, Value};
 use iceberg_sql_catalog::SqlCatalog;
-use object_store::ObjectStoreExt;
+use object_store::{ObjectMeta, ObjectStoreExt};
 
 async fn table(version: u8) -> (Arc<dyn Catalog>, Table) {
     let catalog: Arc<dyn Catalog> = Arc::new(
@@ -147,6 +147,17 @@ async fn active_files(table: &Table, branch: Option<&str>) -> Vec<DataFile> {
         .collect::<Vec<_>>();
     files.sort_by(|left, right| left.file_path().cmp(right.file_path()));
     files
+}
+
+async fn stored_objects(table: &Table) -> Vec<ObjectMeta> {
+    let mut objects = table
+        .object_store()
+        .list(None)
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    objects.sort_by(|left, right| left.location.cmp(&right.location));
+    objects
 }
 
 fn assert_original_fences(commit: &CommitTable, table: &Table, branch: Option<&str>) {
@@ -336,14 +347,9 @@ async fn rewrite_replaces_all_manifests_and_retains_history_in_v2_and_v3() {
                     assert_eq!(*added.first_row_id(), None);
                     assert_eq!(*added.added_rows(), None);
                 }
-                assert_eq!(
-                    serde_json::to_value(table.metadata()).unwrap(),
-                    serde_json::to_value(&base).unwrap()
-                );
-                assert_eq!(
-                    serde_json::to_value(load(&catalog, &table).await.metadata()).unwrap(),
-                    serde_json::to_value(&base).unwrap()
-                );
+                // Typed equality preserves log order without depending on map iteration order.
+                assert_eq!(table.metadata(), &base);
+                assert_eq!(load(&catalog, &table).await.metadata(), &base);
 
                 let published = catalog.update_table(prepared).await.unwrap();
                 assert_eq!(
@@ -452,6 +458,10 @@ async fn rewrite_new_table_or_absent_branch_has_no_parent_and_one_snapshot() {
                 assert_eq!(*added_snapshot(&prepared).parent_snapshot_id(), None);
                 let published = catalog.update_table(prepared).await.unwrap();
                 assert_eq!(
+                    published.metadata().refs[branch.unwrap_or("main")].retention,
+                    SnapshotRetention::default()
+                );
+                assert_eq!(
                     published.metadata().snapshots.len(),
                     base.snapshots.len() + 1
                 );
@@ -502,7 +512,7 @@ async fn stale_rewrite_conflicts_without_losing_winning_file_metadata() {
                     .commit()
                     .await
                     .unwrap();
-                let winning_metadata = serde_json::to_value(table.metadata()).unwrap();
+                let winning_metadata = table.metadata().clone();
                 let winning_files = active_files(&table, winning_branch).await;
                 assert!(winning_files
                     .iter()
@@ -520,10 +530,7 @@ async fn stale_rewrite_conflicts_without_losing_winning_file_metadata() {
                     Err(Error::CommitConflict(_))
                 ));
                 let loaded = load(&catalog, &table).await;
-                assert_eq!(
-                    serde_json::to_value(loaded.metadata()).unwrap(),
-                    winning_metadata
-                );
+                assert_eq!(loaded.metadata(), &winning_metadata);
                 assert_eq!(active_files(&loaded, winning_branch).await, winning_files);
             }
         }
@@ -579,14 +586,8 @@ async fn rewrite_fences_ref_moves_and_target_creation_without_a_new_sequence_num
 async fn rewrite_rejects_other_data_operations_and_delete_inputs_before_writing() {
     let (catalog, mut table) = table(3).await;
     seed(&mut table).await;
-    let before = serde_json::to_value(table.metadata()).unwrap();
-    let object_count = table
-        .object_store()
-        .list(None)
-        .try_collect::<Vec<_>>()
-        .await
-        .unwrap()
-        .len();
+    let before = table.metadata().clone();
+    let before_objects = stored_objects(&table).await;
     for empty in [false, true] {
         for operation in 0..6 {
             let files = replacement_files(&table, empty);
@@ -621,21 +622,121 @@ async fn rewrite_rejects_other_data_operations_and_delete_inputs_before_writing(
             Err(Error::NotSupported(_))
         ));
     }
-    assert_eq!(
+    assert_eq!(stored_objects(&table).await, before_objects);
+    assert_eq!(table.metadata(), &before);
+    assert_eq!(load(&catalog, &table).await.metadata(), &before);
+}
+
+#[tokio::test]
+async fn rewrite_rejects_tags_without_object_writes_or_metadata_changes() {
+    for version in [2, 3] {
+        let (catalog, mut table) = table(version).await;
+        seed(&mut table).await;
+        let tagged_snapshot = *snapshot(&table, None).snapshot_id();
         table
-            .object_store()
-            .list(None)
-            .try_collect::<Vec<_>>()
+            .new_transaction(None)
+            .set_snapshot_ref((
+                "frozen".to_owned(),
+                SnapshotReference {
+                    snapshot_id: tagged_snapshot,
+                    retention: SnapshotRetention::Tag {
+                        max_ref_age_ms: 604_800_000,
+                    },
+                },
+            ))
+            .commit()
             .await
-            .unwrap()
-            .len(),
-        object_count
-    );
-    assert_eq!(serde_json::to_value(table.metadata()).unwrap(), before);
-    assert_eq!(
-        serde_json::to_value(load(&catalog, &table).await.metadata()).unwrap(),
-        before
-    );
+            .unwrap();
+        let before = table.metadata().clone();
+        let before_objects = stored_objects(&table).await;
+        for empty in [false, true] {
+            for publish in [false, true] {
+                let files = replacement_files(&table, empty);
+                let transaction = table.new_transaction(Some("frozen")).rewrite_all(files);
+                let result = if publish {
+                    transaction.commit().await
+                } else {
+                    transaction.prepare_commit().await.map(|_| ())
+                };
+                assert!(matches!(
+                    result,
+                    Err(Error::NotSupported(message)) if message.contains("tag frozen")
+                ));
+                assert_eq!(table.metadata(), &before);
+                assert_eq!(load(&catalog, &table).await.metadata(), &before);
+                assert_eq!(stored_objects(&table).await, before_objects);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn rewrite_preserves_custom_branch_retention_for_empty_and_nonempty_outputs() {
+    for version in [2, 3] {
+        for empty in [false, true] {
+            for branch in [None, Some("main"), Some("audit")] {
+                let (catalog, mut table) = table(version).await;
+                seed(&mut table).await;
+                let ref_name = branch.unwrap_or("main");
+                let parent_id = *snapshot(&table, branch).snapshot_id();
+                let retention = SnapshotRetention::Branch {
+                    min_snapshots_to_keep: Some(7),
+                    max_snapshot_age_ms: Some(172_800_000),
+                    max_ref_age_ms: (ref_name != "main").then_some(604_800_000),
+                };
+                table
+                    .new_transaction(None)
+                    .set_snapshot_ref((
+                        ref_name.to_owned(),
+                        SnapshotReference {
+                            snapshot_id: parent_id,
+                            retention: retention.clone(),
+                        },
+                    ))
+                    .commit()
+                    .await
+                    .unwrap();
+                let before = table.metadata().clone();
+                let files = replacement_files(&table, empty);
+                let prepared = table
+                    .new_transaction(branch)
+                    .rewrite_all(files)
+                    .prepare_commit()
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_original_fences(&prepared, &table, branch);
+                let added = added_snapshot(&prepared);
+                assert_eq!(*added.parent_snapshot_id(), Some(parent_id));
+                let expected = SnapshotReference {
+                    snapshot_id: *added.snapshot_id(),
+                    retention,
+                };
+                let TableUpdate::SetSnapshotRef {
+                    ref_name: prepared_ref,
+                    snapshot_reference,
+                } = &prepared.updates[1]
+                else {
+                    unreachable!("added_snapshot validated the update shape");
+                };
+                assert_eq!(prepared_ref, ref_name);
+                assert_eq!(snapshot_reference, &expected);
+                assert_eq!(table.metadata(), &before);
+                assert_eq!(load(&catalog, &table).await.metadata(), &before);
+                let published = catalog.clone().update_table(prepared).await.unwrap();
+                assert_eq!(published.metadata().refs[ref_name], expected);
+                assert_eq!(
+                    load(&catalog, &table).await.metadata(),
+                    published.metadata()
+                );
+                for (name, reference) in &before.refs {
+                    if name != ref_name {
+                        assert_eq!(published.metadata().refs.get(name), Some(reference));
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[tokio::test]
