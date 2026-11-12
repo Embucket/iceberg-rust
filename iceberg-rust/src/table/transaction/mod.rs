@@ -298,6 +298,9 @@ impl<'table> TableTransaction<'table> {
     /// * `files_to_overwrite` - HashMap mapping manifest file paths to lists of data file
     ///   paths that should be overwritten/replaced
     ///
+    /// Only data manifests may be targeted. Removing delete files through this operation
+    /// is not supported; unrelated delete manifests are retained unchanged.
+    ///
     /// # Returns
     /// * `Self` - The transaction builder for method chaining
     ///
@@ -522,35 +525,23 @@ impl<'table> TableTransaction<'table> {
         self
     }
 
-    /// Commits all operations in this transaction atomically
+    /// Prepare the catalog commit without publishing it or modifying the table handle.
     ///
-    /// This method executes all operations in the transaction and updates the table
-    /// metadata. The changes are atomic - either all operations succeed or none do.
-    /// After commit, the transaction is consumed and the table is updated with the
-    /// new metadata.
+    /// Preparation may write immutable manifest files to object storage. The returned
+    /// commit retains the transaction's optimistic requirements. Callers composing it
+    /// with schema or property updates must preserve those requirements and add any
+    /// additional guards required by their original metadata snapshot.
     ///
-    /// # Returns
-    /// * `Result<(), Error>` - Ok(()) if the commit succeeds, Error if it fails
-    ///
-    /// # Errors
-    /// Returns an error if:
-    /// * Any operation fails to execute
-    /// * The catalog update fails
-    /// * Cleanup of old data files fails (for replace operations)
-    ///
-    /// # Examples
-    /// ```
-    /// let result = table.new_transaction(None)
-    ///     .append(data_files)
-    ///     .update_properties(properties)
-    ///     .commit()
-    ///     .await?;
-    /// ```
-    #[instrument(name = "iceberg_rust::table::transaction::commit", level = "debug", skip(self), fields(
-        table_identifier = %self.table.identifier,
-        branch = ?self.branch
-    ))]
-    pub async fn commit(self) -> Result<(), Error> {
+    /// Publish through [`Catalog::update_table`](crate::catalog::Catalog::update_table)
+    /// and use its returned table to refresh the caller's handle. Abandoning a prepared
+    /// commit may leave unreferenced manifests; never delete them after an uncertain
+    /// publication outcome. An empty transaction returns `None`.
+    pub async fn prepare_commit(self) -> Result<Option<CommitTable>, Error> {
+        let (_, commit) = self.prepare().await?;
+        Ok(commit)
+    }
+
+    async fn prepare(self) -> Result<(&'table mut Table, Option<CommitTable>), Error> {
         if self.table.metadata().table_uuid.is_nil() && self.operations.iter().any(Option::is_some)
         {
             return Err(Error::NotSupported(
@@ -577,7 +568,6 @@ impl<'table> TableTransaction<'table> {
                     .to_owned(),
             ));
         }
-        let catalog = self.table.catalog();
         let identifier = self.table.identifier.clone();
         let base_metadata = self.table.metadata();
         let mut staged_metadata = self
@@ -628,27 +618,62 @@ impl<'table> TableTransaction<'table> {
         }
 
         if updates.is_empty() {
-            return Ok(());
+            return Ok((self.table, None));
         }
 
         debug!(
-            "Committing {} updates to table {}: requirements={:?}, updates={:?}",
+            "Prepared {} updates to table {}: requirements={:?}, updates={:?}",
             updates.len(),
             identifier,
             requirements,
             updates
         );
 
-        let new_table = catalog
-            .clone()
-            .update_table(CommitTable {
+        Ok((
+            self.table,
+            Some(CommitTable {
                 identifier,
                 requirements,
                 updates,
-            })
-            .await?;
+            }),
+        ))
+    }
 
-        *self.table = new_table;
+    /// Commits all operations in this transaction atomically
+    ///
+    /// This method executes all operations in the transaction and updates the table
+    /// metadata. The changes are atomic - either all operations succeed or none do.
+    /// After commit, the transaction is consumed and the table is updated with the
+    /// new metadata.
+    ///
+    /// # Returns
+    /// * `Result<(), Error>` - Ok(()) if the commit succeeds, Error if it fails
+    ///
+    /// # Errors
+    /// Returns an error if:
+    /// * Any operation fails to execute
+    /// * The catalog update fails
+    /// * Cleanup of old data files fails (for replace operations)
+    ///
+    /// # Examples
+    /// ```
+    /// let result = table.new_transaction(None)
+    ///     .append(data_files)
+    ///     .update_properties(properties)
+    ///     .commit()
+    ///     .await?;
+    /// ```
+    #[instrument(name = "iceberg_rust::table::transaction::commit", level = "debug", skip(self), fields(
+        table_identifier = %self.table.identifier,
+        branch = ?self.branch
+    ))]
+    pub async fn commit(self) -> Result<(), Error> {
+        let (table, commit) = self.prepare().await?;
+        let Some(commit) = commit else {
+            return Ok(());
+        };
+        let new_table = table.catalog().update_table(commit).await?;
+        *table = new_table;
         Ok(())
     }
 }

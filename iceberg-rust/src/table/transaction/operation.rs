@@ -772,11 +772,22 @@ impl Operation {
                 };
                 let bytes = hydrated_bytes.as_deref().unwrap_or(&bytes);
 
-                // Validate that all manifests specified in files_to_overwrite actually exist in the current snapshot
+                // Validate overwrite targets before dispatching to any manifest rewrite path.
                 let current_manifest_paths: HashSet<String> = {
                     let manifest_list_reader = ManifestListReader::new(bytes, table_metadata)?;
                     manifest_list_reader
-                        .map(|entry| entry.map(|e| e.manifest_path.clone()))
+                        .map(|entry| {
+                            let manifest = entry?;
+                            if manifest.content != ManifestListContent::Data
+                                && manifests_to_overwrite.contains(&manifest.manifest_path)
+                            {
+                                return Err(Error::NotSupported(format!(
+                                    "Overwriting delete manifest {} through a data-file overwrite is not supported",
+                                    manifest.manifest_path
+                                )));
+                            }
+                            Ok(manifest.manifest_path)
+                        })
                         .collect::<Result<HashSet<_>, _>>()?
                 };
 

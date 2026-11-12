@@ -1364,7 +1364,7 @@ async fn table_scan(
                                 &JoinType::RightAnti,
                                 None,
                                 PartitionMode::CollectLeft,
-                                NullEquality::NullEqualsNothing,
+                                NullEquality::NullEqualsNull,
                                 false,
                             )?)
                                 as Arc<dyn ExecutionPlan>))
