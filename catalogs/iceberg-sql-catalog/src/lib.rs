@@ -1028,9 +1028,7 @@ impl Catalog for SqlCatalog {
             ));
         };
         if !check_table_requirements(&commit.requirements, &metadata) {
-            return Err(IcebergError::InvalidFormat(
-                "Table requirements not valid".to_owned(),
-            ));
+            return Err(IcebergError::CommitConflict(identifier.to_string()));
         }
         // Timestamp of the metadata file we are about to supersede, recorded in
         // the metadata log per the Iceberg spec (the log entry marks when the

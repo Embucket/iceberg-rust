@@ -186,7 +186,7 @@ async fn v3_append_then_overwrite_in_one_transaction_stages_row_lineage() {
         .expect_err("stale multi-operation commit must fail catalog requirements");
     assert!(matches!(
         stale_error,
-        Error::InvalidFormat(message) if message == "Table requirements not valid"
+        Error::CommitConflict(identifier) if identifier == table.identifier().to_string()
     ));
 
     let Tabular::Table(loaded) = catalog.load_tabular(table.identifier()).await.unwrap() else {
