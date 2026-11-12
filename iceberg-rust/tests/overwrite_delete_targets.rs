@@ -19,6 +19,7 @@ use iceberg_rust_spec::values::{Struct, Value};
 use iceberg_sql_catalog::SqlCatalog;
 
 fn file(table: &Table, name: &str, content: Content) -> DataFile {
+    let equality_ids = matches!(&content, Content::EqualityDeletes).then(|| vec![1]);
     DataFile::builder()
         .with_content(content)
         .with_file_path(format!("{}/data/{name}.parquet", table.metadata().location))
@@ -26,6 +27,7 @@ fn file(table: &Table, name: &str, content: Content) -> DataFile {
         .with_partition(Struct::from_iter(Vec::<(String, Option<Value>)>::new()))
         .with_record_count(1)
         .with_file_size_in_bytes(100)
+        .with_equality_ids(equality_ids)
         .with_column_sizes(None)
         .with_value_counts(None)
         .with_null_value_counts(None)
@@ -107,7 +109,8 @@ async fn assert_delete_target_rejected(version: u8, with_replacement: bool) {
     );
 
     let data = file(&table, "original", Content::Data);
-    let deletes = file(&table, "deletes", Content::PositionDeletes);
+    let deletes = file(&table, "deletes", Content::EqualityDeletes);
+    assert_eq!(deletes.equality_ids().as_deref(), Some(&[1][..]));
     table
         .new_transaction(None)
         .append_data(vec![data.clone()])
@@ -117,7 +120,7 @@ async fn assert_delete_target_rejected(version: u8, with_replacement: bool) {
         .unwrap();
     let mut expected_files = vec![
         (data.file_path().clone(), Content::Data),
-        (deletes.file_path().clone(), Content::PositionDeletes),
+        (deletes.file_path().clone(), Content::EqualityDeletes),
     ];
     expected_files.sort_by(|left, right| left.0.cmp(&right.0));
     assert_eq!(active_files(&table).await, expected_files);
