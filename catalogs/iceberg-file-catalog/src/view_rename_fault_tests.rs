@@ -68,6 +68,91 @@ async fn dropping_preparation_publishes_nothing_and_releases_writer() -> TestRes
 }
 
 #[tokio::test]
+async fn captured_source_accessor_binds_fresh_replacement_and_denial_releases_without_effects(
+) -> TestResult {
+    use iceberg_rust::spec::view_metadata::{Version, ViewRepresentation};
+    let fixture = Fixture::new().await?;
+    // The preparing catalog retains a predecessor cache entry. A separate native
+    // writer replaces that name before preparation; validation must see the new
+    // UUID and opaque creator property, not a prior asynchronous lookup's image.
+    let peer = fresh(&fixture).await?;
+    peer.drop_view(fixture.view.identifier()).await?;
+    let creator = Uuid::new_v4();
+    let replacement = View::builder()
+        .with_name("RV")
+        .with_schema(fixture.view.metadata().current_schema(None)?.clone())
+        .with_view_version(
+            Version::builder()
+                .with_representation(ViewRepresentation::sql("SELECT 99 AS X", Some("snowflake")))
+                .build()?,
+        )
+        .with_property((
+            "embucket.sql.view-options.v1".to_owned(),
+            format!("{{\"relation_incarnation\":\"{creator}\"}}"),
+        ))
+        .build(
+            fixture.destination.namespace(),
+            Arc::clone(&peer) as Arc<dyn Catalog>,
+        )
+        .await?;
+    assert_ne!(
+        replacement.metadata().view_uuid,
+        fixture.view.metadata().view_uuid
+    );
+    let expected = replacement.metadata().clone();
+    let prepared = preparation(&fixture).await?;
+    assert_eq!(prepared.source_metadata(), &expected);
+    assert!(std::ptr::eq(
+        prepared.source_metadata(),
+        prepared.source_metadata()
+    ));
+    assert_eq!(
+        prepared.source_metadata().properties["embucket.sql.view-options.v1"],
+        format!("{{\"relation_incarnation\":\"{creator}\"}}")
+    );
+    let root = fixture.catalog.pair_root()?;
+    let p = prepared.plan.places(&root)?;
+    assert!(missing(&root.file(JOURNAL))? && missing(&root.file(WITNESS))?);
+    assert!(missing(&p.stage)? && missing(&p.destination)?);
+    let mut writer = tokio::spawn(async move {
+        let mut replacement = replacement;
+        replacement
+            .new_transaction(None)
+            .update_properties(vec![("later".into(), "kept".into())])
+            .commit()
+            .await?;
+        Ok::<_, IcebergError>(replacement)
+    });
+    assert!(tokio::time::timeout(Duration::from_millis(50), &mut writer)
+        .await
+        .is_err());
+    assert_eq!(prepared.source_metadata(), &expected);
+    // An embedding identity/marker mismatch can deny while retaining exclusion.
+    // Dropping this preparation performs no READY/staging cleanup or publication.
+    drop(prepared);
+    let updated = tokio::time::timeout(Duration::from_secs(3), writer).await???;
+    assert_eq!(updated.metadata().view_uuid, expected.view_uuid);
+    assert_eq!(
+        updated
+            .metadata()
+            .properties
+            .get("later")
+            .map(String::as_str),
+        Some("kept")
+    );
+    assert!(missing(&root.file(JOURNAL))? && missing(&root.file(WITNESS))?);
+    assert!(missing(&p.stage)? && missing(&p.destination)?);
+    let Tabular::View(current) = Arc::clone(&fixture.catalog)
+        .load_tabular(fixture.view.identifier())
+        .await?
+    else {
+        return Err("replacement view".into());
+    };
+    assert_eq!(current.metadata(), updated.metadata());
+    Ok(())
+}
+
+#[tokio::test]
 async fn predecision_failure_cleans_only_private_stage_and_keeps_exact_source() -> TestResult {
     let fixture = Fixture::new().await?;
     let mut prepared = preparation(&fixture).await?;

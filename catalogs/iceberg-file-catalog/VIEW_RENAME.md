@@ -28,6 +28,18 @@ The Catalog convenience method delegates to that owned publisher and retains the
 typed error as its external source. Other catalog implementations keep the
 default Unsupported result.
 
+An embedding owner must validate the exact captured predecessor, rather than a
+View loaded before preparation. The selected read-only
+`PreparedViewRename::source_metadata() -> &ViewMetadata` accessor borrows the
+immutable captured UUID/properties/history while its native writer remains held.
+It interprets no engine marker and grants no authority itself. Preparation creates
+no witness, journal, READY stage, head or cache entry: an owner that denies the
+captured image can drop preparation, releasing exclusion without cleanup or
+publication effects. A test-first control replaces the name through a distinct
+FileCatalog while the preparing catalog retains its old cache, checks the new
+captured UUID/opaque creator marker and a blocked native writer, then denies/drops
+the preparation and proves unchanged names/controls plus later writer progress.
+
 The native operation must preserve ViewMetadata UUID, all schemas, versions,
 version_log, current version, representations and properties exactly. Only its
 location changes to the destination. Old raw metadata images stay byte-identical;
