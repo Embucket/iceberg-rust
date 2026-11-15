@@ -1,9 +1,9 @@
 # File Catalog
 
 The separate [local view rename](VIEW_RENAME.md) adds a default-Unsupported
-Catalog API and an explicit local FileCatalog publisher. Its 22 focused owning
+Catalog API and an explicit local FileCatalog publisher. Its 23 focused owning
 controls pass, including actual process-exit recovery and worker cancellation.
-The complete file-catalog package passes 77 tests/zero failures/one inherited
+The complete file-catalog package passes 78 tests/zero failures/one inherited
 ignored benchmark; configured 1.95 Clippy and whole-workspace format checks pass.
 Independent source review and embedding SQL/account/cache acceptance remain
 separate; the prepared-pair foundation checks below do not qualify that adapter.
@@ -46,7 +46,7 @@ cargo test -p iceberg-file-catalog --lib filesystem_namespace_drop
 
 ## Prepared append pairs
 
-Status: source candidate with canonical owning package checks passed: 55 tests,
+Status: the original prepared-pair foundation's canonical package checks passed: 55 tests,
 zero failures and one inherited ignored benchmark, including all 24 pair controls
 and the existing namespace and real S3/LocalStack controls. Configured Clippy
 1.95.0 passes for this package's all-targets/all-features check with warnings

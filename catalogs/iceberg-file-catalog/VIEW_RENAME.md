@@ -1,9 +1,9 @@
 # Local view rename
 
-Status: bounded native source candidate; 22 focused owning controls pass.
+Status: bounded native source candidate; 23 focused owning controls pass.
 The first three owning tests compiled and produced actual RED (zero passes/three
 failures) on the Unsupported stub before implementation. On runtime source
-`ffaf00c7`, the full owning package passes 77 tests/zero failures/one inherited
+`ffcad125`, the full owning package passes 78 tests/zero failures/one inherited
 ignored benchmark, including existing namespace and real S3/LocalStack controls.
 Configured 1.95 all-targets/all-features Clippy with warnings denied and whole
 workspace format checks pass. Independent source review remains pending for the
@@ -143,7 +143,7 @@ cargo +1.95.0 clippy --offline --locked -p iceberg-file-catalog --all-targets --
 cargo +1.95.0 fmt --all -- --check
 ```
 
-The focused native receipt is 22 passed/zero failed (including the inert helper
+The focused native receipt is 23 passed/zero failed (including the inert helper
 under normal discovery); its recovery test invokes the actual test binary in five
 children exiting from the real blocking worker. Native tests used stable 1.99.1
 and two jobs in an isolated fork target; configured Clippy used its own 1.95
