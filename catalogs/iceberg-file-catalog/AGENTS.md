@@ -18,3 +18,58 @@
   caller's cancellation, and independently verify the lock is still held. Bound
   both worker pauses and async waits; a single pending poll is not proof.
 - Run focused namespace tests and an independent review before finalizing a PR.
+
+## Prepared append pairs
+
+The [explicit prepared-pair API](README.md) owns a bounded local two-head commit
+decision and redo recovery. The caller supplies native prepared commits; no
+ordinary update_table loop is an atomic transaction. Preparation retains one
+catalog-wide writer and publishes nothing. Only the blocking publisher may
+persist the ready/commit/complete controls, install heads or clean up its cache.
+It owns that guard until IO finishes, including a cancelled receiver.
+
+A durable or uncertain decision is never rolled back. Fence all ordinary head
+admission until exact recovery; validate root binding, required controls, both
+old/new byte identities, physical UUIDs and native transitions. Terminal records
+must not undo later normal writes. Configured store prefixes are part of the
+runtime fence and durable root identity; identical URI spellings for different
+native roots must not share authority.
+
+Derive a stable native mutation key even before the catalog root exists: resolve
+the nearest existing ancestor, then append only known-missing normal components.
+Never cache a guessed lexical key after canonicalization fails. Existing
+unresolvable ancestors must fail async construction or produce a fenced
+synchronous catalog-list handle. Keep a stable-symlink/missing-leaf old-reader
+versus new-writer control. Unsupported non-filesystem construction and lookup
+must bypass the shared pair-state registry.
+
+Normal load_tabular owns a single read scope; borrowed scope.load uses its
+unlocked internal implementation. Do not reacquire the fair RwLock through that
+trait method while holding a reader and a writer is queued. This scope is not a
+Rustice SQL/cache/physical lifetime snapshot. The embedding layer must supply a
+separate statement read/publication boundary before enabling INSERT ALL.
+
+Retain source-before-implementation controls, real paused blocking-worker
+cancellation/exclusion proof and actual child-process recovery tests. No new
+runtime dependencies, row conversions or successful SQL support claims belong
+to this metadata primitive.
+
+Pending COMMIT recovery must validate all persisted bounded artifact receipts
+before any head/cache installation. Receipts bind canonical root-relative graph
+members, exact lengths and explicitly noncryptographic accidental-corruption
+checksums; their set has a count/framed checksum. They are not authenticity
+proofs against an external writer. Parse plain predecessor bytes and compare the
+typed image; v1 refuses gzipped predecessor heads rather than accepting an
+unverified correspondence. Preserve ordinary gzip and non-filesystem paths.
+Check distinct table UUIDs again at the publication boundary, not only decode.
+
+Operation outcome and catalog health are distinct. A NotCommitted error must
+not reset an observed required-control corruption fence or overwrite the bad
+control with an abort record. Validate existing terminal controls under the
+same owner before publication, preserve bad bytes and require explicit repair.
+
+Delivery is successful oneshot enqueueing, not proof the caller polled a receipt.
+An already-closed receiver fences; a queued receipt abandoned later can leave a
+coherent healthy commit. Do not infer cancel implies a fork fence or hold an
+acknowledgement wait against an idle retained future. Keep a deterministic
+queued-result cancellation control and describe this boundary to embedders.

@@ -3,6 +3,8 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum Error {
+    #[error("prepared-pair recovery: {0}")]
+    PairRecovery(#[source] IcebergError),
     #[error(transparent)]
     ParseError(#[from] url::ParseError),
     #[error(transparent)]

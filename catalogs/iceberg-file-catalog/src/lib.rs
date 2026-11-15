@@ -45,9 +45,11 @@ type NamespaceWorkerPause = (
 #[derive(Debug)]
 pub struct FileCatalog {
     path: String,
+    mutation_key: String,
     object_store: ObjectStoreBuilder,
     cache: Arc<RwLock<HashMap<Identifier, (String, TabularMetadata)>>>,
     renamed_tables: Arc<RwLock<HashMap<Identifier, Identifier>>>,
+    pair_state: Arc<prepared_pair::PairState>,
     #[cfg(test)]
     update_before_publish_pause: StdMutex<
         Option<(
@@ -126,14 +128,11 @@ fn table_identity_path(location: &str) -> ObjectPath {
 }
 
 pub mod error;
+pub mod prepared_pair;
 
 impl FileCatalog {
     fn mutation_root_key(&self) -> String {
-        let bucket = Bucket::from_path(&self.path)
-            .map(|bucket| bucket.to_string())
-            .unwrap_or_default();
-        let path = ObjectPath::from(strip_prefix(&self.path));
-        format!("{bucket}/{path}").trim_end_matches('/').to_owned()
+        self.mutation_key.clone()
     }
 
     fn catalog_mutation_lock(&self) -> Arc<CatalogMutationLock> {
@@ -151,8 +150,10 @@ impl FileCatalog {
         lock
     }
 
-    async fn mutation_scope(&self) -> tokio::sync::OwnedRwLockReadGuard<()> {
-        self.catalog_mutation_lock().read_owned().await
+    async fn mutation_scope(&self) -> Result<tokio::sync::OwnedRwLockReadGuard<()>, IcebergError> {
+        let guard = self.catalog_mutation_lock().read_owned().await;
+        self.check_pair_health()?;
+        Ok(guard)
     }
 
     fn physical_identifier(&self, identifier: &Identifier) -> Identifier {
@@ -188,11 +189,15 @@ impl FileCatalog {
     }
 
     pub async fn new(path: &str, object_store: ObjectStoreBuilder) -> Result<Self, Error> {
-        Ok(FileCatalog {
+        let (mutation_key, pair_state) =
+            prepared_pair::catalog_state(path, &object_store).map_err(Error::PairRecovery)?;
+        let catalog = FileCatalog {
             path: path.to_owned(),
+            mutation_key,
             object_store,
             cache: Arc::new(RwLock::new(HashMap::new())),
             renamed_tables: Arc::new(RwLock::new(HashMap::new())),
+            pair_state,
             #[cfg(test)]
             update_before_publish_pause: StdMutex::new(None),
             #[cfg(test)]
@@ -203,7 +208,12 @@ impl FileCatalog {
             namespace_create_pause: StdMutex::new(None),
             #[cfg(test)]
             namespace_drop_pause: StdMutex::new(None),
-        })
+        };
+        catalog
+            .recover_append_pair()
+            .await
+            .map_err(Error::PairRecovery)?;
+        Ok(catalog)
     }
 
     pub fn catalog_list(&self) -> Arc<FileCatalogList> {
@@ -232,6 +242,7 @@ impl Catalog for FileCatalog {
                     .path_to_filesystem(&self.catalog_root_path().join(name))
                     .map_err(IcebergError::from)?;
                 let catalog_guard = self.catalog_mutation_lock().write_owned().await;
+                self.check_pair_health()?;
                 #[cfg(test)]
                 let pause = self.namespace_create_pause.lock().unwrap().take();
                 // A cancelled waiter cannot stop an already-started filesystem job.
@@ -252,6 +263,7 @@ impl Catalog for FileCatalog {
     /// Drop a namespace in the catalog
     async fn drop_namespace(&self, namespace: &Namespace) -> Result<(), IcebergError> {
         let catalog_guard = self.catalog_mutation_lock().write_owned().await;
+        self.check_pair_health()?;
         if let ObjectStoreBuilder::Filesystem(store) = &self.object_store {
             if let Some(name) = durable_local_namespace_name(namespace) {
                 let directory = store
@@ -417,6 +429,7 @@ impl Catalog for FileCatalog {
         }
         let catalog_lock = self.catalog_mutation_lock();
         let _catalog_guard = catalog_lock.write().await;
+        self.check_pair_health()?;
         if self.tabular_exists(destination).await? {
             return Err(IcebergError::InvalidFormat(format!(
                 "Destination table {destination} already exists"
@@ -480,51 +493,18 @@ impl Catalog for FileCatalog {
         self: Arc<Self>,
         identifier: &Identifier,
     ) -> Result<Tabular, IcebergError> {
-        let bucket = Bucket::from_path(&self.path)?;
-        let object_store = self.object_store.build(bucket)?;
-
-        let metadata_location = self.metadata_location(identifier).await?;
-
-        let metadata = object_store
-            .get_metadata(&metadata_location)
-            .await
-            .map_err(|error| match error {
-                IcebergError::ObjectStore(object_store::Error::NotFound { .. }) => {
-                    IcebergError::CatalogNotFound
-                }
-                other => other,
-            })?;
-
-        self.cache.write().unwrap().insert(
-            identifier.clone(),
-            (metadata_location.clone(), metadata.clone()),
-        );
-
-        match metadata {
-            TabularMetadata::Table(metadata) => Ok(Tabular::Table(
-                Table::new(
-                    identifier.clone(),
-                    self.clone(),
-                    object_store.clone(),
-                    metadata,
-                )
-                .await?,
-            )),
-            TabularMetadata::View(metadata) => Ok(Tabular::View(
-                View::new(identifier.clone(), self.clone(), metadata).await?,
-            )),
-            TabularMetadata::MaterializedView(metadata) => Ok(Tabular::MaterializedView(
-                MaterializedView::new(identifier.clone(), self.clone(), metadata).await?,
-            )),
+        if !matches!(self.object_store, ObjectStoreBuilder::Filesystem(_)) {
+            return self.load_tabular_under_scope(identifier).await;
         }
+        let _guard = self.mutation_scope().await?;
+        self.load_tabular_under_scope(identifier).await
     }
-
     async fn create_table(
         self: Arc<Self>,
         identifier: Identifier,
         mut create_table: CreateTable,
     ) -> Result<Table, IcebergError> {
-        let _catalog_guard = self.mutation_scope().await;
+        let _catalog_guard = self.mutation_scope().await?;
         let mutation_lock = self.mutation_lock(&identifier);
         let _mutation_guard = mutation_lock.lock().await;
         if self.tabular_exists(&identifier).await? {
@@ -574,7 +554,7 @@ impl Catalog for FileCatalog {
         identifier: Identifier,
         mut create_view: CreateView<Option<()>>,
     ) -> Result<View, IcebergError> {
-        let _catalog_guard = self.mutation_scope().await;
+        let _catalog_guard = self.mutation_scope().await?;
         let mutation_lock = self.mutation_lock(&identifier);
         let _mutation_guard = mutation_lock.lock().await;
         if self.tabular_exists(&identifier).await? {
@@ -613,6 +593,7 @@ impl Catalog for FileCatalog {
     ) -> Result<MaterializedView, IcebergError> {
         let catalog_lock = self.catalog_mutation_lock();
         let _catalog_guard = catalog_lock.write().await;
+        self.check_pair_health()?;
         let mutation_lock = self.mutation_lock(&identifier);
         let _mutation_guard = mutation_lock.lock().await;
         if self.tabular_exists(&identifier).await? {
@@ -674,7 +655,7 @@ impl Catalog for FileCatalog {
     }
 
     async fn update_table(self: Arc<Self>, commit: CommitTable) -> Result<Table, IcebergError> {
-        let _catalog_guard = self.mutation_scope().await;
+        let _catalog_guard = self.mutation_scope().await?;
         let mutation_lock = self.mutation_lock(&commit.identifier);
         let _mutation_guard = mutation_lock.lock().await;
         if commit.updates.iter().any(|update| {
@@ -797,7 +778,7 @@ impl Catalog for FileCatalog {
         self: Arc<Self>,
         commit: CommitView<Option<()>>,
     ) -> Result<View, IcebergError> {
-        let _catalog_guard = self.mutation_scope().await;
+        let _catalog_guard = self.mutation_scope().await?;
         let mutation_lock = self.mutation_lock(&commit.identifier);
         let _mutation_guard = mutation_lock.lock().await;
         let bucket = Bucket::from_path(&self.path)?;
@@ -862,7 +843,7 @@ impl Catalog for FileCatalog {
         self: Arc<Self>,
         commit: CommitView<Identifier>,
     ) -> Result<MaterializedView, IcebergError> {
-        let _catalog_guard = self.mutation_scope().await;
+        let _catalog_guard = self.mutation_scope().await?;
         let mutation_lock = self.mutation_lock(&commit.identifier);
         let _mutation_guard = mutation_lock.lock().await;
         let bucket = Bucket::from_path(&self.path)?;
@@ -934,6 +915,51 @@ impl Catalog for FileCatalog {
 }
 
 impl FileCatalog {
+    async fn load_tabular_under_scope(
+        self: Arc<Self>,
+        identifier: &Identifier,
+    ) -> Result<Tabular, IcebergError> {
+        let bucket = Bucket::from_path(&self.path)?;
+        let object_store = self.object_store.build(bucket)?;
+
+        let metadata_location = self.metadata_location(identifier).await?;
+
+        let metadata = object_store
+            .get_metadata(&metadata_location)
+            .await
+            .map_err(|error| match error {
+                IcebergError::ObjectStore(object_store::Error::NotFound { .. }) => {
+                    IcebergError::CatalogNotFound
+                }
+                other => other,
+            })?;
+
+        self.cache.write().unwrap().insert(
+            identifier.clone(),
+            (metadata_location.clone(), metadata.clone()),
+        );
+
+        match metadata {
+            TabularMetadata::Table(metadata) => Ok(Tabular::Table(
+                Table::new(
+                    identifier.clone(),
+                    self.clone(),
+                    object_store.clone(),
+                    metadata,
+                )
+                .await?,
+            )),
+            TabularMetadata::View(metadata) => Ok(Tabular::View(
+                View::new(identifier.clone(), self.clone(), metadata).await?,
+            )),
+            TabularMetadata::MaterializedView(metadata) => Ok(Tabular::MaterializedView(
+                MaterializedView::new(identifier.clone(), self.clone(), metadata).await?,
+            )),
+        }
+    }
+}
+
+impl FileCatalog {
     fn default_object_store(&self, bucket: Bucket) -> Arc<dyn object_store::ObjectStore> {
         Arc::new(self.object_store.build(bucket).unwrap())
     }
@@ -950,7 +976,7 @@ impl FileCatalog {
     }
 
     async fn drop_tabular(&self, identifier: &Identifier) -> Result<(), IcebergError> {
-        let _catalog_guard = self.mutation_scope().await;
+        let _catalog_guard = self.mutation_scope().await?;
         let mutation_lock = self.mutation_lock(identifier);
         let _mutation_guard = mutation_lock.lock().await;
         #[cfg(test)]
@@ -1002,6 +1028,7 @@ impl FileCatalog {
     }
 
     async fn metadata_location(&self, identifier: &Identifier) -> Result<String, IcebergError> {
+        self.check_pair_health()?;
         let physical_identifier = {
             let renamed_tables = self.renamed_tables.read().unwrap();
             if renamed_tables.values().any(|source| source == identifier)
@@ -1048,6 +1075,7 @@ impl FileCatalog {
             })
             .await
             .map_err(IcebergError::from)?;
+        self.check_pair_health()?;
         latest
             .map(|(_, path)| path)
             .ok_or(IcebergError::CatalogNotFound)
@@ -1275,11 +1303,23 @@ impl FileCatalogList {
 #[async_trait]
 impl CatalogList for FileCatalogList {
     fn catalog(&self, name: &str) -> Option<Arc<dyn Catalog>> {
+        let path = self.path.clone() + "/" + name;
+        let (mutation_key, pair_state) = prepared_pair::catalog_state(&path, &self.object_store)
+            .unwrap_or_else(|_| {
+                // This synchronous trait cannot report constructor IO errors.
+                // Preserve a handle, but never admit operations under a guessed key.
+                (
+                    format!("unresolved-file-catalog:{}", uuid::Uuid::new_v4()),
+                    prepared_pair::unavailable_state(),
+                )
+            });
         Some(Arc::new(FileCatalog {
-            path: self.path.clone() + "/" + name,
+            path,
+            mutation_key,
             object_store: self.object_store.clone(),
             cache: Arc::new(RwLock::new(HashMap::new())),
             renamed_tables: Arc::new(RwLock::new(HashMap::new())),
+            pair_state,
             #[cfg(test)]
             update_before_publish_pause: StdMutex::new(None),
             #[cfg(test)]
