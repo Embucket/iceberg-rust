@@ -43,23 +43,77 @@ pub(crate) fn state_for(key: &str) -> Arc<PairState> {
     state
 }
 
-pub(crate) fn state_for_path(path: &str, builder: &ObjectStoreBuilder) -> Arc<PairState> {
-    state_for(&state_key(path, builder))
+pub(crate) fn catalog_state(
+    path: &str,
+    builder: &ObjectStoreBuilder,
+) -> Result<(String, Arc<PairState>), IcebergError> {
+    let key = state_key(path, builder)?;
+    let state = if matches!(builder, ObjectStoreBuilder::Filesystem(_)) {
+        state_for(&key)
+    } else {
+        // Pair publication is unsupported here: no shared pair-registry mutex.
+        Arc::new(PairState::default())
+    };
+    Ok((key, state))
 }
 
-pub(crate) fn state_key(path: &str, builder: &ObjectStoreBuilder) -> String {
+pub(crate) fn unavailable_state() -> Arc<PairState> {
+    Arc::new(PairState(AtomicU8::new(FENCED)))
+}
+
+pub(crate) fn state_key(path: &str, builder: &ObjectStoreBuilder) -> Result<String, IcebergError> {
     if let ObjectStoreBuilder::Filesystem(store) = builder {
-        if let Ok(native) = store.path_to_filesystem(&ObjectPath::from(strip_prefix(path))) {
-            let native = native.canonicalize().unwrap_or(native);
-            return format!("file:{}", native.display());
-        }
+        let native = store
+            .path_to_filesystem(&ObjectPath::from(strip_prefix(path)))
+            .map_err(IcebergError::from)?;
+        let stable = canonical_future_path(&native)?;
+        return Ok(format!(
+            "file:{}",
+            stable
+                .to_str()
+                .ok_or_else(|| refusal("catalog root key is not UTF-8"))?
+        ));
     }
     let bucket = Bucket::from_path(path)
         .map(|bucket| bucket.to_string())
         .unwrap_or_default();
-    format!("{bucket}/{}", ObjectPath::from(strip_prefix(path)))
+    Ok(format!("{bucket}/{}", ObjectPath::from(strip_prefix(path)))
         .trim_end_matches('/')
-        .to_owned()
+        .to_owned())
+}
+
+// Resolve the nearest existing ancestor, including its symlinks, then append
+// only known-missing normal components. Never freeze an unresolved lexical alias.
+fn canonical_future_path(path: &NativePath) -> Result<PathBuf, IcebergError> {
+    let mut current = path.to_owned();
+    let mut tail = Vec::new();
+    loop {
+        match current.canonicalize() {
+            Ok(mut existing) => {
+                for component in tail.into_iter().rev() {
+                    existing.push(component);
+                }
+                return Ok(existing);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match std::fs::symlink_metadata(&current) {
+                    Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(io(error)),
+                    Ok(_) => return Err(refusal("existing catalog ancestor cannot be resolved")),
+                }
+                let Some(std::path::Component::Normal(component)) =
+                    current.components().next_back()
+                else {
+                    return Err(refusal("missing catalog tail is not a normal component"));
+                };
+                tail.push(component.to_os_string());
+                if !current.pop() {
+                    return Err(refusal("catalog root has no existing ancestor"));
+                }
+            }
+            Err(error) => return Err(io(error)),
+        }
+    }
 }
 
 fn refusal(message: impl Into<String>) -> IcebergError {
@@ -272,9 +326,15 @@ impl FileCatalog {
             .path_to_filesystem(&self.catalog_root_path())
             .map_err(IcebergError::from)?;
         let path = path.canonicalize().map_err(io)?;
+        let key = state_key(&self.path, &self.object_store)?;
+        if key != self.mutation_key {
+            return Err(refusal(
+                "configured catalog root changed from its stable mutation key",
+            ));
+        }
         Ok(NativeRoot {
             path,
-            key: state_key(&self.path, &self.object_store),
+            key,
             location: self.path.clone(),
             store: Arc::clone(store),
         })
@@ -1144,18 +1204,19 @@ fn checkpoint(hook: &Option<Arc<TestHook>>, stage: TestStage) -> Result<(), Iceb
 mod tests;
 
 impl NativeRoot {
-    fn sync_ancestors(&self, mut path: &NativePath) -> Result<(), IcebergError> {
-        if !path.starts_with(&self.path) {
+    fn sync_ancestors(&self, path: &NativePath) -> Result<(), IcebergError> {
+        let mut current = canonical_future_path(path)?;
+        if !current.starts_with(&self.path) {
             return Err(refusal("artifact parent escapes its catalog"));
         }
         loop {
-            self.sync_directory(path)?;
-            if path == self.path {
+            self.sync_directory(&current)?;
+            if current == self.path {
                 return Ok(());
             }
-            path = path
-                .parent()
-                .ok_or_else(|| refusal("artifact parent escapes its catalog"))?;
+            if !current.pop() {
+                return Err(refusal("artifact parent escapes its catalog"));
+            }
         }
     }
 }
@@ -1374,7 +1435,7 @@ fn validate_artifact_membership(
             .new_metadata
             .current_snapshot(None)?
             .ok_or_else(|| refusal("prepared-pair successor has no snapshot"))?;
-        let path = root.native(snapshot.manifest_list())?;
+        let path = canonical_future_path(&root.native(snapshot.manifest_list())?)?;
         // Lexically compare paths, without requiring obsolete terminal artifacts
         // to survive later ordinary writes, DROP/recreate or garbage collection.
         if !receipts

@@ -38,7 +38,7 @@ cargo test -p iceberg-file-catalog --lib filesystem_namespace_drop
 
 ## Prepared append pairs
 
-Status: source candidate. 21 actual-source isolated controls pass (including
+Status: source candidate. 24 actual-source isolated controls pass (including
 one child helper); ordinary Cargo/package and existing namespace checks remain
 pending. A warnings-denied production metadata compilation also passes. This API
 does not implement SQL INSERT ALL, multi-table user transactions, engine cache
@@ -59,8 +59,9 @@ head updates. The explicit prepared_pair module adds a bounded local primitive:
   scope.load(identifier) borrows its existing exclusion, with no recursive
   fair-RwLock acquisition. Ordinary filesystem Catalog::load_tabular takes one individual
   read scope and shares its implementation with borrowed loads. Non-filesystem
-  construction and loads retain their original unlocked dispatch; the new reader
-  scope refuses unsupported backends.
+  construction and loads retain their original unlocked dispatch without entering
+  the process-wide pair-state registry; the new reader scope refuses unsupported
+  backends.
 - recover_append_pair() runs under catalog-wide write exclusion. The async
   FileCatalog::new constructor runs recovery before returning a usable handle.
   A synchronous FileCatalogList::catalog handle refuses required journals
@@ -80,7 +81,16 @@ At most 4096 reachable artifacts are admitted, each manifest/list is at most
 1 MiB, their total encoded metadata is at most 16 MiB, and the complete synced
 artifact payload is at most 256 MiB. These are explicit first-version limits,
 not general Iceberg or SQL limits. Paths are derived through the configured
-filesystem store. Catalog mutation/fence keys bind that configured native root\nonce at construction, so URI/prefix aliases share exclusion while different\nnative roots do not share authority. Symlink/foreign-root artifacts and unexpected heads refuse.
+filesystem store. Catalog mutation/fence keys bind the configured native root at
+construction. If the root does not exist yet, its nearest existing ancestor is
+canonicalized before appending only known-missing normal path components. A
+stable symlink ancestor therefore has the same key before and after root
+creation, including across distinct catalog instances. Unresolvable existing
+ancestors refuse; no lexical fallback creates healthy authority. Async
+construction returns that error, while the synchronous catalog-list trait
+returns a fenced handle. URI/prefix aliases share exclusion; different native
+roots do not share authority. Symlink/foreign-root artifacts and unexpected heads
+refuse.
 The root owner must exclude outside path swaps/writers. Process-local locks do
 not establish that external ownership.
 
@@ -156,6 +166,10 @@ and unchanged non-filesystem construction/load while its writer lock is held.
 Final controls separately prove foreign/corrupt/dangling controls are present
 authority errors, and NotCommitted outcomes retain a health fence, and deterministically queue then abandon a delivered receipt to
 prove a coherent healthy commit is allowed in that specific cancellation window.
+Alias controls construct the first catalog before its leaf exists, hold its
+reader against a peer constructed after creation, then publish/reopen through
+the alias. Separate controls prove unresolved ancestors remain fenced and remote
+construction/catalog-list lookup bypass a held process-wide pair registry.
 The tiny data-file test payload only validates metadata/manifest publication;
 it makes no Parquet decoding or SQL row-acceptance claim.
 

@@ -1018,3 +1018,28 @@ async fn nonfilesystem_construction_and_catalog_lists_do_not_enter_pair_registry
     }
     Ok(())
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn an_unresolvable_existing_ancestor_never_gets_a_healthy_guessed_key() -> TestResult {
+    let root = tempfile::tempdir()?;
+    std::os::unix::fs::symlink(
+        root.path().join("missing-target"),
+        root.path().join("alias"),
+    )?;
+    let store = ObjectStoreBuilder::filesystem(root.path());
+    assert!(FileCatalog::new("file:///alias/new-catalog", store.clone())
+        .await
+        .is_err());
+    let list = crate::FileCatalogList::new("file:///alias", store).await?;
+    let unavailable = list.catalog("new-catalog").ok_or("fenced catalog handle")?;
+    let namespace = Namespace::try_new(&["APP".to_owned()])?;
+    assert!(unavailable
+        .create_namespace(&namespace, None)
+        .await
+        .is_err());
+    let identifier = Identifier::new(&namespace, "MISSING");
+    assert!(unavailable.load_tabular(&identifier).await.is_err());
+    assert!(!root.path().join("missing-target").exists());
+    Ok(())
+}

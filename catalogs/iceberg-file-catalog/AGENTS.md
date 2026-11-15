@@ -35,6 +35,14 @@ must not undo later normal writes. Configured store prefixes are part of the
 runtime fence and durable root identity; identical URI spellings for different
 native roots must not share authority.
 
+Derive a stable native mutation key even before the catalog root exists: resolve
+the nearest existing ancestor, then append only known-missing normal components.
+Never cache a guessed lexical key after canonicalization fails. Existing
+unresolvable ancestors must fail async construction or produce a fenced
+synchronous catalog-list handle. Keep a stable-symlink/missing-leaf old-reader
+versus new-writer control. Unsupported non-filesystem construction and lookup
+must bypass the shared pair-state registry.
+
 Normal load_tabular owns a single read scope; borrowed scope.load uses its
 unlocked internal implementation. Do not reacquire the fair RwLock through that
 trait method while holding a reader and a writer is queued. This scope is not a

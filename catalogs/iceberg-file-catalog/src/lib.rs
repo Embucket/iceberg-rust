@@ -189,13 +189,15 @@ impl FileCatalog {
     }
 
     pub async fn new(path: &str, object_store: ObjectStoreBuilder) -> Result<Self, Error> {
-        let mut catalog = FileCatalog {
+        let (mutation_key, pair_state) =
+            prepared_pair::catalog_state(path, &object_store).map_err(Error::PairRecovery)?;
+        let catalog = FileCatalog {
             path: path.to_owned(),
-            mutation_key: prepared_pair::state_key(path, &object_store),
+            mutation_key,
             object_store,
             cache: Arc::new(RwLock::new(HashMap::new())),
             renamed_tables: Arc::new(RwLock::new(HashMap::new())),
-            pair_state: Arc::new(prepared_pair::PairState::default()),
+            pair_state,
             #[cfg(test)]
             update_before_publish_pause: StdMutex::new(None),
             #[cfg(test)]
@@ -207,7 +209,6 @@ impl FileCatalog {
             #[cfg(test)]
             namespace_drop_pause: StdMutex::new(None),
         };
-        catalog.pair_state = prepared_pair::state_for_path(&catalog.path, &catalog.object_store);
         catalog
             .recover_append_pair()
             .await
@@ -1302,19 +1303,23 @@ impl FileCatalogList {
 #[async_trait]
 impl CatalogList for FileCatalogList {
     fn catalog(&self, name: &str) -> Option<Arc<dyn Catalog>> {
+        let path = self.path.clone() + "/" + name;
+        let (mutation_key, pair_state) = prepared_pair::catalog_state(&path, &self.object_store)
+            .unwrap_or_else(|_| {
+                // This synchronous trait cannot report constructor IO errors.
+                // Preserve a handle, but never admit operations under a guessed key.
+                (
+                    format!("unresolved-file-catalog:{}", uuid::Uuid::new_v4()),
+                    prepared_pair::unavailable_state(),
+                )
+            });
         Some(Arc::new(FileCatalog {
-            path: self.path.clone() + "/" + name,
-            mutation_key: prepared_pair::state_key(
-                &(self.path.clone() + "/" + name),
-                &self.object_store,
-            ),
+            path,
+            mutation_key,
             object_store: self.object_store.clone(),
             cache: Arc::new(RwLock::new(HashMap::new())),
             renamed_tables: Arc::new(RwLock::new(HashMap::new())),
-            pair_state: prepared_pair::state_for_path(
-                &(self.path.clone() + "/" + name),
-                &self.object_store,
-            ),
+            pair_state,
             #[cfg(test)]
             update_before_publish_pause: StdMutex::new(None),
             #[cfg(test)]
