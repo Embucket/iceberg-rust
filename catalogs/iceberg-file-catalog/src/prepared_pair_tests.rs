@@ -201,6 +201,69 @@ fn failure(stage: TestStage) -> Arc<TestHook> {
 }
 
 #[tokio::test]
+async fn append_pair_and_view_rename_share_one_versioned_terminal_slot() -> TestResult {
+    use iceberg_rust::spec::view_metadata::{Version, ViewRepresentation};
+    let fixture = Fixture::new().await?;
+    let view = View::builder()
+        .with_name("RV")
+        .with_schema(fixture.tables[0].current_schema()?.clone())
+        .with_view_version(
+            Version::builder()
+                .with_representation(ViewRepresentation::sql("SELECT 1 AS X", Some("snowflake")))
+                .build()?,
+        )
+        .build(
+            fixture.tables[0].identifier().namespace(),
+            Arc::clone(&fixture.catalog) as Arc<dyn Catalog>,
+        )
+        .await?;
+    let destination = Identifier::new(view.identifier().namespace(), "RV2");
+    // V2 COMPLETE is a valid predecessor for V1 without touching the native
+    // commits' already-prepared metadata/manifest artifact graph.
+    let renamed = Arc::clone(&fixture.catalog)
+        .rename_view(view.identifier(), &destination)
+        .await?;
+    fixture
+        .catalog
+        .prepare_append_pair(fixture.commits.clone())
+        .await?
+        .publish()
+        .await?;
+    assert!(fixture.snapshots().await?.iter().all(Option::is_some));
+    // V1 COMPLETE is a valid predecessor for a subsequent V2 decision as well.
+    let final_name = Identifier::new(view.identifier().namespace(), "RV3");
+    let final_view = Arc::clone(&fixture.catalog)
+        .rename_view(&destination, &final_name)
+        .await?;
+    let mut expected = renamed.metadata().clone();
+    expected.location = expected.location.trim_end_matches('2').to_owned() + "3";
+    assert_eq!(final_view.metadata(), &expected);
+    fixture.catalog.recover_append_pair().await?;
+    assert!(fixture.snapshots().await?.iter().all(Option::is_some));
+    let reopened = Arc::new(
+        FileCatalog::new(
+            "file:///catalog",
+            ObjectStoreBuilder::filesystem(fixture.root.path()),
+        )
+        .await?,
+    );
+    let Tabular::View(view) = Arc::clone(&reopened).load_tabular(&final_name).await? else {
+        return Err("final view".into());
+    };
+    assert_eq!(view.metadata(), &expected);
+    for table in &fixture.tables {
+        let Tabular::Table(table) = Arc::clone(&reopened)
+            .load_tabular(table.identifier())
+            .await?
+        else {
+            return Err("paired table".into());
+        };
+        assert!(table.metadata().current_snapshot_id.is_some());
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn before_decision_failure_keeps_both_old_heads_readable() -> TestResult {
     let fixture = Fixture::new().await?;
     let mut prepared = fixture

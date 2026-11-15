@@ -1,5 +1,17 @@
 # File Catalog
 
+The separate [local view rename](VIEW_RENAME.md) adds a default-Unsupported
+Catalog API and an explicit local FileCatalog publisher. Its 29 focused owning
+controls pass, including actual process-exit recovery and worker cancellation.
+On runtime source `4d5a618d`, the complete file-catalog package passes 82 tests/zero
+failures/one inherited ignored benchmark; configured 1.95 Clippy and
+whole-workspace format checks pass.
+Independent source review and embedding SQL/account/cache acceptance remain
+separate; the prepared-pair foundation checks below do not qualify that adapter.
+The checked `Catalog::rename_view_from_metadata` seam compares the complete
+authorized typed predecessor under the native writer before publishing effects;
+it supports object-safe engine integration without a catalog downcast.
+
 Filesystem and object-store-backed Iceberg catalog.
 
 ## Local Namespace Mutations
@@ -38,7 +50,7 @@ cargo test -p iceberg-file-catalog --lib filesystem_namespace_drop
 
 ## Prepared append pairs
 
-Status: source candidate with canonical owning package checks passed: 55 tests,
+Status: the original prepared-pair foundation's canonical package checks passed: 55 tests,
 zero failures and one inherited ignored benchmark, including all 24 pair controls
 and the existing namespace and real S3/LocalStack controls. Configured Clippy
 1.95.0 passes for this package's all-targets/all-features check with warnings

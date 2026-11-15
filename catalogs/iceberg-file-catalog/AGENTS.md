@@ -1,5 +1,21 @@
 # File Catalog Guidance
 
+- [Local view rename](VIEW_RENAME.md) is a bounded source candidate.
+  Preserve full typed/raw history, UUID and opaque creator markers; never adapt
+  the table relocation's UUID-reset/current-snapshot semantics. Its owned
+  publisher shares the root's single versioned decision slot with append pairs.
+  Preserve actual worker exclusion, staged-history receipts, durable COMMIT redo
+  and required-control fences. READY staging belongs inside source metadata;
+  neither a new logical name nor cache entry may appear before the decision.
+  Old-name local view updates require a fresh physical head/image check, including
+  across distinct catalog instances and old-name recreation with a new UUID.
+  Borrowed reader listing/existence must not reacquire the fair root lock.
+  Embedding callers use the object-safe checked-predecessor method, comparing
+  full typed metadata under the retained writer before any publication effect.
+  Never fall back from that method to unchecked rename or interpret creator
+  properties as native authorization. Identical typed no-op head advances are
+  admissible; arbitrary external writers remain outside the owner contract.
+
 - This crate owns file-catalog metadata lookup and filesystem/object-store
   mutations, not SQL session selection or Rustice display markers.
 - Preserve the existing URI/object-path conversion helpers. Tests must derive
