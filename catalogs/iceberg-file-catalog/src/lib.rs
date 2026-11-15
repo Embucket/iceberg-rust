@@ -509,6 +509,21 @@ impl Catalog for FileCatalog {
             .await
             .map_err(|error| IcebergError::External(Box::new(error)))
     }
+    async fn rename_view_from_metadata(
+        self: Arc<Self>,
+        source: &Identifier,
+        destination: &Identifier,
+        expected: &ViewMetadata,
+    ) -> Result<View, IcebergError> {
+        let prepared = self.prepare_view_rename(source, destination).await?;
+        if prepared.source_metadata() != expected {
+            return Err(IcebergError::CommitConflict(source.to_string()));
+        }
+        prepared
+            .publish()
+            .await
+            .map_err(|error| IcebergError::External(Box::new(error)))
+    }
     async fn drop_view(&self, identifier: &Identifier) -> Result<(), IcebergError> {
         self.drop_tabular(identifier).await
     }
