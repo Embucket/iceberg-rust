@@ -532,3 +532,223 @@ async fn configured_native_root_owns_the_fence_and_exclusion_identity() -> TestR
     assert!(alias.read_scope().await.is_ok());
     Ok(())
 }
+
+async fn candidate_artifact_paths(
+    fixture: &Fixture,
+    prepared: &PreparedAppendPair,
+) -> TestResult<[PathBuf; 3]> {
+    let table = Table::new(
+        fixture.tables[1].identifier().clone(),
+        Arc::clone(&fixture.catalog) as Arc<dyn Catalog>,
+        fixture.tables[1].object_store(),
+        prepared.entries[1].new_metadata.clone(),
+    )
+    .await?;
+    let snapshot = table
+        .metadata()
+        .current_snapshot(None)?
+        .ok_or("candidate snapshot")?;
+    let list = fixture.catalog.pair_native(snapshot.manifest_list())?;
+    let manifests = table.manifests(None, None).await?;
+    let manifest = fixture
+        .catalog
+        .pair_native(&manifests.first().ok_or("candidate manifest")?.manifest_path)?;
+    Ok([
+        fixture.root.path().join("catalog/APP/B/data/input.parquet"),
+        manifest,
+        list,
+    ])
+}
+
+#[tokio::test]
+async fn pending_commit_recovery_validates_every_artifact_before_any_install() -> TestResult {
+    for stage in [TestStage::AfterDecision, TestStage::AfterFirstHead] {
+        for kind in 0..3 {
+            for missing in [true, false] {
+                let fixture = Fixture::new().await?;
+                let mut prepared = fixture
+                    .catalog
+                    .prepare_append_pair(fixture.commits.clone())
+                    .await?;
+                let path = candidate_artifact_paths(&fixture, &prepared).await?[kind].clone();
+                prepared.hook = Some(failure(stage));
+                assert_eq!(
+                    prepared
+                        .publish()
+                        .await
+                        .expect_err("pending decision")
+                        .outcome,
+                    PairOutcome::CommittedNeedsRecovery
+                );
+                let exact = std::fs::read(&path)?;
+                if missing {
+                    std::fs::remove_file(&path)?;
+                } else {
+                    let mut corrupt = exact.clone();
+                    *corrupt.first_mut().ok_or("nonempty artifact")? ^= 1;
+                    std::fs::write(&path, corrupt)?;
+                }
+                assert!(
+                    fixture.catalog.recover_append_pair().await.is_err(),
+                    "stage={stage:?}, kind={kind}, missing={missing}"
+                );
+                assert!(fixture.catalog.read_scope().await.is_err());
+                assert!(
+                    !fixture
+                        .root
+                        .path()
+                        .join("catalog/APP/B/metadata/v1.metadata.json")
+                        .exists(),
+                    "bad artifact must be checked before installing second head"
+                );
+                if stage == TestStage::AfterDecision {
+                    assert!(
+                        !fixture
+                            .root
+                            .path()
+                            .join("catalog/APP/A/metadata/v1.metadata.json")
+                            .exists(),
+                        "bad artifact must be checked before installing first head"
+                    );
+                }
+                std::fs::write(path, exact)?;
+                fixture.catalog.recover_append_pair().await?;
+                assert!(fixture.snapshots().await?.iter().all(Option::is_some));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn journal_typed_predecessor_must_match_its_exact_byte_image() -> TestResult {
+    let fixture = Fixture::new().await?;
+    let mut prepared = fixture
+        .catalog
+        .prepare_append_pair(fixture.commits.clone())
+        .await?;
+    prepared.hook = Some(failure(TestStage::AfterFirstHead));
+    assert!(prepared.publish().await.is_err());
+    let path = fixture.root.path().join("catalog").join(JOURNAL);
+    let exact = std::fs::read(&path)?;
+    let mut journal: serde_json::Value = serde_json::from_slice(&exact)?;
+    let entry = &mut journal["entries"][1];
+    entry["old_metadata"]["properties"]["forged-annotation"] =
+        serde_json::json!("not-in-predecessor-bytes");
+    let mut next: serde_json::Value =
+        serde_json::from_str(entry["new_json"].as_str().ok_or("new JSON")?)?;
+    next["properties"]["forged-annotation"] = serde_json::json!("not-in-predecessor-bytes");
+    entry["new_json"] = serde_json::to_string(&next)?.into();
+    std::fs::write(&path, serde_json::to_vec(&journal)?)?;
+    assert!(
+        fixture.catalog.recover_append_pair().await.is_err(),
+        "a consistent typed old/new transition cannot invent predecessor properties"
+    );
+    assert!(!fixture
+        .root
+        .path()
+        .join("catalog/APP/B/metadata/v1.metadata.json")
+        .exists());
+    assert!(fixture.catalog.read_scope().await.is_err());
+    std::fs::write(path, exact)?;
+    fixture.catalog.recover_append_pair().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn pair_v1_refuses_gzipped_predecessors_before_control_effects() -> TestResult {
+    let fixture = Fixture::new().await?;
+    let mut table = fixture.tables[0].clone();
+    table
+        .new_transaction(None)
+        .update_properties(vec![(
+            "write.metadata.compression-codec".to_owned(),
+            "gzip".to_owned(),
+        )])
+        .commit()
+        .await?;
+    assert!(fixture
+        .catalog
+        .metadata_location(table.identifier())
+        .await?
+        .ends_with(".gz.metadata.json"));
+    assert!(fixture
+        .catalog
+        .prepare_append_pair(fixture.commits.clone())
+        .await
+        .is_err());
+    assert!(!fixture.root.path().join("catalog").join(WITNESS).exists());
+    assert!(!fixture.root.path().join("catalog").join(JOURNAL).exists());
+    assert_eq!(fixture.snapshots().await?, [None, None]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn duplicate_physical_uuid_is_refused_before_a_prepared_capability() -> TestResult {
+    let fixture = Fixture::new().await?;
+    let uuid = fixture.tables[0].metadata().table_uuid;
+    let path = fixture
+        .root
+        .path()
+        .join("catalog/APP/B/metadata/v0.metadata.json");
+    let mut metadata: TableMetadata = serde_json::from_slice(&std::fs::read(&path)?)?;
+    metadata.table_uuid = uuid;
+    std::fs::write(path, serde_json::to_vec(&metadata)?)?;
+    std::fs::write(
+        fixture
+            .root
+            .path()
+            .join("catalog/APP/B/metadata/table-uuid"),
+        uuid.as_bytes(),
+    )?;
+    let mut commits = fixture.commits.clone();
+    for requirement in &mut commits[1].requirements {
+        if let TableRequirement::AssertTableUuid { uuid: required } = requirement {
+            *required = uuid;
+        }
+    }
+    assert!(fixture.catalog.prepare_append_pair(commits).await.is_err());
+    assert!(!fixture.root.path().join("catalog").join(WITNESS).exists());
+    assert_eq!(fixture.snapshots().await?, [None, None]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn ordinary_nonfilesystem_load_keeps_its_existing_unlocked_path() -> TestResult {
+    let memory =
+        Arc::new(FileCatalog::new("/pair-memory-control", ObjectStoreBuilder::memory()).await?);
+    let namespace = Namespace::try_new(&["APP".to_owned()])?;
+    let schema = Schema::builder()
+        .with_struct_field(StructField {
+            id: 1,
+            name: "id".to_owned(),
+            required: true,
+            field_type: Type::Primitive(PrimitiveType::Long),
+            doc: None,
+            initial_default: None,
+            write_default: None,
+        })
+        .build()?;
+    let mut builder = CreateTableBuilder::default();
+    let table = builder
+        .with_name("T")
+        .with_schema(schema)
+        .build(&namespace, Arc::clone(&memory) as Arc<dyn Catalog>)
+        .await?;
+    let writer = memory.catalog_mutation_lock().write_owned().await;
+    let loaded = tokio::time::timeout(
+        Duration::from_secs(1),
+        Arc::clone(&memory).load_tabular(table.identifier()),
+    )
+    .await??;
+    let Tabular::Table(loaded) = loaded else {
+        return Err("table".into());
+    };
+    assert_eq!(loaded.metadata().table_uuid, table.metadata().table_uuid);
+    drop(writer);
+    assert!(
+        memory.read_scope().await.is_err(),
+        "new pair snapshot scopes are explicitly filesystem-only"
+    );
+    Ok(())
+}
