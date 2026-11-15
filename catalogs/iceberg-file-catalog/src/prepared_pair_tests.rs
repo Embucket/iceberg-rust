@@ -20,13 +20,12 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> TestResult<Self> {
-        let root = tempfile::tempdir()?;
+        Self::at(tempfile::tempdir()?, "file:///catalog").await
+    }
+
+    async fn at(root: tempfile::TempDir, location: &str) -> TestResult<Self> {
         let catalog = Arc::new(
-            FileCatalog::new(
-                "file:///catalog",
-                ObjectStoreBuilder::filesystem(root.path()),
-            )
-            .await?,
+            FileCatalog::new(location, ObjectStoreBuilder::filesystem(root.path())).await?,
         );
         let schema = Schema::builder()
             .with_struct_field(StructField {
@@ -918,5 +917,104 @@ async fn dangling_required_journal_is_present_corruption_not_fresh_absence() -> 
     assert!(fixture.catalog.read_scope().await.is_err());
     assert_eq!(std::fs::read_link(journal)?, target);
     assert!(!fixture.root.path().join("catalog").join(WITNESS).exists());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_stable_symlink_ancestor_keeps_the_same_key_before_and_after_leaf_creation() -> TestResult
+{
+    let root = tempfile::tempdir()?;
+    std::fs::create_dir(root.path().join("actual"))?;
+    std::os::unix::fs::symlink(root.path().join("actual"), root.path().join("alias"))?;
+    assert!(!root.path().join("alias/new-catalog").exists());
+    // at() constructs the original handle before CREATE namespace makes the leaf.
+    let fixture = Fixture::at(root, "file:///alias/new-catalog").await?;
+    let peer = Arc::new(
+        FileCatalog::new(
+            "file:///alias/new-catalog",
+            ObjectStoreBuilder::filesystem(fixture.root.path()),
+        )
+        .await?,
+    );
+    let scope = fixture.catalog.read_scope().await?;
+    let commits = fixture.commits.clone();
+    let peer_job = Arc::clone(&peer);
+    let mut pending = tokio::spawn(async move { peer_job.prepare_append_pair(commits).await });
+    match tokio::time::timeout(Duration::from_millis(50), &mut pending).await {
+        Err(_) => {}
+        Ok(result) => {
+            drop(scope);
+            drop(result);
+            return Err(
+                "new peer bypassed the old handle's read exclusion through a stable ancestor alias"
+                    .into(),
+            );
+        }
+    }
+    for table in &fixture.tables {
+        let Tabular::Table(current) = scope.load(table.identifier()).await? else {
+            return Err("table".into());
+        };
+        assert!(current.metadata().current_snapshot_id.is_none());
+    }
+    drop(scope);
+    let prepared = tokio::time::timeout(Duration::from_secs(5), pending).await???;
+    prepared.publish().await?;
+    assert!(fixture.snapshots().await?.iter().all(Option::is_some));
+    let reopened = Arc::new(
+        FileCatalog::new(
+            "file:///alias/new-catalog",
+            ObjectStoreBuilder::filesystem(fixture.root.path()),
+        )
+        .await?,
+    );
+    let scoped = reopened.read_scope().await?;
+    for table in &fixture.tables {
+        let Tabular::Table(current) = scoped.load(table.identifier()).await? else {
+            return Err("table".into());
+        };
+        assert_eq!(current.metadata().snapshots.len(), 1);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn nonfilesystem_construction_and_catalog_lists_do_not_enter_pair_registry() -> TestResult {
+    for use_list in [false, true] {
+        let (finished, waiting) = std::sync::mpsc::channel();
+        let registry = STATES.get_or_init(Default::default);
+        let guard = registry.lock().map_err(|_| "pair registry lock")?;
+        let worker = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime");
+            let result = runtime.block_on(async {
+                if use_list {
+                    let list = crate::FileCatalogList::new(
+                        "/remote-pair-registry",
+                        ObjectStoreBuilder::memory(),
+                    )
+                    .await?;
+                    Ok::<_, crate::error::Error>(list.catalog("CHILD").is_some())
+                } else {
+                    FileCatalog::new("/remote-pair-registry", ObjectStoreBuilder::memory())
+                        .await
+                        .map(|_| true)
+                }
+            });
+            let _ = finished.send(result.map_err(|error| error.to_string()));
+        });
+        let result = waiting.recv_timeout(Duration::from_millis(100));
+        drop(guard);
+        worker
+            .join()
+            .map_err(|_| "remote constructor worker panic")?;
+        assert!(
+            matches!(result, Ok(Ok(true))),
+            "remote pair-unsupported path entered global registry, use_list={use_list}: {result:?}"
+        );
+    }
     Ok(())
 }
