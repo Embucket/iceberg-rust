@@ -231,7 +231,7 @@ pub struct PreparedAppendPair {
     root: NativeRoot,
     operation_id: Uuid,
     entries: [Entry; 2],
-    artifacts: Vec<PathBuf>,
+    artifacts: Vec<ArtifactReceipt>,
     #[cfg(test)]
     hook: Option<Arc<TestHook>>,
 }
@@ -290,6 +290,9 @@ impl FileCatalog {
     }
 
     pub(crate) fn check_pair_health(&self) -> Result<(), IcebergError> {
+        if !matches!(self.object_store, ObjectStoreBuilder::Filesystem(_)) {
+            return Ok(());
+        }
         match self.pair_state.0.load(Ordering::Acquire) {
             HEALTHY => Ok(()),
             UNPREPARED => {
@@ -327,6 +330,11 @@ impl FileCatalog {
     }
 
     pub async fn read_scope(self: &Arc<Self>) -> Result<FileCatalogReadScope, IcebergError> {
+        if !matches!(self.object_store, ObjectStoreBuilder::Filesystem(_)) {
+            return Err(refusal(
+                "prepared-pair reader scopes require a filesystem catalog",
+            ));
+        }
         Ok(FileCatalogReadScope {
             catalog: Arc::clone(self),
             _guard: self.mutation_scope().await?,
@@ -339,6 +347,11 @@ impl FileCatalog {
         self: &Arc<Self>,
         commits: [CommitTable; 2],
     ) -> Result<PreparedAppendPair, IcebergError> {
+        if !matches!(self.object_store, ObjectStoreBuilder::Filesystem(_)) {
+            return Err(refusal(
+                "prepared append pairs require a local filesystem catalog",
+            ));
+        }
         let guard = self.catalog_mutation_lock().write_owned().await;
         self.check_pair_health()?;
         let root = self.pair_root()?;
@@ -359,6 +372,11 @@ impl FileCatalog {
                 return Err(refusal("prepared append pair requires plain local targets"));
             }
             let old_location = self.metadata_location(&commit.identifier).await?;
+            if old_location.ends_with(".gz.metadata.json") {
+                return Err(refusal(
+                    "prepared append pair v1 requires plain JSON predecessor heads",
+                ));
+            }
             let Tabular::Table(old_table) = Arc::clone(self)
                 .load_tabular_under_scope(&commit.identifier)
                 .await?
@@ -400,6 +418,11 @@ impl FileCatalog {
             }
             let old_path = self.pair_native(&old_location)?;
             let old_bytes = root.read(&old_path, MAX_METADATA)?;
+            if serde_json::from_slice::<TableMetadata>(&old_bytes)? != *old {
+                return Err(refusal(
+                    "prepared-pair typed predecessor differs from its exact bytes",
+                ));
+            }
             let new_location =
                 new_filesystem_metadata_location(&next.location, &old_location, false)?;
             let candidate = Table::new(
@@ -446,31 +469,39 @@ impl FileCatalog {
         let entries: [Entry; 2] = entries
             .try_into()
             .map_err(|_| refusal("prepared append pair requires two targets"))?;
+        validate_distinct_entries(&entries)?;
         let mut prepared = PreparedAppendPair {
             catalog: Arc::clone(self),
             _guard: guard,
             root,
             operation_id: Uuid::new_v4(),
             entries,
-            artifacts: artifacts.into_iter().collect(),
+            artifacts: Vec::new(),
             #[cfg(test)]
             hook: None,
         };
-        prepared.artifacts.sort();
-        // Encode and bound all durable control bytes before entering the native worker.
-        prepared.journal("commit")?;
-        Ok(prepared)
+        let mut paths = artifacts.into_iter().collect::<Vec<_>>();
+        paths.sort();
+        // The checksum reader owns the same writer while native IO runs. Cancelling
+        // preparation cannot release it while the actual blocking reader is active.
+        tokio::task::spawn_blocking(move || {
+            prepared.artifacts = capture_artifacts(&prepared.root, &paths)?;
+            validate_artifact_membership(&prepared.root, &prepared.entries, &prepared.artifacts)?;
+            prepared.journal("commit")?;
+            Ok(prepared)
+        })
+        .await
+        .map_err(io)?
     }
 
     /// Recover under catalog-wide write exclusion before exposing any table heads.
     /// A synchronous CatalogList handle with required pair controls remains fenced
     /// until an explicit asynchronous constructor/recovery establishes this receipt.
     pub async fn recover_append_pair(&self) -> Result<(), IcebergError> {
-        let guard = self.catalog_mutation_lock().write_owned().await;
         if !matches!(self.object_store, ObjectStoreBuilder::Filesystem(_)) {
-            self.pair_state.0.store(HEALTHY, Ordering::Release);
             return Ok(());
         }
+        let guard = self.catalog_mutation_lock().write_owned().await;
         let ObjectStoreBuilder::Filesystem(store) = &self.object_store else {
             return Err(fenced());
         };
@@ -501,7 +532,13 @@ impl FileCatalog {
 
 impl PreparedAppendPair {
     fn journal(&self, phase: &str) -> Result<Vec<u8>, IcebergError> {
-        encode_journal(&self.root.key, self.operation_id, phase, &self.entries)
+        encode_journal(
+            &self.root.key,
+            self.operation_id,
+            phase,
+            &self.entries,
+            &self.artifacts,
+        )
     }
 
     /// One non-cancellable blocking owner performs the decision and both installs.
@@ -567,18 +604,8 @@ impl PublishOwner {
         let mut outcome = PairOutcome::NotCommitted;
         let result = (|| {
             validate_entries(root, &prepared.entries, false)?;
-            let mut total = 0_u64;
-            for path in &prepared.artifacts {
-                let file = root.regular(path)?;
-                total = total
-                    .checked_add(file.metadata().map_err(io)?.len())
-                    .ok_or_else(|| refusal("prepared-pair artifact byte overflow"))?;
-                if total > MAX_ARTIFACT_BYTES {
-                    return Err(refusal("prepared-pair artifact bytes exceed their bound"));
-                }
-                file.sync_all().map_err(io)?;
-                root.sync_ancestors(path.parent().ok_or_else(|| refusal("artifact parent"))?)?;
-            }
+            validate_artifacts(root, &prepared.artifacts, true)?;
+            validate_artifact_membership(root, &prepared.entries, &prepared.artifacts)?;
             prepare_witness(root)?;
             let ready = prepared.journal("ready")?;
             let mut attempted = false;
@@ -735,6 +762,7 @@ fn encode_journal(
     operation_id: Uuid,
     phase: &str,
     entries: &[Entry; 2],
+    artifacts: &[ArtifactReceipt],
 ) -> Result<Vec<u8>, IcebergError> {
     let entries = entries
         .iter()
@@ -750,8 +778,20 @@ fn encode_journal(
             })
         })
         .collect::<Vec<_>>();
+    let receipts = artifacts
+        .iter()
+        .map(|artifact| {
+            json!({
+                "path": artifact.relative,
+                "length": artifact.length,
+                "checksum_fnv1a64": format!("{:016x}", artifact.checksum),
+            })
+        })
+        .collect::<Vec<_>>();
     let bytes = serde_json::to_vec(
-        &json!({ "version": 1, "catalog": key, "operation_id": operation_id.to_string(), "phase": phase, "entries": entries }),
+        &json!({ "version": 1, "catalog": key, "operation_id": operation_id.to_string(), "phase": phase, "entries": entries,
+            "artifacts": receipts, "artifact_count": artifacts.len(),
+            "artifact_receipts_fnv1a64": format!("{:016x}", artifact_receipt_checksum(artifacts)) }),
     )?;
     if bytes.len() > MAX_JOURNAL {
         return Err(refusal("prepared-pair journal exceeds its byte bound"));
@@ -762,9 +802,9 @@ fn encode_journal(
 fn decode_journal(
     root: &NativeRoot,
     bytes: &[u8],
-) -> Result<(Uuid, String, [Entry; 2]), IcebergError> {
+) -> Result<(Uuid, String, [Entry; 2], Vec<ArtifactReceipt>), IcebergError> {
     let value: Value = serde_json::from_slice(bytes)?;
-    if value.as_object().map(|map| map.len()) != Some(5)
+    if value.as_object().map(|map| map.len()) != Some(8)
         || value["version"] != 1
         || value["catalog"] != root.key
     {
@@ -837,10 +877,22 @@ fn decode_journal(
     {
         return Err(refusal("prepared-pair targets are not distinct"));
     }
-    Ok((operation, phase, entries))
+    let artifacts = decode_artifacts(root, &value)?;
+    validate_artifact_membership(root, &entries, &artifacts)?;
+    Ok((operation, phase, entries, artifacts))
 }
 
 fn validate_transition(entry: &Entry) -> Result<(), IcebergError> {
+    if entry.old_location.ends_with(".gz.metadata.json") {
+        return Err(refusal(
+            "prepared append pair v1 requires plain JSON predecessor heads",
+        ));
+    }
+    if serde_json::from_slice::<TableMetadata>(&entry.old_bytes)? != entry.old_metadata {
+        return Err(refusal(
+            "prepared-pair typed predecessor differs from its exact bytes",
+        ));
+    }
     if entry.commit.identifier != entry.identifier
         || !check_table_requirements(&entry.commit.requirements, &entry.old_metadata)
     {
@@ -878,6 +930,7 @@ fn validate_entries(
     entries: &[Entry; 2],
     decided: bool,
 ) -> Result<(), IcebergError> {
+    validate_distinct_entries(entries)?;
     for entry in entries {
         validate_transition(entry)?;
         let (old, new) = root.paths(entry)?;
@@ -966,7 +1019,7 @@ fn recover(root: &NativeRoot, cache: &Cache) -> Result<(), IcebergError> {
         return Err(refusal("prepared-pair witness has a foreign root"));
     }
     let bytes = root.read(&root.file(JOURNAL), MAX_JOURNAL)?;
-    let (operation, phase, entries) = decode_journal(root, &bytes)?;
+    let (operation, phase, entries, artifacts) = decode_journal(root, &bytes)?;
     match phase.as_str() {
         // Completed/aborted decisions do not retain authority over later ordinary
         // appends or DROP/recreate. Their syntax/root binding must still validate.
@@ -975,18 +1028,21 @@ fn recover(root: &NativeRoot, cache: &Cache) -> Result<(), IcebergError> {
             validate_entries(root, &entries, false)?;
             root.replace_control(
                 JOURNAL,
-                &encode_journal(&root.key, operation, "aborted", &entries)?,
+                &encode_journal(&root.key, operation, "aborted", &entries, &artifacts)?,
                 &mut false,
             )
         }
         "commit" => {
+            // Validate the complete durable artifact receipt set before installing
+            // even the first missing head. Never expose an unreplayable decision.
+            validate_artifacts(root, &artifacts, true)?;
             validate_entries(root, &entries, true)?;
             for entry in &entries {
                 root.install_head(entry, &root.native(&entry.new_location)?)?;
             }
             root.replace_control(
                 JOURNAL,
-                &encode_journal(&root.key, operation, "complete", &entries)?,
+                &encode_journal(&root.key, operation, "complete", &entries, &artifacts)?,
                 &mut false,
             )?;
             publish_cache(cache, &entries)
@@ -1081,4 +1137,259 @@ fn add_metadata_artifact(
         }
     }
     Ok(())
+}
+
+fn validate_distinct_entries(entries: &[Entry; 2]) -> Result<(), IcebergError> {
+    if entries[0].identifier == entries[1].identifier
+        || entries[0].new_metadata.table_uuid == entries[1].new_metadata.table_uuid
+    {
+        return Err(refusal(
+            "prepared-pair targets must have distinct physical UUIDs",
+        ));
+    }
+    Ok(())
+}
+
+// Accidental-corruption detection, not an authenticity or hostile-writer proof.
+// Explicit framing, length and a fixed FNV-1a-64 algorithm make receipts portable.
+const FNV_OFFSET: u64 = 14_695_981_039_346_656_037;
+const FNV_PRIME: u64 = 1_099_511_628_211;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ArtifactReceipt {
+    relative: String,
+    length: u64,
+    checksum: u64,
+}
+
+fn checksum_update(mut checksum: u64, bytes: &[u8]) -> u64 {
+    for byte in bytes {
+        checksum = (checksum ^ u64::from(*byte)).wrapping_mul(FNV_PRIME);
+    }
+    checksum
+}
+
+impl ArtifactReceipt {
+    fn path(&self, root: &NativeRoot) -> Result<PathBuf, IcebergError> {
+        let path = NativePath::new(&self.relative);
+        if self.relative.is_empty()
+            || self.relative.len() > 4096
+            || path.components().count() > 64
+            || !path
+                .components()
+                .all(|part| matches!(part, std::path::Component::Normal(_)))
+        {
+            return Err(refusal(
+                "prepared-pair artifact path is not a bounded relative key",
+            ));
+        }
+        Ok(root.path.join(path))
+    }
+}
+
+fn inspect_artifact(
+    root: &NativeRoot,
+    path: &NativePath,
+    sync: bool,
+) -> Result<ArtifactReceipt, IcebergError> {
+    let mut file = root.regular(path)?;
+    let length = file.metadata().map_err(io)?.len();
+    if length > MAX_ARTIFACT_BYTES {
+        return Err(refusal("prepared-pair artifact exceeds its byte bound"));
+    }
+    let mut checksum = FNV_OFFSET;
+    let mut total = 0_u64;
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let count = file.read(&mut buffer).map_err(io)?;
+        if count == 0 {
+            break;
+        }
+        total = total
+            .checked_add(count as u64)
+            .ok_or_else(|| refusal("prepared-pair artifact byte overflow"))?;
+        if total > MAX_ARTIFACT_BYTES {
+            return Err(refusal("prepared-pair artifact exceeds its byte bound"));
+        }
+        checksum = checksum_update(checksum, &buffer[..count]);
+    }
+    if total != length || file.metadata().map_err(io)?.len() != length {
+        return Err(refusal("prepared-pair artifact changed during its receipt"));
+    }
+    let canonical = path.canonicalize().map_err(io)?;
+    let relative = canonical
+        .strip_prefix(&root.path)
+        .map_err(|_| refusal("artifact escapes its root"))?
+        .to_str()
+        .ok_or_else(|| refusal("artifact key is not UTF-8"))?
+        .to_owned();
+    let receipt = ArtifactReceipt {
+        relative,
+        length,
+        checksum,
+    };
+    receipt.path(root)?;
+    if sync {
+        file.sync_all().map_err(io)?;
+        root.sync_ancestors(path.parent().ok_or_else(|| refusal("artifact parent"))?)?;
+    }
+    Ok(receipt)
+}
+
+fn capture_artifacts(
+    root: &NativeRoot,
+    paths: &[PathBuf],
+) -> Result<Vec<ArtifactReceipt>, IcebergError> {
+    if paths.is_empty() || paths.len() > MAX_ARTIFACTS {
+        return Err(refusal("prepared-pair artifact count exceeds its bound"));
+    }
+    let mut total = 0_u64;
+    let mut receipts = Vec::new();
+    for path in paths {
+        let receipt = inspect_artifact(root, path, false)?;
+        total = total
+            .checked_add(receipt.length)
+            .ok_or_else(|| refusal("artifact byte overflow"))?;
+        if total > MAX_ARTIFACT_BYTES {
+            return Err(refusal("prepared-pair artifact total exceeds its bound"));
+        }
+        receipts.push(receipt);
+    }
+    receipts.sort_unstable_by(|left, right| left.relative.cmp(&right.relative));
+    if receipts
+        .windows(2)
+        .any(|pair| pair[0].relative == pair[1].relative)
+    {
+        return Err(refusal("duplicate canonical artifact keys"));
+    }
+    Ok(receipts)
+}
+
+fn validate_artifacts(
+    root: &NativeRoot,
+    receipts: &[ArtifactReceipt],
+    sync: bool,
+) -> Result<(), IcebergError> {
+    validate_artifact_bounds(root, receipts)?;
+    for receipt in receipts {
+        if inspect_artifact(root, &receipt.path(root)?, sync)? != *receipt {
+            return Err(refusal(
+                "prepared-pair artifact no longer matches its durable receipt",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn artifact_receipt_checksum(receipts: &[ArtifactReceipt]) -> u64 {
+    let mut checksum = FNV_OFFSET;
+    for receipt in receipts {
+        checksum = checksum_update(checksum, &(receipt.relative.len() as u64).to_le_bytes());
+        checksum = checksum_update(checksum, receipt.relative.as_bytes());
+        checksum = checksum_update(checksum, &receipt.length.to_le_bytes());
+        checksum = checksum_update(checksum, &receipt.checksum.to_le_bytes());
+    }
+    checksum
+}
+
+fn validate_artifact_bounds(
+    root: &NativeRoot,
+    receipts: &[ArtifactReceipt],
+) -> Result<(), IcebergError> {
+    if receipts.is_empty()
+        || receipts.len() > MAX_ARTIFACTS
+        || receipts
+            .windows(2)
+            .any(|pair| pair[0].relative >= pair[1].relative)
+    {
+        return Err(refusal(
+            "prepared-pair artifact receipts are not bounded sorted unique keys",
+        ));
+    }
+    let mut total = 0_u64;
+    for receipt in receipts {
+        receipt.path(root)?;
+        total = total
+            .checked_add(receipt.length)
+            .ok_or_else(|| refusal("artifact byte overflow"))?;
+        if total > MAX_ARTIFACT_BYTES {
+            return Err(refusal(
+                "prepared-pair artifact receipts exceed their total bound",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_artifact_membership(
+    root: &NativeRoot,
+    entries: &[Entry; 2],
+    receipts: &[ArtifactReceipt],
+) -> Result<(), IcebergError> {
+    validate_artifact_bounds(root, receipts)?;
+    for entry in entries {
+        let snapshot = entry
+            .new_metadata
+            .current_snapshot(None)?
+            .ok_or_else(|| refusal("prepared-pair successor has no snapshot"))?;
+        let path = root.native(snapshot.manifest_list())?;
+        // Lexically compare paths, without requiring obsolete terminal artifacts
+        // to survive later ordinary writes, DROP/recreate or garbage collection.
+        if !receipts
+            .iter()
+            .any(|receipt| receipt.path(root).is_ok_and(|candidate| candidate == path))
+        {
+            return Err(refusal(
+                "prepared-pair snapshot list has no durable artifact receipt",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn decode_artifacts(
+    root: &NativeRoot,
+    value: &Value,
+) -> Result<Vec<ArtifactReceipt>, IcebergError> {
+    let raw = value["artifacts"]
+        .as_array()
+        .ok_or_else(|| refusal("missing durable artifact receipts"))?;
+    if raw.len() > MAX_ARTIFACTS || value["artifact_count"].as_u64() != Some(raw.len() as u64) {
+        return Err(refusal("prepared-pair artifact receipt count changed"));
+    }
+    let mut receipts = Vec::new();
+    for item in raw {
+        if item.as_object().map(|map| map.len()) != Some(3) {
+            return Err(refusal("invalid artifact receipt"));
+        }
+        let text = item["checksum_fnv1a64"]
+            .as_str()
+            .ok_or_else(|| refusal("missing artifact checksum"))?;
+        if text.len() != 16
+            || !text
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(refusal("invalid artifact checksum"));
+        }
+        receipts.push(ArtifactReceipt {
+            relative: item["path"]
+                .as_str()
+                .ok_or_else(|| refusal("missing artifact key"))?
+                .to_owned(),
+            length: item["length"]
+                .as_u64()
+                .ok_or_else(|| refusal("missing artifact length"))?,
+            checksum: u64::from_str_radix(text, 16).map_err(io)?,
+        });
+    }
+    validate_artifact_bounds(root, &receipts)?;
+    if value["artifact_receipts_fnv1a64"].as_str()
+        != Some(format!("{:016x}", artifact_receipt_checksum(&receipts)).as_str())
+    {
+        return Err(refusal(
+            "prepared-pair artifact receipt set checksum changed",
+        ));
+    }
+    Ok(receipts)
 }

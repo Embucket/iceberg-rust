@@ -45,3 +45,12 @@ Retain source-before-implementation controls, real paused blocking-worker
 cancellation/exclusion proof and actual child-process recovery tests. No new
 runtime dependencies, row conversions or successful SQL support claims belong
 to this metadata primitive.
+
+Pending COMMIT recovery must validate all persisted bounded artifact receipts
+before any head/cache installation. Receipts bind canonical root-relative graph
+members, exact lengths and explicitly noncryptographic accidental-corruption
+checksums; their set has a count/framed checksum. They are not authenticity
+proofs against an external writer. Parse plain predecessor bytes and compare the
+typed image; v1 refuses gzipped predecessor heads rather than accepting an
+unverified correspondence. Preserve ordinary gzip and non-filesystem paths.
+Check distinct table UUIDs again at the publication boundary, not only decode.

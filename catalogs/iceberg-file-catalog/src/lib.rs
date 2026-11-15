@@ -492,6 +492,9 @@ impl Catalog for FileCatalog {
         self: Arc<Self>,
         identifier: &Identifier,
     ) -> Result<Tabular, IcebergError> {
+        if !matches!(self.object_store, ObjectStoreBuilder::Filesystem(_)) {
+            return self.load_tabular_under_scope(identifier).await;
+        }
         let _guard = self.mutation_scope().await?;
         self.load_tabular_under_scope(identifier).await
     }

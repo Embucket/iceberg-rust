@@ -736,6 +736,12 @@ async fn ordinary_nonfilesystem_load_keeps_its_existing_unlocked_path() -> TestR
         .build(&namespace, Arc::clone(&memory) as Arc<dyn Catalog>)
         .await?;
     let writer = memory.catalog_mutation_lock().write_owned().await;
+    let fresh = tokio::time::timeout(
+        Duration::from_secs(1),
+        FileCatalog::new("/pair-memory-control", memory.object_store.clone()),
+    )
+    .await??;
+    drop(fresh);
     let loaded = tokio::time::timeout(
         Duration::from_secs(1),
         Arc::clone(&memory).load_tabular(table.identifier()),
@@ -750,5 +756,25 @@ async fn ordinary_nonfilesystem_load_keeps_its_existing_unlocked_path() -> TestR
         memory.read_scope().await.is_err(),
         "new pair snapshot scopes are explicitly filesystem-only"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn publisher_rechecks_distinct_identities_before_control_effects() -> TestResult {
+    let fixture = Fixture::new().await?;
+    let mut prepared = fixture
+        .catalog
+        .prepare_append_pair(fixture.commits.clone())
+        .await?;
+    // A private-candidate invariant must still be checked at the publication
+    // boundary, independently of preparation and recovery decoding.
+    prepared.entries[1] = prepared.entries[0].clone();
+    let error = prepared
+        .publish()
+        .await
+        .expect_err("duplicate publication candidate");
+    assert_eq!(error.outcome, PairOutcome::NotCommitted);
+    assert_eq!(fixture.snapshots().await?, [None, None]);
+    assert!(!fixture.root.path().join("catalog").join(WITNESS).exists());
     Ok(())
 }

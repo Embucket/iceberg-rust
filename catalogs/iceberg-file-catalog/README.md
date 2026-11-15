@@ -38,7 +38,7 @@ cargo test -p iceberg-file-catalog --lib filesystem_namespace_drop
 
 ## Prepared append pairs
 
-Status: source candidate. Twelve actual-source isolated controls pass (including
+Status: source candidate. Eighteen actual-source isolated controls pass (including
 one child helper); ordinary Cargo/package and existing namespace checks remain
 pending. A warnings-denied production metadata compilation also passes. This API
 does not implement SQL INSERT ALL, multi-table user transactions, engine cache
@@ -57,8 +57,10 @@ head updates. The explicit prepared_pair module adds a bounded local primitive:
   and installs the two heads as steps of that same recoverable decision.
 - FileCatalog::read_scope() returns an opaque cooperating reader scope.
   scope.load(identifier) borrows its existing exclusion, with no recursive
-  fair-RwLock acquisition. Ordinary Catalog::load_tabular takes one individual
-  read scope and shares its implementation with borrowed loads.
+  fair-RwLock acquisition. Ordinary filesystem Catalog::load_tabular takes one individual
+  read scope and shares its implementation with borrowed loads. Non-filesystem
+  construction and loads retain their original unlocked dispatch; the new reader
+  scope refuses unsupported backends.
 - recover_append_pair() runs under catalog-wide write exclusion. The async
   FileCatalog::new constructor runs recovery before returning a usable handle.
   A synchronous FileCatalogList::catalog handle refuses required journals
@@ -89,11 +91,25 @@ Two required fixed controls live in the catalog directory:
   ready, commit, complete or aborted.
 
 The journal includes both predecessor byte images and typed native commits plus
-the exact successor bytes. COMMIT is the durable decision; immutable data,
+the exact successor bytes. Version 1 explicitly requires plain JSON predecessor
+heads; ordinary single-table gzip metadata reads/writes are unchanged. Decoding
+and publication compare the parsed predecessor bytes with the captured typed
+metadata, so a self-consistent typed transition cannot invent old properties. COMMIT is the durable decision; immutable data,
 manifest/list files and parent directories are synced first. Each head is
 installed atomically from a fully synced private temporary file, with create
 semantics. Recovery accepts only the exact old or exact decided new head and
 checks physical UUIDs. It never overwrites an unrelated successor.
+
+The complete prepared artifact graph is retained as sorted unique root-relative
+receipts with byte lengths and fixed FNV-1a-64 checksums, plus a framed checksum
+and count for the receipt set. Snapshot manifest-list references must be members.
+Preparation captures those receipts in an owned blocking reader; publication
+checks them again before the decision. Pending COMMIT recovery verifies every
+receipt, including data files, manifests and lists, before installing any head or
+publishing a cache image. Missing, truncated or changed files fence recovery.
+Lengths and FNV checksums detect accidental corruption; this is explicitly not
+cryptographic authenticity or a hostile-writer/collision-resistance contract.
+The embedding root owner must exclude writers outside the catalog protocol.
 
 PairPublishError.outcome distinguishes NotCommitted, DecisionUnknown and
 CommittedNeedsRecovery. A predecision failure changes no table. An uncertain
@@ -123,6 +139,10 @@ requirements, discarded preparation, borrowed-reader writer exclusion,
 predecision failure, first-head failure/fencing/redo, actual blocking-worker
 cancellation and held exclusion, foreign successor/required-control loss, and
 actual child-process termination at ready/commit/first-head with repeat recovery.
+Review controls additionally cover missing/same-length-corrupt data/manifest/list
+artifacts before and after the first installed head, predecessor typed/byte-image
+tampering, explicit gzip refusal, duplicate physical UUID admission/publication,
+and unchanged non-filesystem construction/load while its writer lock is held.
 The tiny data-file test payload only validates metadata/manifest publication;
 it makes no Parquet decoding or SQL row-acceptance claim.
 
