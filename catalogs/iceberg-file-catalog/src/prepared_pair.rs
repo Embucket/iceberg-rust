@@ -185,7 +185,7 @@ impl NativeRoot {
             return Err(refusal("prepared-pair journal exceeds its byte bound"));
         }
         let destination = self.file(name);
-        if destination.try_exists().map_err(io)? {
+        if control_exists(&destination)? {
             self.regular(&destination)?;
         }
         let temporary = self.temporary(&self.path, bytes)?;
@@ -234,6 +234,8 @@ pub struct PreparedAppendPair {
     artifacts: Vec<ArtifactReceipt>,
     #[cfg(test)]
     hook: Option<Arc<TestHook>>,
+    #[cfg(test)]
+    delivery_hook: Option<Arc<TestHook>>,
 }
 
 /// Exact committed metadata images, before an embedding engine refreshes its own providers.
@@ -479,12 +481,22 @@ impl FileCatalog {
             artifacts: Vec::new(),
             #[cfg(test)]
             hook: None,
+            #[cfg(test)]
+            delivery_hook: None,
         };
         let mut paths = artifacts.into_iter().collect::<Vec<_>>();
         paths.sort();
         // The checksum reader owns the same writer while native IO runs. Cancelling
         // preparation cannot release it while the actual blocking reader is active.
         tokio::task::spawn_blocking(move || {
+            if let Err(error) = validate_existing_controls(&prepared.root) {
+                prepared
+                    .catalog
+                    .pair_state
+                    .0
+                    .store(FENCED, Ordering::Release);
+                return Err(error);
+            }
             prepared.artifacts = capture_artifacts(&prepared.root, &paths)?;
             validate_artifact_membership(&prepared.root, &prepared.entries, &prepared.artifacts)?;
             prepared.journal("commit")?;
@@ -542,8 +554,9 @@ impl PreparedAppendPair {
     }
 
     /// One non-cancellable blocking owner performs the decision and both installs.
-    /// A cancelled waiter cannot release the catalog writer; an unacknowledged
-    /// successful decision fences admission until explicit recovery.
+    /// A cancelled waiter cannot release the catalog writer. A receiver already
+    /// closed at worker delivery fences admission; a successfully queued receipt
+    /// may subsequently be abandoned while the coherent commit remains healthy.
     pub async fn publish(self) -> Result<CommittedPairReceipt, PairPublishError> {
         let (sender, receiver) = tokio::sync::oneshot::channel();
         let state = Arc::clone(&self.catalog.pair_state);
@@ -553,8 +566,9 @@ impl PreparedAppendPair {
                 finished: false,
             };
             let result = owner.publish();
-            let healthy = result.is_ok()
-                || matches!(&result, Err(error) if error.outcome == PairOutcome::NotCommitted);
+            let healthy = (result.is_ok()
+                || matches!(&result, Err(error) if error.outcome == PairOutcome::NotCommitted))
+                && owner.prepared.catalog.pair_state.0.load(Ordering::Acquire) != FENCED;
             if sender.send(result).is_ok() && healthy {
                 owner
                     .prepared
@@ -571,6 +585,15 @@ impl PreparedAppendPair {
                     .store(FENCED, Ordering::Release);
             }
             owner.finished = true;
+            #[cfg(test)]
+            if checkpoint(&owner.prepared.delivery_hook, TestStage::AfterDelivery).is_err() {
+                owner
+                    .prepared
+                    .catalog
+                    .pair_state
+                    .0
+                    .store(FENCED, Ordering::Release);
+            }
         }));
         receiver.await.map_err(|error| {
             state.0.store(FENCED, Ordering::Release);
@@ -603,10 +626,25 @@ impl PublishOwner {
         let root = &prepared.root;
         let mut outcome = PairOutcome::NotCommitted;
         let result = (|| {
+            if let Err(error) = validate_existing_controls(root) {
+                prepared
+                    .catalog
+                    .pair_state
+                    .0
+                    .store(FENCED, Ordering::Release);
+                return Err(error);
+            }
             validate_entries(root, &prepared.entries, false)?;
             validate_artifacts(root, &prepared.artifacts, true)?;
             validate_artifact_membership(root, &prepared.entries, &prepared.artifacts)?;
-            prepare_witness(root)?;
+            if let Err(error) = prepare_witness(root) {
+                prepared
+                    .catalog
+                    .pair_state
+                    .0
+                    .store(FENCED, Ordering::Release);
+                return Err(error);
+            }
             let ready = prepared.journal("ready")?;
             let mut attempted = false;
             root.replace_control(JOURNAL, &ready, &mut attempted)?;
@@ -651,7 +689,10 @@ impl PublishOwner {
         result.map_err(|source| {
             // Before decision no target changed. Persist an explicit terminal abort;
             // if that acknowledgement fails, require recovery rather than absence fallback.
-            if outcome == PairOutcome::NotCommitted && root.file(WITNESS).exists() {
+            if outcome == PairOutcome::NotCommitted
+                && prepared.catalog.pair_state.0.load(Ordering::Acquire) != FENCED
+                && root.file(WITNESS).exists()
+            {
                 if let Ok(aborted) = prepared.journal("aborted") {
                     if root.replace_control(JOURNAL, &aborted, &mut false).is_err() {
                         outcome = PairOutcome::DecisionUnknown;
@@ -975,7 +1016,7 @@ fn witness_bytes(root: &NativeRoot) -> Result<Vec<u8>, IcebergError> {
 fn prepare_witness(root: &NativeRoot) -> Result<(), IcebergError> {
     let expected = witness_bytes(root)?;
     let path = root.file(WITNESS);
-    if path.try_exists().map_err(io)? {
+    if control_exists(&path)? {
         if root.read(&path, 4096)? != expected {
             return Err(refusal("prepared-pair required witness changed"));
         }
@@ -1007,8 +1048,8 @@ fn publish_cache(cache: &Cache, entries: &[Entry; 2]) -> Result<(), IcebergError
 }
 
 fn recover(root: &NativeRoot, cache: &Cache) -> Result<(), IcebergError> {
-    let witness = root.file(WITNESS).try_exists().map_err(io)?;
-    let journal = root.file(JOURNAL).try_exists().map_err(io)?;
+    let witness = control_exists(&root.file(WITNESS))?;
+    let journal = control_exists(&root.file(JOURNAL))?;
     if !witness && !journal {
         return Ok(());
     }
@@ -1057,6 +1098,7 @@ enum TestStage {
     BeforeDecision,
     AfterDecision,
     AfterFirstHead,
+    AfterDelivery,
 }
 #[cfg(test)]
 #[derive(Debug)]
@@ -1392,4 +1434,35 @@ fn decode_artifacts(
         ));
     }
     Ok(receipts)
+}
+
+// A statement's NotCommitted outcome is not a clean-health receipt. Observed
+// required-control corruption must fence admission and preserve those bytes.
+fn validate_existing_controls(root: &NativeRoot) -> Result<(), IcebergError> {
+    let witness = control_exists(&root.file(WITNESS))?;
+    let journal = control_exists(&root.file(JOURNAL))?;
+    if !witness && !journal {
+        return Ok(());
+    }
+    if !witness || !journal {
+        return Err(refusal("required prepared-pair controls are missing"));
+    }
+    if root.read(&root.file(WITNESS), 4096)? != witness_bytes(root)? {
+        return Err(refusal("required prepared-pair witness changed"));
+    }
+    let (_, phase, _, _) = decode_journal(root, &root.read(&root.file(JOURNAL), MAX_JOURNAL)?)?;
+    if !matches!(phase.as_str(), "complete" | "aborted") {
+        return Err(refusal(
+            "an existing prepared-pair decision requires recovery",
+        ));
+    }
+    Ok(())
+}
+
+fn control_exists(path: &NativePath) -> Result<bool, IcebergError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(io(error)),
+    }
 }

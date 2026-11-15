@@ -845,3 +845,78 @@ async fn bad_required_controls_before_publication_fence_without_rewriting_them()
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn abandoning_an_already_queued_receipt_can_leave_a_healthy_complete_commit() -> TestResult {
+    let fixture = Fixture::new().await?;
+    let mut prepared = fixture
+        .catalog
+        .prepare_append_pair(fixture.commits.clone())
+        .await?;
+    let (before, before_waiting) = tokio::sync::oneshot::channel();
+    let (begin, begin_waiting) = std::sync::mpsc::channel();
+    let (delivered, delivered_waiting) = tokio::sync::oneshot::channel();
+    let (finish, finish_waiting) = std::sync::mpsc::channel();
+    prepared.hook = Some(Arc::new(TestHook {
+        stage: TestStage::BeforeDecision,
+        fail: false,
+        crash: false,
+        pause: StdMutex::new(Some((before, begin_waiting))),
+    }));
+    prepared.delivery_hook = Some(Arc::new(TestHook {
+        stage: TestStage::AfterDelivery,
+        fail: false,
+        crash: false,
+        pause: StdMutex::new(Some((delivered, finish_waiting))),
+    }));
+    let mut publication = Box::pin(prepared.publish());
+    assert!(futures::poll!(publication.as_mut()).is_pending());
+    tokio::time::timeout(Duration::from_secs(5), before_waiting).await??;
+    // Retain but never poll the result future again. Let the real worker queue
+    // its receipt, then abandon it while the native owner is still paused.
+    begin.send(())?;
+    tokio::time::timeout(Duration::from_secs(5), delivered_waiting).await??;
+    drop(publication);
+    finish.send(())?;
+    let scope =
+        tokio::time::timeout(Duration::from_secs(5), fixture.catalog.read_scope()).await??;
+    for table in &fixture.tables {
+        let Tabular::Table(current) = scope.load(table.identifier()).await? else {
+            return Err("table".into());
+        };
+        assert_eq!(current.metadata().snapshots.len(), 1);
+        assert!(current.metadata().current_snapshot_id.is_some());
+    }
+    drop(scope);
+    let reopened = Arc::new(
+        FileCatalog::new(
+            "file:///catalog",
+            ObjectStoreBuilder::filesystem(fixture.root.path()),
+        )
+        .await?,
+    );
+    assert!(reopened.read_scope().await.is_ok());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn dangling_required_journal_is_present_corruption_not_fresh_absence() -> TestResult {
+    let fixture = Fixture::new().await?;
+    let prepared = fixture
+        .catalog
+        .prepare_append_pair(fixture.commits.clone())
+        .await?;
+    let journal = fixture.root.path().join("catalog").join(JOURNAL);
+    let target = fixture.root.path().join("missing-control-target");
+    std::os::unix::fs::symlink(&target, &journal)?;
+    let error = prepared
+        .publish()
+        .await
+        .expect_err("dangling required control");
+    assert_eq!(error.outcome, PairOutcome::NotCommitted);
+    assert!(fixture.catalog.read_scope().await.is_err());
+    assert_eq!(std::fs::read_link(journal)?, target);
+    assert!(!fixture.root.path().join("catalog").join(WITNESS).exists());
+    Ok(())
+}

@@ -38,7 +38,7 @@ cargo test -p iceberg-file-catalog --lib filesystem_namespace_drop
 
 ## Prepared append pairs
 
-Status: source candidate. Eighteen actual-source isolated controls pass (including
+Status: source candidate. 21 actual-source isolated controls pass (including
 one child helper); ordinary Cargo/package and existing namespace checks remain
 pending. A warnings-denied production metadata compilation also passes. This API
 does not implement SQL INSERT ALL, multi-table user transactions, engine cache
@@ -112,7 +112,11 @@ cryptographic authenticity or a hostile-writer/collision-resistance contract.
 The embedding root owner must exclude writers outside the catalog protocol.
 
 PairPublishError.outcome distinguishes NotCommitted, DecisionUnknown and
-CommittedNeedsRecovery. A predecision failure changes no table. An uncertain
+CommittedNeedsRecovery. A predecision failure changes no table. NotCommitted
+describes the operation, not catalog health. Observed foreign/corrupt/missing required
+controls independently fence ordinary admission, preserve their exact bytes and
+prevent an abort journal from replacing them. Fresh controls are checked during
+preparation and again at the publication boundary. An uncertain
 decision or postdecision failure fences ordinary head admission until exact redo
 recovery; it must never be reported as a rollback. Ready recovery keeps old
 heads. Commit recovery installs both new heads idempotently before exposure.
@@ -121,8 +125,14 @@ but their root, format and transition syntax must still validate. Losing a
 required witness/journal is an error, never legacy-absence fallback.
 
 The actual blocking publisher owns the FileCatalog, writer guard and cache cleanup
-through IO. Cancelling its waiting future does not release exclusion. An
-unacknowledged completed publication remains fenced until explicit recovery.
+through IO. Cancelling its waiting future does not release exclusion. If its
+receiver is already closed when the worker delivers the result, admission
+remains fenced until explicit recovery. Successfully enqueueing a receipt is the
+fork's delivery boundary, not an acknowledgement that the caller polled it. A
+receipt queued to a retained idle future can later be discarded while the fully
+installed coherent commit remains healthy. No acknowledgement wait blocks the
+native worker. Rustice must not infer cancellation implies a fork fence; its
+statement/cache visibility and result-delivery owner must resolve the outcome.
 Embedding engines must retain their own root owner, transaction/database guards
 and admission through that native worker's drain.
 
@@ -143,6 +153,9 @@ Review controls additionally cover missing/same-length-corrupt data/manifest/lis
 artifacts before and after the first installed head, predecessor typed/byte-image
 tampering, explicit gzip refusal, duplicate physical UUID admission/publication,
 and unchanged non-filesystem construction/load while its writer lock is held.
+Final controls separately prove foreign/corrupt/dangling controls are present
+authority errors, and NotCommitted outcomes retain a health fence, and deterministically queue then abandon a delivered receipt to
+prove a coherent healthy commit is allowed in that specific cancellation window.
 The tiny data-file test payload only validates metadata/manifest publication;
 it makes no Parquet decoding or SQL row-acceptance claim.
 

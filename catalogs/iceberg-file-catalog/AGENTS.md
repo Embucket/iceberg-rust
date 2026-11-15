@@ -54,3 +54,14 @@ proofs against an external writer. Parse plain predecessor bytes and compare the
 typed image; v1 refuses gzipped predecessor heads rather than accepting an
 unverified correspondence. Preserve ordinary gzip and non-filesystem paths.
 Check distinct table UUIDs again at the publication boundary, not only decode.
+
+Operation outcome and catalog health are distinct. A NotCommitted error must
+not reset an observed required-control corruption fence or overwrite the bad
+control with an abort record. Validate existing terminal controls under the
+same owner before publication, preserve bad bytes and require explicit repair.
+
+Delivery is successful oneshot enqueueing, not proof the caller polled a receipt.
+An already-closed receiver fences; a queued receipt abandoned later can leave a
+coherent healthy commit. Do not infer cancel implies a fork fence or hold an
+acknowledgement wait against an idle retained future. Keep a deterministic
+queued-result cancellation control and describe this boundary to embedders.
