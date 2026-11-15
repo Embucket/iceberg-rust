@@ -57,27 +57,32 @@ The proposed native state machine is bounded full-image publication:
    Validate plain local locations and an absent same-namespace destination before
    any control or destination write. A discarded preparation changes no names.
 2. Persist the required root witness and READY journal before creating an owned
-   destination directory. Stage byte-identical historical files plus one new
-   current head whose typed image differs only in location. The destination's
-   owner marker binds this operation, so cleanup never adopts unrelated files.
-   Sync files and directories. Cooperative namespace/list/existence/load readers
-   remain excluded by the writer throughout this interval.
-3. Fsync COMMIT as the decision. Source retirement then removes only exact captured
-   files; persist COMPLETE and publish the destination cache only after its exact
-   image/history is durable and the old namespace entry is gone. Delivery follows
-   the foundation's enqueueing-versus-acknowledgement contract.
-4. READY recovery verifies the unchanged source and removes only a proven owned
-   partial destination. COMMIT recovery validates the full decided destination
-   graph before retiring any remaining exact source files. Missing/corrupt/foreign
+   operation staging directory inside the source's metadata directory. Nested
+   staging cannot introduce another catalog object or replace the old direct-child
+   head. Stage byte-identical historical files plus one new current head whose
+   typed image differs only in location, and an operation-bound owner marker.
+   Sync files and directories; the public destination remains absent.
+3. Fsync COMMIT as the decision, then move the complete staged directory to the
+   absent destination under exclusive namespace ownership. Source retirement
+   removes only exact captured files. Persist COMPLETE and publish the destination
+   cache only after its exact image/history is durable and the old name is gone.
+   Cooperative namespace/list/existence/load readers remain excluded throughout.
+   Delivery follows the foundation's enqueueing-versus-acknowledgement contract.
+4. READY recovery verifies the unchanged source and removes only its operation's
+   known partial staging files. COMMIT recovery validates the full staged or
+   already-published destination graph before publishing/retiring any remaining
+   exact source files. Missing/corrupt/foreign
    evidence fences admission; it is never repaired by inventing history. Terminal
    journals do not undo later ordinary updates, DROP or old-name recreation.
 
-Required controls for the pair and view families must be checked together before
-either recovery changes a head. Two simultaneous pending decisions are invalid:
-the common writer cannot legitimately create them. Synchronous constructor
-admission must detect either required-control family; explicit asynchronous
-recovery may clear health only after both are valid. No extra native query-file
-probe is needed after the root's existing one-time UNPREPARED admission check.
+Reuse the existing single required witness/journal slot: append records retain
+strict V1 decoding; view rename uses a strict tagged V2 image. A new publication
+can replace only a valid terminal prior record. One slot/common writer cannot
+legitimately hold two pending decisions. Recovery dispatches the validated record
+kind under one owner before clearing health; synchronous constructor admission
+already detects the required slot. No extra native query-file probe is needed
+after the root's existing one-time UNPREPARED admission check. Older implementations
+must refuse the new journal version, not reinterpret it as absent legacy data.
 
 The exact codec, source/destination receipt budgets and fault stages remain to be
 implemented and tested. The above is a proposed protocol, not a successful
