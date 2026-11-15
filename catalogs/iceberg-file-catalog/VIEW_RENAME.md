@@ -2,9 +2,12 @@
 
 Status: bounded native source candidate; 22 focused owning controls pass.
 The first three owning tests compiled and produced actual RED (zero passes/three
-failures) on the Unsupported stub before implementation. Full owning package,
-configured Clippy and independent source review are still pending for the new
-operation. Embedding SQL/account/cache publication remains **Missing**; the
+failures) on the Unsupported stub before implementation. On runtime source
+`ffaf00c7`, the full owning package passes 77 tests/zero failures/one inherited
+ignored benchmark, including existing namespace and real S3/LocalStack controls.
+Configured 1.95 all-targets/all-features Clippy with warnings denied and whole
+workspace format checks pass. Independent source review remains pending for the
+new operation. Embedding SQL/account/cache publication remains **Missing**; the
 prepared-pair foundation's qualification does not qualify that integration.
 
 `Catalog::rename_view(self: Arc<Self>, source, destination)` returns the renamed
@@ -119,9 +122,14 @@ creator marker is not an ownership check.
 
 ```sh
 cargo test --offline --locked -p iceberg-file-catalog --lib view_rename -- --test-threads=1
+cargo test --offline --locked -p iceberg-file-catalog --lib -- --test-threads=1
+cargo +1.95.0 clippy --offline --locked -p iceberg-file-catalog --all-targets --all-features -- -D warnings
+cargo +1.95.0 fmt --all -- --check
 ```
 
 The focused native receipt is 22 passed/zero failed (including the inert helper
 under normal discovery); its recovery test invokes the actual test binary in five
-children exiting from the real blocking worker. Full package checks and SQL/stock
-fixture acceptance must be recorded independently on their final source trees.
+children exiting from the real blocking worker. Native tests used stable 1.99.1
+and two jobs in an isolated fork target; configured Clippy used its own 1.95
+target and two jobs. SQL/stock fixture acceptance and broader fork CI must be
+recorded independently on their final source trees.
