@@ -835,7 +835,7 @@ fn hex(bytes: &[u8]) -> String {
         .collect()
 }
 fn unhex(value: &str) -> Result<Vec<u8>, IcebergError> {
-    if value.len() > MAX_METADATA * 2 || value.len() % 2 != 0 {
+    if value.len() > MAX_METADATA * 2 || !value.len().is_multiple_of(2) {
         return Err(refusal(
             "prepared-pair predecessor encoding exceeds its bound",
         ));
