@@ -18,3 +18,30 @@
   caller's cancellation, and independently verify the lock is still held. Bound
   both worker pauses and async waits; a single pending poll is not proof.
 - Run focused namespace tests and an independent review before finalizing a PR.
+
+## Prepared append pairs
+
+The [explicit prepared-pair API](README.md) owns a bounded local two-head commit
+decision and redo recovery. The caller supplies native prepared commits; no
+ordinary update_table loop is an atomic transaction. Preparation retains one
+catalog-wide writer and publishes nothing. Only the blocking publisher may
+persist the ready/commit/complete controls, install heads or clean up its cache.
+It owns that guard until IO finishes, including a cancelled receiver.
+
+A durable or uncertain decision is never rolled back. Fence all ordinary head
+admission until exact recovery; validate root binding, required controls, both
+old/new byte identities, physical UUIDs and native transitions. Terminal records
+must not undo later normal writes. Configured store prefixes are part of the
+runtime fence and durable root identity; identical URI spellings for different
+native roots must not share authority.
+
+Normal load_tabular owns a single read scope; borrowed scope.load uses its
+unlocked internal implementation. Do not reacquire the fair RwLock through that
+trait method while holding a reader and a writer is queued. This scope is not a
+Rustice SQL/cache/physical lifetime snapshot. The embedding layer must supply a
+separate statement read/publication boundary before enabling INSERT ALL.
+
+Retain source-before-implementation controls, real paused blocking-worker
+cancellation/exclusion proof and actual child-process recovery tests. No new
+runtime dependencies, row conversions or successful SQL support claims belong
+to this metadata primitive.

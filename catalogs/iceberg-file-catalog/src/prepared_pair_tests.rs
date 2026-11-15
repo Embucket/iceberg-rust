@@ -191,3 +191,344 @@ async fn reader_scope_excludes_pair_preparation() -> TestResult {
     assert!(fixture.snapshots().await?.iter().all(Option::is_some));
     Ok(())
 }
+
+fn failure(stage: TestStage) -> Arc<TestHook> {
+    Arc::new(TestHook {
+        stage,
+        fail: true,
+        crash: false,
+        pause: StdMutex::new(None),
+    })
+}
+
+#[tokio::test]
+async fn before_decision_failure_keeps_both_old_heads_readable() -> TestResult {
+    let fixture = Fixture::new().await?;
+    let mut prepared = fixture
+        .catalog
+        .prepare_append_pair(fixture.commits.clone())
+        .await?;
+    prepared.hook = Some(failure(TestStage::BeforeDecision));
+    let error = prepared
+        .publish()
+        .await
+        .expect_err("injected predecision failure");
+    assert_eq!(error.outcome, PairOutcome::NotCommitted);
+    assert_eq!(fixture.snapshots().await?, [None, None]);
+    fixture.catalog.recover_append_pair().await?;
+    assert_eq!(fixture.snapshots().await?, [None, None]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn failure_after_first_head_fences_then_redoes_both_exact_heads() -> TestResult {
+    let fixture = Fixture::new().await?;
+    let mut prepared = fixture
+        .catalog
+        .prepare_append_pair(fixture.commits.clone())
+        .await?;
+    prepared.hook = Some(failure(TestStage::AfterFirstHead));
+    let error = prepared
+        .publish()
+        .await
+        .expect_err("injected postdecision failure");
+    assert_eq!(error.outcome, PairOutcome::CommittedNeedsRecovery);
+    assert!(fixture
+        .root
+        .path()
+        .join("catalog/APP/A/metadata/v1.metadata.json")
+        .exists());
+    assert!(!fixture
+        .root
+        .path()
+        .join("catalog/APP/B/metadata/v1.metadata.json")
+        .exists());
+    assert!(fixture.catalog.read_scope().await.is_err());
+    assert!(Arc::clone(&fixture.catalog)
+        .load_tabular(fixture.tables[0].identifier())
+        .await
+        .is_err());
+    assert!(fixture
+        .catalog
+        .metadata_location(fixture.tables[1].identifier())
+        .await
+        .is_err());
+    let reopened = Arc::new(
+        FileCatalog::new(
+            "file:///catalog",
+            ObjectStoreBuilder::filesystem(fixture.root.path()),
+        )
+        .await?,
+    );
+    reopened.recover_append_pair().await?;
+    reopened.recover_append_pair().await?;
+    let scope = reopened.read_scope().await?;
+    for table in &fixture.tables {
+        let Tabular::Table(current) = scope.load(table.identifier()).await? else {
+            return Err("table".into());
+        };
+        assert!(current.metadata().current_snapshot_id.is_some());
+        assert_eq!(current.metadata().table_uuid, table.metadata().table_uuid);
+        assert_eq!(current.metadata().snapshots.len(), 1);
+    }
+    drop(scope);
+    // A terminal journal must not roll back a later ordinary commit.
+    let Tabular::Table(mut current) = Arc::clone(&reopened)
+        .load_tabular(fixture.tables[0].identifier())
+        .await?
+    else {
+        return Err("table".into());
+    };
+    current
+        .new_transaction(None)
+        .update_properties(vec![("ordinary-after-pair".to_owned(), "1".to_owned())])
+        .commit()
+        .await?;
+    reopened.recover_append_pair().await?;
+    let Tabular::Table(current) = Arc::clone(&reopened)
+        .load_tabular(fixture.tables[0].identifier())
+        .await?
+    else {
+        return Err("table".into());
+    };
+    assert_eq!(
+        current
+            .metadata()
+            .properties
+            .get("ordinary-after-pair")
+            .map(String::as_str),
+        Some("1")
+    );
+    assert_eq!(current.metadata().snapshots.len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancelled_waiter_retains_actual_worker_exclusion_and_requires_recovery() -> TestResult {
+    let fixture = Fixture::new().await?;
+    let mut prepared = fixture
+        .catalog
+        .prepare_append_pair(fixture.commits.clone())
+        .await?;
+    let (entered, waiting) = tokio::sync::oneshot::channel();
+    let (resume, release) = std::sync::mpsc::channel();
+    prepared.hook = Some(Arc::new(TestHook {
+        stage: TestStage::AfterFirstHead,
+        fail: false,
+        crash: false,
+        pause: StdMutex::new(Some((entered, release))),
+    }));
+    let caller = tokio::spawn(prepared.publish());
+    tokio::time::timeout(Duration::from_secs(5), waiting).await??;
+    caller.abort();
+    assert!(caller.await.expect_err("caller aborted").is_cancelled());
+    let catalog = Arc::clone(&fixture.catalog);
+    let mut reader = tokio::spawn(async move { catalog.read_scope().await });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut reader)
+            .await
+            .is_err(),
+        "cancelled waiter released the actual worker's writer guard"
+    );
+    assert!(!fixture
+        .root
+        .path()
+        .join("catalog/APP/B/metadata/v1.metadata.json")
+        .exists());
+    resume.send(())?;
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), reader)
+            .await??
+            .is_err(),
+        "unacknowledged publication must remain fenced"
+    );
+    fixture.catalog.recover_append_pair().await?;
+    assert!(fixture.snapshots().await?.iter().all(Option::is_some));
+    Ok(())
+}
+
+#[tokio::test]
+async fn required_control_loss_and_foreign_successor_are_not_legacy_fallback() -> TestResult {
+    let fixture = Fixture::new().await?;
+    let mut prepared = fixture
+        .catalog
+        .prepare_append_pair(fixture.commits.clone())
+        .await?;
+    prepared.hook = Some(failure(TestStage::AfterFirstHead));
+    assert!(prepared.publish().await.is_err());
+    let first = fixture
+        .root
+        .path()
+        .join("catalog/APP/A/metadata/v1.metadata.json");
+    let exact = std::fs::read(&first)?;
+    std::fs::write(&first, b"foreign-successor")?;
+    assert!(fixture.catalog.recover_append_pair().await.is_err());
+    assert!(fixture.catalog.read_scope().await.is_err());
+    std::fs::write(&first, exact)?;
+    fixture.catalog.recover_append_pair().await?;
+    let journal = fixture.root.path().join("catalog").join(JOURNAL);
+    std::fs::remove_file(journal)?;
+    assert!(FileCatalog::new(
+        "file:///catalog",
+        ObjectStoreBuilder::filesystem(fixture.root.path())
+    )
+    .await
+    .is_err());
+    assert!(fixture.catalog.read_scope().await.is_err());
+    Ok(())
+}
+
+#[tokio::test]
+async fn duplicate_targets_and_nonfilesystem_pairs_are_explicit_refusals() -> TestResult {
+    let fixture = Fixture::new().await?;
+    assert!(fixture
+        .catalog
+        .prepare_append_pair([fixture.commits[0].clone(), fixture.commits[0].clone()])
+        .await
+        .is_err());
+    assert_eq!(fixture.snapshots().await?, [None, None]);
+    let memory =
+        Arc::new(FileCatalog::new("memory://catalog", ObjectStoreBuilder::memory()).await?);
+    assert!(memory
+        .prepare_append_pair(fixture.commits.clone())
+        .await
+        .is_err());
+    assert!(!fixture.root.path().join("catalog").join(WITNESS).exists());
+    Ok(())
+}
+
+// Invoked only by the bounded child-process control below. Default test discovery
+// returns without changing process state.
+#[tokio::test]
+async fn prepared_pair_crash_helper() -> TestResult {
+    let Some(root) = std::env::var_os("ICEBERG_PAIR_TEST_ROOT") else {
+        return Ok(());
+    };
+    let root = PathBuf::from(root);
+    let commits: [CommitTable; 2] =
+        serde_json::from_slice(&std::fs::read(root.join("pair-input.json"))?)?;
+    let catalog =
+        Arc::new(FileCatalog::new("file:///catalog", ObjectStoreBuilder::filesystem(&root)).await?);
+    let mut prepared = catalog.prepare_append_pair(commits).await?;
+    let stage = match std::env::var("ICEBERG_PAIR_TEST_STAGE")?.as_str() {
+        "ready" => TestStage::BeforeDecision,
+        "decision" => TestStage::AfterDecision,
+        "first" => TestStage::AfterFirstHead,
+        _ => return Err("unknown child crash stage".into()),
+    };
+    prepared.hook = Some(Arc::new(TestHook {
+        stage,
+        fail: false,
+        crash: true,
+        pause: StdMutex::new(None),
+    }));
+    prepared.publish().await?;
+    Err("child did not terminate at its actual worker checkpoint".into())
+}
+
+#[tokio::test]
+async fn process_exit_recovers_exact_old_or_complete_new_pair() -> TestResult {
+    for stage in ["ready", "decision", "first"] {
+        let fixture = Fixture::new().await?;
+        std::fs::write(
+            fixture.root.path().join("pair-input.json"),
+            serde_json::to_vec(&fixture.commits)?,
+        )?;
+        let mut child = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "prepared_pair::tests::prepared_pair_crash_helper",
+                "--nocapture",
+            ])
+            .env("ICEBERG_PAIR_TEST_ROOT", fixture.root.path())
+            .env("ICEBERG_PAIR_TEST_STAGE", stage)
+            .spawn()?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                child.kill()?;
+                child.wait()?;
+                return Err(format!("prepared-pair child timed out at {stage}").into());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(status.code(), Some(86), "{stage}");
+        let reopened = Arc::new(
+            FileCatalog::new(
+                "file:///catalog",
+                ObjectStoreBuilder::filesystem(fixture.root.path()),
+            )
+            .await?,
+        );
+        for _ in 0..2 {
+            reopened.recover_append_pair().await?;
+            let scope = reopened.read_scope().await?;
+            for table in &fixture.tables {
+                let Tabular::Table(current) = scope.load(table.identifier()).await? else {
+                    return Err("table".into());
+                };
+                assert_eq!(
+                    current.metadata().snapshots.len(),
+                    usize::from(stage != "ready"),
+                    "{stage}"
+                );
+                assert_eq!(
+                    current.metadata().current_snapshot_id.is_some(),
+                    stage != "ready",
+                    "{stage}"
+                );
+                assert_eq!(current.metadata().table_uuid, table.metadata().table_uuid);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn configured_native_root_owns_the_fence_and_exclusion_identity() -> TestResult {
+    let first = Fixture::new().await?;
+    let other = Fixture::new().await?;
+    let alias = Arc::new(
+        FileCatalog::new(
+            &format!("file://{}/catalog", first.root.path().display()),
+            ObjectStoreBuilder::filesystem("/"),
+        )
+        .await?,
+    );
+    let prepared = first
+        .catalog
+        .prepare_append_pair(first.commits.clone())
+        .await?;
+    // Same native root through a different store prefix/URI spelling must share
+    // actual mutation exclusion; another native root using file:///catalog must not.
+    let namespace = Namespace::try_new(&["WAITING".to_owned()])?;
+    let alias_job = Arc::clone(&alias);
+    let mut waiting =
+        tokio::spawn(async move { alias_job.create_namespace(&namespace, None).await });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut waiting)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), other.snapshots()).await??,
+        [None, None]
+    );
+    drop(prepared);
+    tokio::time::timeout(Duration::from_secs(5), waiting).await???;
+
+    let mut prepared = first
+        .catalog
+        .prepare_append_pair(first.commits.clone())
+        .await?;
+    prepared.hook = Some(failure(TestStage::AfterFirstHead));
+    assert!(prepared.publish().await.is_err());
+    assert!(alias.read_scope().await.is_err());
+    assert_eq!(other.snapshots().await?, [None, None]);
+    first.catalog.recover_append_pair().await?;
+    assert!(alias.read_scope().await.is_ok());
+    Ok(())
+}
