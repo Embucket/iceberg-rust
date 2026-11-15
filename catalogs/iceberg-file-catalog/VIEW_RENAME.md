@@ -1,6 +1,6 @@
 # Local view rename
 
-Status: bounded native source candidate; 27 focused owning controls pass.
+Status: bounded native source candidate; 29 focused owning controls pass.
 The first three owning tests compiled and produced actual RED (zero passes/three
 failures) on the Unsupported stub before implementation. On runtime source
 `4d5a618d`, the full owning package passes 82 tests/zero failures/one inherited
@@ -97,6 +97,18 @@ Namespace enumeration/existence must participate in native rename read exclusion
 internal calls under existing guards must use borrowed implementations rather
 than recursively reacquiring the fair read lock.
 
+Native name loads have no cached-metadata return path. Both ordinary
+`load_tabular` and borrowed `scope.load` resolve the physical direct-child head,
+read its actual metadata, then populate the cache. Two additional owning controls
+keep an independent peer's predecessor cache deliberately warm: old-name direct
+and scoped loads return CatalogNotFound after rename, and a recreated old name
+with the same v1 head basename returns its different new UUID/image. The renamed
+destination keeps the original UUID/image. These controls passed immediately on
+unchanged production; no native read-cache gap or failing RED was observed and no
+loader/ordinary-table/remote fast path was changed. Engine provider caches and
+late background refresh publication still require their own embedding barrier;
+native liveness does not invalidate an already-retained engine provider.
+
 Passing owning controls cover a table collision/wrong source kind, same-name and
 cross-namespace refusals, memory refusal, source/target symlink bounds, real paused
 worker cancellation and independent blocked reader/namespace writer, predecision
@@ -168,9 +180,12 @@ cargo +1.95.0 clippy --offline --locked -p iceberg-file-catalog --all-targets --
 cargo +1.95.0 fmt --all -- --check
 ```
 
-The focused native receipt is 27 passed/zero failed (including the inert helper
+The focused native receipt is 29 passed/zero failed (including the inert helper
 under normal discovery); its recovery test invokes the actual test binary in five
 children exiting from the real blocking worker. Native tests used stable 1.99.1
 and two jobs in an isolated fork target; configured Clippy used its own 1.95
 target and two jobs. SQL/stock fixture acceptance and broader fork CI must be
 recorded independently on their final source trees.
+The two later peer-load controls are a tests/docs-only addition: all 29 focused
+controls and configured Clippy pass, while the full 82-test package receipt stays
+bound to unchanged production source `4d5a618d`.

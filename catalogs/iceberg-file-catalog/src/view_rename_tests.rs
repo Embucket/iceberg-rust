@@ -246,3 +246,134 @@ async fn peer_cached_listing_does_not_revive_the_old_name() -> TestResult {
     assert!(!peer.tabular_exists(fixture.view.identifier()).await?);
     Ok(())
 }
+
+#[tokio::test]
+async fn preloaded_native_peer_loads_refuse_old_name_after_rename() -> TestResult {
+    let fixture = Fixture::new().await?;
+    let peer = fixture.peer().await?;
+    assert!(!Arc::ptr_eq(&peer.cache, &fixture.catalog.cache));
+    let Tabular::View(old) = Arc::clone(&peer)
+        .load_tabular(fixture.view.identifier())
+        .await?
+    else {
+        return Err("preloaded peer view".into());
+    };
+    let renamed = Arc::clone(&fixture.catalog)
+        .rename_view_from_metadata(
+            fixture.view.identifier(),
+            &fixture.destination,
+            old.metadata(),
+        )
+        .await?;
+    // Publisher cache cleanup must not accidentally make this peer proof pass.
+    {
+        let cache = peer.cache.read().map_err(|_| "peer cache poisoned")?;
+        let (_, TabularMetadata::View(cached)) = cache
+            .get(fixture.view.identifier())
+            .ok_or("peer predecessor cache")?
+        else {
+            return Err("predecessor cache is not a view".into());
+        };
+        assert_eq!(cached, old.metadata());
+    }
+    for _ in 0..2 {
+        assert!(matches!(
+            Arc::clone(&peer)
+                .load_tabular(fixture.view.identifier())
+                .await,
+            Err(IcebergError::CatalogNotFound)
+        ));
+        let scope = peer.read_scope().await?;
+        assert!(matches!(
+            scope.load(fixture.view.identifier()).await,
+            Err(IcebergError::CatalogNotFound)
+        ));
+        let Tabular::View(current) = scope.load(&fixture.destination).await? else {
+            return Err("peer destination view".into());
+        };
+        assert_eq!(current.metadata(), renamed.metadata());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn preloaded_native_peer_loads_new_uuid_at_same_old_name_and_head() -> TestResult {
+    let fixture = Fixture::new().await?;
+    let peer = fixture.peer().await?;
+    let Tabular::View(old) = Arc::clone(&peer)
+        .load_tabular(fixture.view.identifier())
+        .await?
+    else {
+        return Err("preloaded peer view".into());
+    };
+    let cached_head = peer
+        .cache
+        .read()
+        .map_err(|_| "peer cache poisoned")?
+        .get(fixture.view.identifier())
+        .ok_or("peer predecessor cache")?
+        .0
+        .clone();
+    let renamed = Arc::clone(&fixture.catalog)
+        .rename_view_from_metadata(
+            fixture.view.identifier(),
+            &fixture.destination,
+            old.metadata(),
+        )
+        .await?;
+    let mut replacement = View::builder()
+        .with_name("RV")
+        .with_schema(old.current_schema(None)?.clone())
+        .with_view_version(
+            Version::builder()
+                .with_representation(ViewRepresentation::sql("SELECT 99 AS X", Some("snowflake")))
+                .build()?,
+        )
+        .build(
+            fixture.destination.namespace(),
+            Arc::clone(&fixture.catalog) as Arc<dyn Catalog>,
+        )
+        .await?;
+    replacement
+        .new_transaction(None)
+        .update_properties(vec![("new-incarnation".into(), "kept".into())])
+        .commit()
+        .await?;
+    assert_ne!(replacement.metadata().view_uuid, old.metadata().view_uuid);
+    assert_eq!(
+        fixture
+            .catalog
+            .metadata_location(fixture.view.identifier())
+            .await?,
+        cached_head
+    );
+    {
+        let cache = peer.cache.read().map_err(|_| "peer cache poisoned")?;
+        let (head, TabularMetadata::View(cached)) = cache
+            .get(fixture.view.identifier())
+            .ok_or("peer predecessor cache")?
+        else {
+            return Err("predecessor cache is not a view".into());
+        };
+        assert_eq!(head, &cached_head);
+        assert_eq!(cached.view_uuid, old.metadata().view_uuid);
+    }
+    // Same name and head basename, different UUID: always read the physical image.
+    let Tabular::View(current) = Arc::clone(&peer)
+        .load_tabular(fixture.view.identifier())
+        .await?
+    else {
+        return Err("peer replacement view".into());
+    };
+    assert_eq!(current.metadata(), replacement.metadata());
+    let scope = peer.read_scope().await?;
+    let Tabular::View(current) = scope.load(fixture.view.identifier()).await? else {
+        return Err("borrowed replacement view".into());
+    };
+    assert_eq!(current.metadata(), replacement.metadata());
+    let Tabular::View(current) = scope.load(&fixture.destination).await? else {
+        return Err("peer renamed view".into());
+    };
+    assert_eq!(current.metadata(), renamed.metadata());
+    Ok(())
+}
