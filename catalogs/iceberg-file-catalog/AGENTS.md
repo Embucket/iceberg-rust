@@ -1,5 +1,10 @@
 # File Catalog Guidance
 
+- [View rename preparation](VIEW_RENAME.md) is test-first and unimplemented.
+  Preserve full typed/raw history, UUID and opaque creator markers; never adapt
+  the table relocation's UUID-reset/current-snapshot semantics. Its future owned
+  publisher must retain the existing read/write, cancellation and recovery gates.
+
 - This crate owns file-catalog metadata lookup and filesystem/object-store
   mutations, not SQL session selection or Rustice display markers.
 - Preserve the existing URI/object-path conversion helpers. Tests must derive

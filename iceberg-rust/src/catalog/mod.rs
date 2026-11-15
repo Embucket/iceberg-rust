@@ -212,6 +212,19 @@ pub trait Catalog: Send + Sync + Debug {
     ) -> Result<(), Error> {
         Err(Error::NotSupported("rename table".to_string()))
     }
+    /// Rename a view while preserving its UUID, properties and complete version/schema history.
+    ///
+    /// Implementations may support a bounded local subset. Native publication must retain
+    /// its actual owner through cancellation and recover an uncertain decision before
+    /// exposing either name. The returned view identifies the destination and its new
+    /// location. Unsupported catalogs retain this explicit refusal.
+    async fn rename_view(
+        self: Arc<Self>,
+        _source: &Identifier,
+        _destination: &Identifier,
+    ) -> Result<View, Error> {
+        Err(Error::NotSupported("rename view".to_string()))
+    }
     /// Drops a view from the catalog and deletes its metadata.
     ///
     /// # Arguments

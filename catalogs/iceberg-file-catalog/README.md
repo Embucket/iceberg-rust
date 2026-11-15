@@ -1,5 +1,9 @@
 # File Catalog
 
+The separate [local view rename preparation](VIEW_RENAME.md) adds a default
+Unsupported Catalog API and authored owning controls. It is unimplemented and
+unqualified; the prepared-pair checks below do not qualify view rename.
+
 Filesystem and object-store-backed Iceberg catalog.
 
 ## Local Namespace Mutations
