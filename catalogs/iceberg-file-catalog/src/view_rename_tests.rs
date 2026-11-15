@@ -9,11 +9,11 @@ use std::time::Duration;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-struct Fixture {
-    root: tempfile::TempDir,
-    catalog: Arc<FileCatalog>,
-    view: View,
-    destination: Identifier,
+pub(crate) struct Fixture {
+    pub(crate) root: tempfile::TempDir,
+    pub(crate) catalog: Arc<FileCatalog>,
+    pub(crate) view: View,
+    pub(crate) destination: Identifier,
 }
 
 impl Fixture {
@@ -27,7 +27,7 @@ impl Fixture {
         ))
     }
 
-    async fn new() -> TestResult<Self> {
+    pub(crate) async fn new() -> TestResult<Self> {
         let root = tempfile::tempdir()?;
         let catalog = Arc::new(
             FileCatalog::new(

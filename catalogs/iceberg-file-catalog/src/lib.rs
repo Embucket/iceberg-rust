@@ -129,6 +129,7 @@ fn table_identity_path(location: &str) -> ObjectPath {
 
 pub mod error;
 pub mod prepared_pair;
+pub use prepared_pair::view_rename::{PreparedViewRename, ViewRenameError};
 
 #[cfg(test)]
 mod view_rename_tests;
@@ -476,6 +477,17 @@ impl Catalog for FileCatalog {
             .unwrap_or_else(|| source.clone());
         renamed_tables.insert(destination.clone(), physical_source);
         Ok(())
+    }
+    async fn rename_view(
+        self: Arc<Self>,
+        source: &Identifier,
+        destination: &Identifier,
+    ) -> Result<View, IcebergError> {
+        self.prepare_view_rename(source, destination)
+            .await?
+            .publish()
+            .await
+            .map_err(|error| IcebergError::External(Box::new(error)))
     }
     async fn drop_view(&self, identifier: &Identifier) -> Result<(), IcebergError> {
         self.drop_tabular(identifier).await

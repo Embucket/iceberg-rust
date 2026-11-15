@@ -10,6 +10,9 @@ use std::path::{Path as NativePath, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering};
 use uuid::Uuid;
 
+#[path = "view_rename.rs"]
+pub mod view_rename;
+
 const JOURNAL: &str = ".iceberg-append-pair-v1";
 const WITNESS: &str = ".iceberg-append-pair-required-v1";
 const MAX_METADATA: usize = 1024 * 1024;
