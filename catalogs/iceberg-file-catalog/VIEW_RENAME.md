@@ -1,13 +1,14 @@
 # Local view rename
 
-Status: bounded native source candidate; 23 focused owning controls pass.
+Status: bounded native source candidate; 27 focused owning controls pass.
 The first three owning tests compiled and produced actual RED (zero passes/three
 failures) on the Unsupported stub before implementation. On runtime source
-`ffcad125`, the full owning package passes 78 tests/zero failures/one inherited
+`4d5a618d`, the full owning package passes 82 tests/zero failures/one inherited
 ignored benchmark, including existing namespace and real S3/LocalStack controls.
 Configured 1.95 all-targets/all-features Clippy with warnings denied and whole
-workspace format checks pass. Independent source review remains pending for the
-new operation. Embedding SQL/account/cache publication remains **Missing**; the
+workspace format checks pass. The publisher/accessor source review passed; review
+of the later checked-predecessor seam remains pending. Embedding SQL/account/cache
+publication remains **Missing**; the
 prepared-pair foundation's qualification does not qualify that integration.
 
 `Catalog::rename_view(self: Arc<Self>, source, destination)` returns the renamed
@@ -64,6 +65,9 @@ caller images and a distinct native writer to replace the UUID, alter body or an
 unrelated property with the UUID/creator marker unchanged, and advance the head
 without changing the typed image. Dynamic Catalog dispatch and denial followed
 by exact retry must prove the seam does not depend on a concrete FileCatalog.
+The four controls produced actual native RED on the default-Unsupported stub
+before the FileCatalog override; all 27 focused owning controls then pass. The
+override retains the same publisher, typed outcome and cancellation boundaries.
 
 The native operation must preserve ViewMetadata UUID, all schemas, versions,
 version_log, current version, representations and properties exactly. Only its
@@ -164,7 +168,7 @@ cargo +1.95.0 clippy --offline --locked -p iceberg-file-catalog --all-targets --
 cargo +1.95.0 fmt --all -- --check
 ```
 
-The focused native receipt is 23 passed/zero failed (including the inert helper
+The focused native receipt is 27 passed/zero failed (including the inert helper
 under normal discovery); its recovery test invokes the actual test binary in five
 children exiting from the real blocking worker. Native tests used stable 1.99.1
 and two jobs in an isolated fork target; configured Clippy used its own 1.95

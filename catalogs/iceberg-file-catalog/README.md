@@ -1,12 +1,15 @@
 # File Catalog
 
 The separate [local view rename](VIEW_RENAME.md) adds a default-Unsupported
-Catalog API and an explicit local FileCatalog publisher. Its 23 focused owning
+Catalog API and an explicit local FileCatalog publisher. Its 27 focused owning
 controls pass, including actual process-exit recovery and worker cancellation.
-The complete file-catalog package passes 78 tests/zero failures/one inherited
+The complete file-catalog package passes 82 tests/zero failures/one inherited
 ignored benchmark; configured 1.95 Clippy and whole-workspace format checks pass.
 Independent source review and embedding SQL/account/cache acceptance remain
 separate; the prepared-pair foundation checks below do not qualify that adapter.
+The checked `Catalog::rename_view_from_metadata` seam compares the complete
+authorized typed predecessor under the native writer before publishing effects;
+it supports object-safe engine integration without a catalog downcast.
 
 Filesystem and object-store-backed Iceberg catalog.
 
