@@ -49,3 +49,36 @@ postdecision failure injection, actual process exits/repeated recovery, missing
 required controls, raw history byte preservation and catalog reopen. Embedding
 SQL/account/cache publication remains a separate owner boundary; no SQL support,
 XFAIL retirement, Rustice pin or P0 closure follows from this preparation.
+
+The proposed native state machine is bounded full-image publication:
+
+1. Under the existing catalog writer, capture the exact source head and all
+   regular metadata/history files with root-relative length/checksum receipts.
+   Validate plain local locations and an absent same-namespace destination before
+   any control or destination write. A discarded preparation changes no names.
+2. Persist the required root witness and READY journal before creating an owned
+   destination directory. Stage byte-identical historical files plus one new
+   current head whose typed image differs only in location. The destination's
+   owner marker binds this operation, so cleanup never adopts unrelated files.
+   Sync files and directories. Cooperative namespace/list/existence/load readers
+   remain excluded by the writer throughout this interval.
+3. Fsync COMMIT as the decision. Source retirement then removes only exact captured
+   files; persist COMPLETE and publish the destination cache only after its exact
+   image/history is durable and the old namespace entry is gone. Delivery follows
+   the foundation's enqueueing-versus-acknowledgement contract.
+4. READY recovery verifies the unchanged source and removes only a proven owned
+   partial destination. COMMIT recovery validates the full decided destination
+   graph before retiring any remaining exact source files. Missing/corrupt/foreign
+   evidence fences admission; it is never repaired by inventing history. Terminal
+   journals do not undo later ordinary updates, DROP or old-name recreation.
+
+Required controls for the pair and view families must be checked together before
+either recovery changes a head. Two simultaneous pending decisions are invalid:
+the common writer cannot legitimately create them. Synchronous constructor
+admission must detect either required-control family; explicit asynchronous
+recovery may clear health only after both are valid. No extra native query-file
+probe is needed after the root's existing one-time UNPREPARED admission check.
+
+The exact codec, source/destination receipt budgets and fault stages remain to be
+implemented and tested. The above is a proposed protocol, not a successful
+publication or recovery receipt.
