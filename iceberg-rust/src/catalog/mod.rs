@@ -30,6 +30,7 @@ use identifier::Identifier;
 
 use crate::error::Error;
 use crate::materialized_view::MaterializedView;
+use crate::spec::view_metadata::ViewMetadata;
 use crate::table::Table;
 use crate::view::View;
 
@@ -224,6 +225,21 @@ pub trait Catalog: Send + Sync + Debug {
         _destination: &Identifier,
     ) -> Result<View, Error> {
         Err(Error::NotSupported("rename view".to_string()))
+    }
+    /// Rename only the exact authorized semantic predecessor under publication exclusion.
+    ///
+    /// Compare the complete typed metadata, including UUID, location, schemas, versions,
+    /// representations and opaque properties, before publishing any rename effect. A
+    /// mismatch must fail without adopting a replacement. An intervening head advance
+    /// with an identical typed image is admissible: this is not a physical-write counter.
+    /// Implementations must not fall back to unchecked `rename_view`.
+    async fn rename_view_from_metadata(
+        self: Arc<Self>,
+        _source: &Identifier,
+        _destination: &Identifier,
+        _expected: &ViewMetadata,
+    ) -> Result<View, Error> {
+        Err(Error::NotSupported("checked view rename".to_string()))
     }
     /// Drops a view from the catalog and deletes its metadata.
     ///

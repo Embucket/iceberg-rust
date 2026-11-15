@@ -44,6 +44,27 @@ the accessor follow-up passes all 23 focused owning controls. Validation must no
 re-enter any FileCatalog method requiring a reader or writer while this exclusive
 preparation is held; that includes committing pending native table writes.
 
+The object-safe checked integration seam is
+`Catalog::rename_view_from_metadata(self: Arc<Self>, source, destination,
+expected: &ViewMetadata)`. Its default is explicitly Unsupported, never unchecked
+fallback. FileCatalog must compare the complete authorized typed image against
+`prepared.source_metadata()` under the retained native writer. A mismatch returns
+`CommitConflict` before witness, READY, staging, decision, head or cache effects;
+the embedding engine still owns authorization of the expected image. No arbitrary
+native handle, catalog downcast or interpretation of an engine marker is needed.
+Existing unchecked `rename_view` remains a separate native convenience.
+
+This compares modeled semantic state, not the number of physical writes. A new
+head containing an identical typed UUID/location/schema/version/body/property
+image is admissible; head basenames alone can be reused after DROP/recreation and
+are not an incarnation proof. The root owner excludes hostile/out-of-protocol
+writers capable of forging both UUID and all opaque creator metadata. This is
+not authenticity or external-writer isolation. Test-first controls use warmed
+caller images and a distinct native writer to replace the UUID, alter body or an
+unrelated property with the UUID/creator marker unchanged, and advance the head
+without changing the typed image. Dynamic Catalog dispatch and denial followed
+by exact retry must prove the seam does not depend on a concrete FileCatalog.
+
 The native operation must preserve ViewMetadata UUID, all schemas, versions,
 version_log, current version, representations and properties exactly. Only its
 location changes to the destination. Old raw metadata images stay byte-identical;

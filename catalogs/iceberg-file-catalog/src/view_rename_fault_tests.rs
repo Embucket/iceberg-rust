@@ -152,6 +152,178 @@ async fn captured_source_accessor_binds_fresh_replacement_and_denial_releases_wi
     Ok(())
 }
 
+fn assert_no_rename_effects(fixture: &Fixture) -> TestResult {
+    let root = fixture.catalog.pair_root()?;
+    assert!(missing(&root.file(JOURNAL))? && missing(&root.file(WITNESS))?);
+    let source = root.path.join("APP/RV");
+    assert!(!missing(&source)? && missing(&root.path.join("APP/RV2"))?);
+    assert!(children(&root, &source.join("metadata"))?
+        .iter()
+        .all(|path| !path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with(".view-rename-"))));
+    Ok(())
+}
+
+#[tokio::test]
+async fn checked_view_rename_rejects_recreated_uuid_with_a_warmed_authorized_image() -> TestResult {
+    use iceberg_rust::spec::view_metadata::{Version, ViewRepresentation};
+    let fixture = Fixture::new().await?;
+    let authorized = fixture.view.metadata().clone();
+    let peer = fresh(&fixture).await?;
+    peer.drop_view(fixture.view.identifier()).await?;
+    let replacement = View::builder()
+        .with_name("RV")
+        .with_schema(authorized.current_schema(None)?.clone())
+        .with_view_version(
+            Version::builder()
+                .with_representation(ViewRepresentation::sql("SELECT 2 AS X", Some("snowflake")))
+                .build()?,
+        )
+        .with_property((
+            "embucket.sql.view-options.v1".to_owned(),
+            authorized.properties["embucket.sql.view-options.v1"].clone(),
+        ))
+        .build(
+            fixture.destination.namespace(),
+            Arc::clone(&peer) as Arc<dyn Catalog>,
+        )
+        .await?;
+    assert_ne!(replacement.metadata().view_uuid, authorized.view_uuid);
+    let catalog: Arc<dyn Catalog> = Arc::clone(&fixture.catalog) as Arc<dyn Catalog>;
+    let error = catalog
+        .rename_view_from_metadata(fixture.view.identifier(), &fixture.destination, &authorized)
+        .await
+        .expect_err("cannot adopt recreated source from warm authority");
+    assert!(matches!(error, IcebergError::CommitConflict(_)), "{error}");
+    assert_no_rename_effects(&fixture)?;
+    let Tabular::View(view) = peer.load_tabular(fixture.view.identifier()).await? else {
+        return Err("replacement view".into());
+    };
+    assert_eq!(view.metadata(), replacement.metadata());
+    Ok(())
+}
+
+#[tokio::test]
+async fn checked_view_rename_rejects_same_uuid_body_or_property_change_before_controls(
+) -> TestResult {
+    use iceberg_rust::spec::view_metadata::ViewRepresentation;
+    for body in [false, true] {
+        let fixture = Fixture::new().await?;
+        let authorized = fixture.view.metadata().clone();
+        let peer = fresh(&fixture).await?;
+        let Tabular::View(mut changed) = Arc::clone(&peer)
+            .load_tabular(fixture.view.identifier())
+            .await?
+        else {
+            return Err("source view".into());
+        };
+        if body {
+            let fields = changed.metadata().current_schema(None)?.fields().clone();
+            changed
+                .new_transaction(None)
+                .update_representations(
+                    vec![ViewRepresentation::sql("SELECT 3 AS X", Some("snowflake"))],
+                    fields,
+                )
+                .commit()
+                .await?;
+        } else {
+            changed
+                .new_transaction(None)
+                .update_properties(vec![("opaque-property".into(), "changed".into())])
+                .commit()
+                .await?;
+        }
+        assert_eq!(changed.metadata().view_uuid, authorized.view_uuid);
+        assert_eq!(
+            changed.metadata().properties["embucket.sql.view-options.v1"],
+            authorized.properties["embucket.sql.view-options.v1"]
+        );
+        assert_ne!(changed.metadata(), &authorized);
+        let catalog: Arc<dyn Catalog> = Arc::clone(&fixture.catalog) as Arc<dyn Catalog>;
+        let error = catalog
+            .rename_view_from_metadata(fixture.view.identifier(), &fixture.destination, &authorized)
+            .await
+            .expect_err("full semantic image changed");
+        assert!(matches!(error, IcebergError::CommitConflict(_)), "{error}");
+        assert_no_rename_effects(&fixture)?;
+        let Tabular::View(view) = peer.load_tabular(fixture.view.identifier()).await? else {
+            return Err("changed view".into());
+        };
+        assert_eq!(view.metadata(), changed.metadata());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn checked_view_rename_admits_identical_typed_image_after_head_version_advance() -> TestResult
+{
+    use iceberg_rust::catalog::commit::CommitView;
+    let fixture = Fixture::new().await?;
+    let authorized = fixture.view.metadata().clone();
+    let old_head = fixture
+        .catalog
+        .metadata_location(fixture.view.identifier())
+        .await?;
+    let peer = fresh(&fixture).await?;
+    Arc::clone(&peer)
+        .load_tabular(fixture.view.identifier())
+        .await?;
+    let unchanged = Arc::clone(&peer)
+        .update_view(CommitView {
+            identifier: fixture.view.identifier().clone(),
+            requirements: vec![],
+            updates: vec![],
+        })
+        .await?;
+    assert_eq!(unchanged.metadata(), &authorized);
+    assert_ne!(
+        peer.metadata_location(fixture.view.identifier()).await?,
+        old_head
+    );
+    let catalog: Arc<dyn Catalog> = Arc::clone(&fixture.catalog) as Arc<dyn Catalog>;
+    let renamed = catalog
+        .rename_view_from_metadata(fixture.view.identifier(), &fixture.destination, &authorized)
+        .await?;
+    let mut expected = authorized;
+    expected.location.push('2');
+    assert_eq!(renamed.metadata(), &expected);
+    assert_destination(&fixture, &fresh(&fixture).await?).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn checked_view_rename_dyn_dispatch_declines_then_allows_exact_retry() -> TestResult {
+    let fixture = Fixture::new().await?;
+    let authorized = fixture.view.metadata().clone();
+    let mut wrong = authorized.clone();
+    wrong
+        .properties
+        .insert("unauthorized-caller-image".into(), "wrong".into());
+    let catalog: Arc<dyn Catalog> = Arc::clone(&fixture.catalog) as Arc<dyn Catalog>;
+    let error = Arc::clone(&catalog)
+        .rename_view_from_metadata(fixture.view.identifier(), &fixture.destination, &wrong)
+        .await
+        .expect_err("exact predecessor required");
+    assert!(matches!(error, IcebergError::CommitConflict(_)), "{error}");
+    assert_no_rename_effects(&fixture)?;
+    assert!(fixture.catalog.read_scope().await.is_ok());
+    catalog
+        .rename_view_from_metadata(fixture.view.identifier(), &fixture.destination, &authorized)
+        .await?;
+    assert_destination(&fixture, &fixture.catalog).await?;
+    let memory: Arc<dyn Catalog> =
+        Arc::new(FileCatalog::new("memory://catalog", ObjectStoreBuilder::memory()).await?);
+    assert!(matches!(
+        memory
+            .rename_view_from_metadata(fixture.view.identifier(), &fixture.destination, &authorized)
+            .await,
+        Err(IcebergError::NotSupported(_))
+    ));
+    Ok(())
+}
+
 #[tokio::test]
 async fn predecision_failure_cleans_only_private_stage_and_keeps_exact_source() -> TestResult {
     let fixture = Fixture::new().await?;
