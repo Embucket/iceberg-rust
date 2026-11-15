@@ -38,9 +38,12 @@ cargo test -p iceberg-file-catalog --lib filesystem_namespace_drop
 
 ## Prepared append pairs
 
-Status: source candidate. 24 actual-source isolated controls pass (including
-one child helper); ordinary Cargo/package and existing namespace checks remain
-pending. A warnings-denied production metadata compilation also passes. This API
+Status: source candidate with canonical owning package checks passed: 55 tests,
+zero failures and one inherited ignored benchmark, including all 24 pair controls
+and the existing namespace and real S3/LocalStack controls. Configured Clippy
+1.95.0 passes for this package's all-targets/all-features check with warnings
+denied; whole-workspace format and independent source review also pass. Broader
+fork CI and embedding-engine acceptance remain separate. This API
 does not implement SQL INSERT ALL, multi-table user transactions, engine cache
 snapshots, or distributed transactions.
 
@@ -178,11 +181,16 @@ Run the focused controls and existing namespace controls before a PR:
 ~~~sh
 cargo test -p iceberg-file-catalog prepared_pair::tests -- --test-threads=1
 cargo test -p iceberg-file-catalog namespace
+cargo test -p iceberg-file-catalog --lib -- --test-threads=1
+cargo +1.95.0 clippy -p iceberg-file-catalog --all-targets --all-features -- -D warnings
+cargo +1.95.0 fmt --all -- --check
 ~~~
 
 The isolated run compiles the actual FileCatalog production source and these
 owning tests against pinned frozen dependency rlibs; it excludes the unrelated
 original DataFusion/Docker test modules. The tests-first unsupported stub compiles
 and its two-head/reopen success control fails before implementation. This is not
-a full Cargo workspace or Rustice runtime acceptance receipt. Ordinary package,
-namespace, configured static checks and independent source review remain required.
+a full Cargo workspace or Rustice runtime acceptance receipt. The later canonical
+package run includes the complete original DataFusion/Docker test module. Owning
+package, namespace, configured static checks and independent source review now
+pass; this does not qualify SQL INSERT ALL, engine caches or a fork-wide CI run.
