@@ -126,6 +126,7 @@ fn table_identity_path(location: &str) -> ObjectPath {
 }
 
 pub mod error;
+pub mod prepared_pair;
 
 impl FileCatalog {
     fn mutation_root_key(&self) -> String {
