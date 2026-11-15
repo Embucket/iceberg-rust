@@ -778,3 +778,70 @@ async fn publisher_rechecks_distinct_identities_before_control_effects() -> Test
     assert!(!fixture.root.path().join("catalog").join(WITNESS).exists());
     Ok(())
 }
+
+#[tokio::test]
+async fn bad_required_controls_before_publication_fence_without_rewriting_them() -> TestResult {
+    for damaged in ["fresh-witness", "existing-witness", "existing-journal"] {
+        let fixture = Fixture::new().await?;
+        if damaged != "fresh-witness" {
+            let mut before = fixture
+                .catalog
+                .prepare_append_pair(fixture.commits.clone())
+                .await?;
+            before.hook = Some(failure(TestStage::BeforeDecision));
+            assert_eq!(
+                before
+                    .publish()
+                    .await
+                    .expect_err("predecision setup")
+                    .outcome,
+                PairOutcome::NotCommitted
+            );
+        }
+        let prepared = fixture
+            .catalog
+            .prepare_append_pair(fixture.commits.clone())
+            .await?;
+        let witness = fixture.root.path().join("catalog").join(WITNESS);
+        let journal = fixture.root.path().join("catalog").join(JOURNAL);
+        let previous_witness = std::fs::read(&witness).ok();
+        let previous_journal = std::fs::read(&journal).ok();
+        let bad = b"foreign-or-corrupt-required-control".to_vec();
+        let destination = if damaged == "existing-journal" {
+            &journal
+        } else {
+            &witness
+        };
+        std::fs::write(destination, &bad)?;
+        let error = prepared
+            .publish()
+            .await
+            .expect_err("bad required authority");
+        assert_eq!(error.outcome, PairOutcome::NotCommitted, "{damaged}");
+        assert!(
+            fixture.catalog.read_scope().await.is_err(),
+            "operation abort must not reset unhealthy required controls: {damaged}"
+        );
+        assert_eq!(std::fs::read(destination)?, bad, "{damaged}");
+        if damaged != "existing-journal" {
+            assert_eq!(
+                std::fs::read(&journal).ok(),
+                previous_journal,
+                "do not replace a journal after observing a foreign witness"
+            );
+        }
+        if let Some(bytes) = previous_witness {
+            std::fs::write(&witness, bytes)?;
+        } else {
+            std::fs::remove_file(&witness)?;
+        }
+        if let Some(bytes) = previous_journal {
+            std::fs::write(&journal, bytes)?;
+        } else if journal.exists() {
+            std::fs::remove_file(&journal)?;
+        }
+        fixture.catalog.recover_append_pair().await?;
+        assert_eq!(fixture.snapshots().await?, [None, None]);
+    }
+    Ok(())
+}
