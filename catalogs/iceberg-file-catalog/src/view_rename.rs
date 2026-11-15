@@ -816,6 +816,16 @@ impl FileCatalogReadScope {
 }
 
 impl PreparedViewRename {
+    /// Borrow the exact predecessor captured under this preparation's writer.
+    ///
+    /// An embedding owner may validate its UUID and opaque properties before
+    /// deciding to publish. This accessor performs no IO, allocation or marker
+    /// interpretation and never releases exclusion. Preparation has created no
+    /// journal/staging effects; dropping a denied preparation only releases it.
+    pub fn source_metadata(&self) -> &ViewMetadata {
+        &self.plan.old
+    }
+
     pub async fn publish(self) -> Result<View, ViewRenameError> {
         let catalog = Arc::clone(&self.catalog);
         let destination = self.plan.destination.clone();

@@ -39,6 +39,10 @@ publication effects. A test-first control replaces the name through a distinct
 FileCatalog while the preparing catalog retains its old cache, checks the new
 captured UUID/opaque creator marker and a blocked native writer, then denies/drops
 the preparation and proves unchanged names/controls plus later writer progress.
+The missing-method control produced only the expected E0599 compile refusals;
+the accessor follow-up passes all 23 focused owning controls. Validation must not
+re-enter any FileCatalog method requiring a reader or writer while this exclusive
+preparation is held; that includes committing pending native table writes.
 
 The native operation must preserve ViewMetadata UUID, all schemas, versions,
 version_log, current version, representations and properties exactly. Only its
