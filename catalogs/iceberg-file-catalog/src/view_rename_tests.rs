@@ -17,6 +17,16 @@ struct Fixture {
 }
 
 impl Fixture {
+    async fn peer(&self) -> TestResult<Arc<FileCatalog>> {
+        Ok(Arc::new(
+            FileCatalog::new(
+                "file:///catalog",
+                ObjectStoreBuilder::filesystem(self.root.path()),
+            )
+            .await?,
+        ))
+    }
+
     async fn new() -> TestResult<Self> {
         let root = tempfile::tempdir()?;
         let catalog = Arc::new(
@@ -133,7 +143,22 @@ async fn view_rename_waits_for_an_existing_catalog_reader() -> TestResult {
 #[tokio::test]
 async fn retained_old_name_view_cannot_resurrect_after_rename() -> TestResult {
     let fixture = Fixture::new().await?;
-    let mut retained = fixture.view.clone();
+    // Distinct preloaded catalogs are essential: removing only the publisher's
+    // cache entry must not accidentally make this stale-writer proof pass.
+    let peer = fixture.peer().await?;
+    let peer_after_recreate = fixture.peer().await?;
+    let Tabular::View(mut retained) = Arc::clone(&peer)
+        .load_tabular(fixture.view.identifier())
+        .await?
+    else {
+        return Err("peer view".into());
+    };
+    let Tabular::View(mut retained_after_recreate) = peer_after_recreate
+        .load_tabular(fixture.view.identifier())
+        .await?
+    else {
+        return Err("second peer view".into());
+    };
     let renamed = Arc::clone(&fixture.catalog)
         .rename_view(fixture.view.identifier(), &fixture.destination)
         .await?;
@@ -156,5 +181,68 @@ async fn retained_old_name_view_cannot_resurrect_after_rename() -> TestResult {
         return Err("destination is not a view".into());
     };
     assert_eq!(current.metadata(), renamed.metadata());
+    let mut recreated = View::builder()
+        .with_name(fixture.view.identifier().name())
+        .with_schema(fixture.view.metadata().current_schema(None)?.clone())
+        .with_view_version(
+            Version::builder()
+                .with_representation(ViewRepresentation::sql("SELECT 99 AS X", Some("snowflake")))
+                .build()?,
+        )
+        .build(
+            fixture.view.identifier().namespace(),
+            Arc::clone(&fixture.catalog) as Arc<dyn Catalog>,
+        )
+        .await?;
+    // Reuse the old v1 head basename as well as the logical name. A path/version
+    // check without the live UUID must not admit the predecessor's authority.
+    recreated
+        .new_transaction(None)
+        .update_properties(vec![("new-incarnation".to_owned(), "kept".to_owned())])
+        .commit()
+        .await?;
+    assert_ne!(
+        recreated.metadata().view_uuid,
+        fixture.view.metadata().view_uuid
+    );
+    let expected_recreated = recreated.metadata().clone();
+    assert!(retained_after_recreate
+        .new_transaction(None)
+        .update_properties(vec![("late".to_owned(), "must-not-publish".to_owned())])
+        .commit()
+        .await
+        .is_err());
+    let Tabular::View(current) = Arc::clone(&fixture.catalog)
+        .load_tabular(fixture.view.identifier())
+        .await?
+    else {
+        return Err("recreated view".into());
+    };
+    assert_eq!(current.metadata(), &expected_recreated);
+    let Tabular::View(current) = Arc::clone(&fixture.catalog)
+        .load_tabular(&fixture.destination)
+        .await?
+    else {
+        return Err("renamed view".into());
+    };
+    assert_eq!(current.metadata(), renamed.metadata());
+    Ok(())
+}
+
+#[tokio::test]
+async fn peer_cached_listing_does_not_revive_the_old_name() -> TestResult {
+    let fixture = Fixture::new().await?;
+    let peer = fixture.peer().await?;
+    Arc::clone(&peer)
+        .load_tabular(fixture.view.identifier())
+        .await?;
+    Arc::clone(&fixture.catalog)
+        .rename_view(fixture.view.identifier(), &fixture.destination)
+        .await?;
+    assert_eq!(
+        peer.list_tabulars(fixture.destination.namespace()).await?,
+        vec![fixture.destination.clone()]
+    );
+    assert!(!peer.tabular_exists(fixture.view.identifier()).await?);
     Ok(())
 }

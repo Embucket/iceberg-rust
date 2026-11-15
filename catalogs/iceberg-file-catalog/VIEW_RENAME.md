@@ -2,7 +2,9 @@
 
 Status: test-first preparation, runtime **Missing**. The new Catalog method has
 an explicit Unsupported default and FileCatalog has not implemented it yet.
-The authored three owning tests have not been compiled or run. The existing
+The first three owning tests compiled and produced the expected actual RED
+(zero passes/three failures) on the Unsupported stub before implementation.
+The later peer-cache/old-name recreation refinements remain uncompiled. The existing
 prepared-pair foundation's qualification does not qualify this new operation.
 
 `Catalog::rename_view(self: Arc<Self>, source, destination)` returns the renamed
@@ -32,6 +34,13 @@ update_view cache alone can otherwise recreate a removed old location. Tests mus
 also recreate the old name and prove its new UUID cannot be touched by a retained
 predecessor handle. Existing non-filesystem and ordinary table behavior stays on
 its current dispatch.
+
+The retained-writer control uses distinct preloaded FileCatalog instances, then
+recreates the old name up to the same v1 head basename with a different UUID.
+The peer-listing control requires cached old names to disappear after rename.
+Namespace enumeration/existence must participate in native rename read exclusion;
+internal calls under existing guards must use borrowed implementations rather
+than recursively reacquiring the fair read lock.
 
 Further required controls before implementation acceptance include table/view
 destination collisions, wrong source kind, source/target no-follow path bounds,
