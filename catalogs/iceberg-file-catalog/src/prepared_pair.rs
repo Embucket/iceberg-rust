@@ -1123,6 +1123,9 @@ fn recover(root: &NativeRoot, cache: &Cache) -> Result<(), IcebergError> {
         return Err(refusal("prepared-pair witness has a foreign root"));
     }
     let bytes = root.read(&root.file(JOURNAL), MAX_JOURNAL)?;
+    if view_rename::is_record(&bytes)? {
+        return view_rename::recover_record(root, cache, &bytes);
+    }
     let (operation, phase, entries, artifacts) = decode_journal(root, &bytes)?;
     match phase.as_str() {
         // Completed/aborted decisions do not retain authority over later ordinary
@@ -1161,6 +1164,8 @@ enum TestStage {
     BeforeDecision,
     AfterDecision,
     AfterFirstHead,
+    AfterFirstSourceFile,
+    AfterSourceRetired,
     AfterDelivery,
 }
 #[cfg(test)]
@@ -1514,7 +1519,11 @@ fn validate_existing_controls(root: &NativeRoot) -> Result<(), IcebergError> {
     if root.read(&root.file(WITNESS), 4096)? != witness_bytes(root)? {
         return Err(refusal("required prepared-pair witness changed"));
     }
-    let (_, phase, _, _) = decode_journal(root, &root.read(&root.file(JOURNAL), MAX_JOURNAL)?)?;
+    let bytes = root.read(&root.file(JOURNAL), MAX_JOURNAL)?;
+    if view_rename::is_record(&bytes)? {
+        return view_rename::validate_terminal(root, &bytes);
+    }
+    let (_, phase, _, _) = decode_journal(root, &bytes)?;
     if !matches!(phase.as_str(), "complete" | "aborted") {
         return Err(refusal(
             "an existing prepared-pair decision requires recovery",

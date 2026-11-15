@@ -1,5 +1,5 @@
-//! Test-first view rename contract. The initial native implementation remains
-//! the Catalog default Unsupported stub; no runtime qualification is claimed.
+//! Test-first view rename contract; the initial Catalog Unsupported stub produced
+//! the preserved three-test RED before the bounded FileCatalog implementation.
 
 use super::*;
 use iceberg_rust::spec::schema::Schema;

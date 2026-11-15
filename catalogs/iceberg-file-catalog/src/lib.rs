@@ -135,6 +135,63 @@ pub use prepared_pair::view_rename::{PreparedViewRename, ViewRenameError};
 mod view_rename_tests;
 
 impl FileCatalog {
+    async fn tabular_exists_under_scope(
+        &self,
+        identifier: &Identifier,
+    ) -> Result<bool, IcebergError> {
+        match self.metadata_location(identifier).await {
+            Ok(_) => Ok(true),
+            Err(
+                IcebergError::CatalogNotFound
+                | IcebergError::NotFound(_)
+                | IcebergError::ObjectStore(object_store::Error::NotFound { .. }),
+            ) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn list_tabulars_under_scope(
+        &self,
+        namespace: &Namespace,
+    ) -> Result<Vec<Identifier>, IcebergError> {
+        let bucket = Bucket::from_path(&self.path)?;
+        let object_store = self.object_store.build(bucket)?;
+        let mut identifiers: HashSet<Identifier> = object_store
+            .list(Some(
+                &strip_prefix(&self.namespace_path(&namespace[0])).into(),
+            ))
+            .map_err(IcebergError::from)
+            .map_ok(|object| self.identifier(object.location.as_ref()))
+            .try_collect()
+            .await?;
+        let renamed = self.renamed_tables.read().unwrap();
+        for (destination, source) in renamed.iter() {
+            if destination != source {
+                identifiers.remove(source);
+            }
+            if destination.namespace() == namespace {
+                identifiers.insert(destination.clone());
+            }
+        }
+        drop(renamed);
+        let cache = self.cache.read().unwrap();
+        for (identifier, (_, metadata)) in cache.iter() {
+            if identifier.namespace() != namespace {
+                continue;
+            }
+            // A local View's cache is not a surviving namespace entry after a
+            // different FileCatalog instance retires its physical old name.
+            let local_view = matches!(metadata,TabularMetadata::View(view)
+                if self.is_local_view_location(identifier,&view.location));
+            if !local_view || identifiers.contains(identifier) {
+                identifiers.insert(identifier.clone());
+            }
+        }
+        let mut identifiers = identifiers.into_iter().collect::<Vec<_>>();
+        identifiers.sort_by_key(ToString::to_string);
+        Ok(identifiers)
+    }
+
     fn mutation_root_key(&self) -> String {
         self.mutation_key.clone()
     }
@@ -351,44 +408,11 @@ impl Catalog for FileCatalog {
             .any(|n| n.first() == Some(target)))
     }
     async fn list_tabulars(&self, namespace: &Namespace) -> Result<Vec<Identifier>, IcebergError> {
-        let bucket = Bucket::from_path(&self.path)?;
-        let object_store = self.object_store.build(bucket)?;
-
-        let mut identifiers: HashSet<Identifier> = object_store
-            .list(Some(
-                &strip_prefix(&self.namespace_path(&namespace[0])).into(),
-            ))
-            .map_err(IcebergError::from)
-            .map_ok(|x| {
-                let path = x.location.as_ref();
-                self.identifier(path)
-            })
-            .try_collect::<HashSet<_>>()
-            .await?;
-
-        let renamed_tables = self.renamed_tables.read().unwrap();
-        for (destination, source) in renamed_tables.iter() {
-            if destination != source {
-                identifiers.remove(source);
-            }
-            if destination.namespace() == namespace {
-                identifiers.insert(destination.clone());
-            }
+        if !matches!(self.object_store, ObjectStoreBuilder::Filesystem(_)) {
+            return self.list_tabulars_under_scope(namespace).await;
         }
-        drop(renamed_tables);
-
-        identifiers.extend(
-            self.cache
-                .read()
-                .unwrap()
-                .keys()
-                .filter(|identifier| identifier.namespace() == namespace)
-                .cloned(),
-        );
-
-        let mut identifiers = identifiers.into_iter().collect::<Vec<_>>();
-        identifiers.sort_by_key(ToString::to_string);
-        Ok(identifiers)
+        let _scope = self.mutation_scope().await?;
+        self.list_tabulars_under_scope(namespace).await
     }
     async fn list_namespaces(&self, _parent: Option<&str>) -> Result<Vec<Namespace>, IcebergError> {
         let bucket = Bucket::from_path(&self.path)?;
@@ -405,15 +429,11 @@ impl Catalog for FileCatalog {
             .collect::<Result<_, IcebergError>>()
     }
     async fn tabular_exists(&self, identifier: &Identifier) -> Result<bool, IcebergError> {
-        match self.metadata_location(identifier).await {
-            Ok(_) => Ok(true),
-            Err(
-                IcebergError::CatalogNotFound
-                | IcebergError::NotFound(_)
-                | IcebergError::ObjectStore(object_store::Error::NotFound { .. }),
-            ) => Ok(false),
-            Err(error) => Err(error),
+        if !matches!(self.object_store, ObjectStoreBuilder::Filesystem(_)) {
+            return self.tabular_exists_under_scope(identifier).await;
         }
+        let _scope = self.mutation_scope().await?;
+        self.tabular_exists_under_scope(identifier).await
     }
     async fn drop_table(&self, identifier: &Identifier) -> Result<(), IcebergError> {
         self.drop_tabular(identifier).await
@@ -522,7 +542,7 @@ impl Catalog for FileCatalog {
         let _catalog_guard = self.mutation_scope().await?;
         let mutation_lock = self.mutation_lock(&identifier);
         let _mutation_guard = mutation_lock.lock().await;
-        if self.tabular_exists(&identifier).await? {
+        if self.tabular_exists_under_scope(&identifier).await? {
             return Err(IcebergError::InvalidFormat(
                 "Table already exists. Path".to_owned(),
             ));
@@ -572,7 +592,7 @@ impl Catalog for FileCatalog {
         let _catalog_guard = self.mutation_scope().await?;
         let mutation_lock = self.mutation_lock(&identifier);
         let _mutation_guard = mutation_lock.lock().await;
-        if self.tabular_exists(&identifier).await? {
+        if self.tabular_exists_under_scope(&identifier).await? {
             return Err(IcebergError::InvalidFormat(
                 "View already exists. Path".to_owned(),
             ));
@@ -611,7 +631,7 @@ impl Catalog for FileCatalog {
         self.check_pair_health()?;
         let mutation_lock = self.mutation_lock(&identifier);
         let _mutation_guard = mutation_lock.lock().await;
-        if self.tabular_exists(&identifier).await? {
+        if self.tabular_exists_under_scope(&identifier).await? {
             return Err(IcebergError::InvalidFormat(
                 "View already exists. Path".to_owned(),
             ));
@@ -808,6 +828,26 @@ impl Catalog for FileCatalog {
         let (previous_metadata_location, mut metadata) = entry;
         let metadata_location = match &mut metadata {
             TabularMetadata::View(metadata) => {
+                if self.is_local_view_location(&identifier, &metadata.location) {
+                    let current_location =
+                        self.metadata_location(&identifier)
+                            .await
+                            .map_err(|error| match error {
+                                IcebergError::CatalogNotFound
+                                | IcebergError::NotFound(_)
+                                | IcebergError::ObjectStore(object_store::Error::NotFound {
+                                    ..
+                                }) => IcebergError::CommitConflict(identifier.to_string()),
+                                other => other,
+                            })?;
+                    let current = object_store.get_metadata(&current_location).await?;
+                    if !matches!(current,TabularMetadata::View(ref current) if current==metadata)
+                        || parse_version(&current_location)?
+                            != parse_version(&previous_metadata_location)?
+                    {
+                        return Err(IcebergError::CommitConflict(identifier.to_string()));
+                    }
+                }
                 if !check_view_requirements(&commit.requirements, metadata) {
                     return Err(IcebergError::InvalidFormat(
                         "View requirements not valid".to_owned(),

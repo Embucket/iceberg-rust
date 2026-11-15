@@ -1,11 +1,11 @@
-# Local view rename preparation
+# Local view rename
 
-Status: test-first preparation, runtime **Missing**. The new Catalog method has
-an explicit Unsupported default and FileCatalog has not implemented it yet.
-The first three owning tests compiled and produced the expected actual RED
-(zero passes/three failures) on the Unsupported stub before implementation.
-The later peer-cache/old-name recreation refinements remain uncompiled. The existing
-prepared-pair foundation's qualification does not qualify this new operation.
+Status: bounded native source candidate; 22 focused owning controls pass.
+The first three owning tests compiled and produced actual RED (zero passes/three
+failures) on the Unsupported stub before implementation. Full owning package,
+configured Clippy and independent source review are still pending for the new
+operation. Embedding SQL/account/cache publication remains **Missing**; the
+prepared-pair foundation's qualification does not qualify that integration.
 
 `Catalog::rename_view(self: Arc<Self>, source, destination)` returns the renamed
 View and allows an implementation to own its resources through native drain.
@@ -13,6 +13,17 @@ The selected FileCatalog subset is two different plain names in one local
 filesystem namespace, one existing View, and an absent destination. Memory,
 remote, cross-namespace, materialized-view and unsupported-location variants stay
 explicit refusals in the first version. Existing table rename is unchanged.
+
+`Arc<FileCatalog>::prepare_view_rename(source, destination)` returns an opaque
+`PreparedViewRename`, retaining the native root writer without changing either
+name or creating controls. Dropping preparation releases it. `publish()` returns
+the renamed `View` or `ViewRenameError { outcome: PairOutcome, source }`.
+`NotCommitted` describes the operation, independently of catalog health: observed
+required-control corruption can still fence the catalog. `DecisionUnknown` and
+`CommittedNeedsRecovery` always require explicit recovery before admission.
+The Catalog convenience method delegates to that owned publisher and retains the
+typed error as its external source. Other catalog implementations keep the
+default Unsupported result.
 
 The native operation must preserve ViewMetadata UUID, all schemas, versions,
 version_log, current version, representations and properties exactly. Only its
@@ -42,15 +53,18 @@ Namespace enumeration/existence must participate in native rename read exclusion
 internal calls under existing guards must use borrowed implementations rather
 than recursively reacquiring the fair read lock.
 
-Further required controls before implementation acceptance include table/view
-destination collisions, wrong source kind, source/target no-follow path bounds,
-real paused worker cancellation and held read/write exclusion, predecision and
-postdecision failure injection, actual process exits/repeated recovery, missing
-required controls, raw history byte preservation and catalog reopen. Embedding
-SQL/account/cache publication remains a separate owner boundary; no SQL support,
-XFAIL retirement, Rustice pin or P0 closure follows from this preparation.
+Passing owning controls cover a table collision/wrong source kind, same-name and
+cross-namespace refusals, memory refusal, source/target symlink bounds, real paused
+worker cancellation and independent blocked reader/namespace writer, predecision
+abort, four postdecision failure boundaries, actual process exits at five phases,
+repeated recovery, missing/corrupt successor and historical images, required
+control corruption/loss, preserved unknown evidence, byte-identical raw history,
+reopen, repeated rename and later ordinary update/DROP/recreation. A V2 rename,
+V1 prepared append pair, then V2 rename share the same terminal control slot.
+No SQL support, XFAIL retirement, Rustice pin or P0 closure follows from these
+native metadata controls.
 
-The proposed native state machine is bounded full-image publication:
+The native state machine is bounded full-image publication:
 
 1. Under the existing catalog writer, capture the exact source head and all
    regular metadata/history files with root-relative length/checksum receipts.
@@ -84,6 +98,30 @@ already detects the required slot. No extra native query-file probe is needed
 after the root's existing one-time UNPREPARED admission check. Older implementations
 must refuse the new journal version, not reinterpret it as absent legacy data.
 
-The exact codec, source/destination receipt budgets and fault stages remain to be
-implemented and tested. The above is a proposed protocol, not a successful
-publication or recovery receipt.
+Each current/predecessor head is plain JSON, at most 1 MiB; gzipped current heads
+refuse before effects in this first subset. At most 4094 regular direct-child
+history files and 16 MiB of total history/new-head/owner allowance are admitted;
+the journal is at most 16 MiB. Historical metadata files are hard-linked
+byte-identically into private staging. The mutable version hint is rebuilt and a
+new current catalog head differs only in location. Receipt paths/count/framed
+FNV-1a checksums bind the exact bounded history, with the foundation's explicit
+noncryptographic accidental-corruption contract. Recovery never invents a missing
+or corrupt image and does not silently treat required controls as legacy absence.
+
+The blocking owner retains the root writer through IO and cache cleanup after its
+async waiter is cancelled. Closed receiver at delivery fences. Successfully
+enqueueing a receipt is not proof the caller polled it: abandoning an already
+queued result can leave a coherent healthy commit. No acknowledgement wait is
+held against an idle future. The embedding layer must separately coordinate SQL
+transaction/DDL guards, account identity/grants, provider caches and its statement
+read lifetime before exposing view rename. Native preservation of an opaque
+creator marker is not an ownership check.
+
+```sh
+cargo test --offline --locked -p iceberg-file-catalog --lib view_rename -- --test-threads=1
+```
+
+The focused native receipt is 22 passed/zero failed (including the inert helper
+under normal discovery); its recovery test invokes the actual test binary in five
+children exiting from the real blocking worker. Full package checks and SQL/stock
+fixture acceptance must be recorded independently on their final source trees.

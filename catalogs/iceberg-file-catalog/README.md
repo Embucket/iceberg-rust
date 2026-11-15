@@ -1,8 +1,10 @@
 # File Catalog
 
-The separate [local view rename preparation](VIEW_RENAME.md) adds a default
-Unsupported Catalog API and authored owning controls. It is unimplemented and
-unqualified; the prepared-pair checks below do not qualify view rename.
+The separate [local view rename](VIEW_RENAME.md) adds a default-Unsupported
+Catalog API and an explicit local FileCatalog publisher. Its 22 focused owning
+controls pass, including actual process-exit recovery and worker cancellation.
+Full package qualification and embedding SQL/account/cache acceptance remain
+separate; the prepared-pair foundation checks below do not qualify that adapter.
 
 Filesystem and object-store-backed Iceberg catalog.
 
