@@ -49,6 +49,7 @@ async fn existing_empty_unrecognized_and_corrupt_endpoints_never_become_none() -
         "empty_endpoint",
         "unrecognized_metadata",
         "invalid_json",
+        "missing_current_heads",
         "endpoint_file",
         "metadata_file",
     ] {
@@ -74,6 +75,18 @@ async fn existing_empty_unrecognized_and_corrupt_endpoints_never_become_none() -
             "invalid_json" => {
                 std::fs::write(&head, b"not-json")?;
             }
+            "missing_current_heads" => {
+                for child in std::fs::read_dir(&metadata)? {
+                    let child = child?;
+                    if child
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| name.ends_with(".metadata.json"))
+                    {
+                        std::fs::remove_file(child.path())?;
+                    }
+                }
+            }
             "endpoint_file" => {
                 std::fs::remove_dir_all(&endpoint)?;
                 std::fs::write(&endpoint, b"file")?;
@@ -84,6 +97,18 @@ async fn existing_empty_unrecognized_and_corrupt_endpoints_never_become_none() -
             }
         }
         let scope = fixture.catalog.read_scope().await?;
+        if fault == "invalid_json" {
+            assert!(
+                scope.tabular_exists(fixture.view.identifier()).await?,
+                "legacy exists does not parse metadata"
+            );
+        }
+        if fault == "unrecognized_metadata" {
+            assert!(
+                !scope.tabular_exists(fixture.view.identifier()).await?,
+                "legacy lookup is not physical absence proof"
+            );
+        }
         assert!(
             scope
                 .load_if_present(fixture.view.identifier())
@@ -173,12 +198,17 @@ async fn borrowed_optional_exists_and_listing_do_not_reenter_a_queued_writer() -
     let scope = fixture.catalog.read_scope().await?;
     let source = fixture.view.identifier().clone();
     let destination = fixture.destination.clone();
-    let catalog = Arc::clone(&fixture.catalog);
-    let mut writer =
-        tokio::spawn(async move { catalog.prepare_view_rename(&source, &destination).await });
-    assert!(tokio::time::timeout(Duration::from_millis(50), &mut writer)
-        .await
-        .is_err());
+    let writer = Arc::clone(&fixture.catalog).prepare_view_rename(&source, &destination);
+    tokio::pin!(writer);
+    assert!(
+        matches!(futures::poll!(writer.as_mut()), std::task::Poll::Pending),
+        "actual writer's first await queues its native write lock"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), writer.as_mut())
+            .await
+            .is_err()
+    );
     let Some(Tabular::View(view)) = tokio::time::timeout(
         Duration::from_secs(3),
         scope.load_if_present(fixture.view.identifier()),
@@ -210,7 +240,7 @@ async fn borrowed_optional_exists_and_listing_do_not_reenter_a_queued_writer() -
         vec![fixture.view.identifier().clone()]
     );
     drop(scope);
-    drop(tokio::time::timeout(Duration::from_secs(3), writer).await???);
+    drop(tokio::time::timeout(Duration::from_secs(3), writer).await??);
     assert!(
         fixture
             .catalog
