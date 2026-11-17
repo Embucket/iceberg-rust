@@ -239,7 +239,8 @@ async fn borrowed_optional_exists_and_listing_do_not_reenter_a_queued_writer() -
     let scope = fixture.catalog.read_scope().await?;
     let source = fixture.view.identifier().clone();
     let destination = fixture.destination.clone();
-    let writer = Arc::clone(&fixture.catalog).prepare_view_rename(&source, &destination);
+    let writer_catalog = Arc::clone(&fixture.catalog);
+    let writer = writer_catalog.prepare_view_rename(&source, &destination);
     tokio::pin!(writer);
     assert!(
         matches!(futures::poll!(writer.as_mut()), std::task::Poll::Pending),

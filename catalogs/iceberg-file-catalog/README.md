@@ -232,3 +232,12 @@ a full Cargo workspace or Rustice runtime acceptance receipt. The later canonica
 package run includes the complete original DataFusion/Docker test module. Owning
 package, namespace, configured static checks and independent source review now
 pass; this does not qualify SQL INSERT ALL, engine caches or a fork-wide CI run.
+
+### First optional-read compiler admission
+
+The first native `b37c6abc` test build exited 101 after 73.665 seconds,
+before running the new controls or Clippy. Its writer-exclusion fixture borrowed
+a temporary catalog Arc into the prepared rename future (E0716). The scoped
+test-only successor retains that same cloned Arc in `writer_catalog`; the future,
+arguments, exclusion and final assertions are unchanged. The original failed
+compiler log remains retained. New owning tests and configured Clippy are Pending.
