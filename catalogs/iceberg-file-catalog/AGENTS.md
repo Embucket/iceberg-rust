@@ -73,8 +73,14 @@ through the physical proof, ordinary full native load and identity rechecks.
 Never map CatalogNotFound to None: native load also uses it for missing metadata.
 Borrowed exists/list preserve their old under-scope helper behavior and are not
 coherent physical absence evidence. No trait reentry, writes, head-selection
-change, new dependency or row conversion belongs in this path. This source is
-uncompiled until its independent native controls/Clippy are actually run.
+change, new dependency or row conversion belongs in this path. Source `3a706411`
+has seven native controls plus the full owning package 91 PASS / 0 FAIL /
+1 inherited ignored benchmark, and configured 1.95 all-target/all-feature Clippy
+PASS. Preserve the original b37 compiler failure and wrong-CWD full90/1/1 result.
+Use the canonical Cargo package CWD for inherited relative fixtures; an unchanged
+ELF may produce a setup failure from the workspace root. This qualification does
+not authorize an embedding engine pin, SQL/account/cache activation or a claim of
+fork-wide CI/performance coverage.
 
 Retain source-before-implementation controls, real paused blocking-worker
 cancellation/exclusion proof and actual child-process recovery tests. No new

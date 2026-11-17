@@ -1,13 +1,20 @@
 # File Catalog
 
-The scoped optional-read successor is **source preparation, uncompiled**. It is
-based on merged `63629472`. Its borrowed exists/list methods already exist in
+The scoped optional-read successor is **qualified for the native file-catalog
+API** on source `3a706411`. Its seven new real-file controls pass; the complete
+owning package passes 91 tests, zero failures and one inherited ignored benchmark.
+Configured Rust 1.95 Clippy passes with `--all-targets --all-features -D warnings`.
+Normal tests used the existing native default unoptimized/debuginfo profile on
+Rust 1.99.1. These are local owning-package results, not fork-wide CI, embedding
+SQL/account/cache, Rustice pin or performance acceptance.
+
+The source is based on merged `63629472`. Its borrowed exists/list methods exist in
 the separate `view_rename.rs` impl and remain byte-unchanged. An initial source
 review inspected only the `prepared_pair.rs` impl and incorrectly inferred they
 were absent; that claim was retracted before compilation. A separate suspected
 ordinary-rename lock recursion was also disproved by the full Memory-only gate
-and direct memory lookup dispatch. Ordinary rename is byte-unchanged and no
-native test failure was observed. Historical checks do not qualify this successor.
+and direct memory lookup dispatch. Ordinary rename is byte-unchanged; neither
+retracted source suspicion produced an observed native test failure.
 
 `FileCatalogReadScope::load_if_present` adds a stronger Unix-filesystem API for
 one exact plain physical endpoint. `None` requires no-follow leaf absence under
@@ -21,10 +28,27 @@ Borrowed exists/list retain their previous metadata-lookup semantics and must no
 replace this proof. No native writer, SQL authorization, cache lifetime, hostile
 filesystem protection, account protocol or row conversion is added.
 
-Seven authored real-file controls cover complete View/Table kind preservation,
+Seven passing real-file controls cover complete View/Table kind preservation,
 physical absence, bad endpoints/heads/parents, unsafe names, unchanged catalog
-bytes and all three borrowed methods while a writer is queued. They remain
-UNCOMPILED; no test/native/Clippy or embedding-engine acceptance is claimed.
+bytes and all three borrowed methods while a writer is queued.
+
+The first `b37c6abc` compiler admission exited 101 (E0716) before tests; the
+test-only successor retained the same catalog Arc through its borrowed writer
+future. The first complete `3a706411` run used the workspace CWD and retained
+90 PASS / 1 FAIL / 1 ignored in an inherited CSV fixture test. The unchanged
+2a305329 test ELF then passed 91 / 0 / 1 from the canonical Cargo package CWD,
+where `../../datafusion_iceberg/testdata/tpch/lineitem.csv` resolves to the original
+6,382,729-byte fixture (SHA256 `fc446fafb0c8c7b25a8aff07ff9d4b0c43fa88dbd9da534e3b02ebf47293363b`).
+Build-producer CWD, source, ELF and fixture were unchanged. Both original failures
+are retained; this was a documented execution-CWD correction, not a source repair
+or discarded test result. The corrected owning/Clippy receipt is
+`native-scoped-read-3a7064-package-cwd-owning-receipt-20261117.json`
+(SHA256 `d89362f59b4fb6f99fa62d1e6f32d8e6eb8e3bfbf84d2915836f4066b70d0464`),
+with independent cold source/log/ELF/15-extern review
+`native-scoped-read-3a7064-warehouses-independent-actual-review-20261117.json`
+(SHA256 `9b3a1356092a6c78cb1ba621d6666446025115671fd5bc0c6ec5a28d8218cbcc`).
+Original receipts/logs remain local evidence. Run owning tests through Cargo's
+package execution context; direct test-ELF execution must preserve that same CWD.
 
 The separate [local view rename](VIEW_RENAME.md) adds a default-Unsupported
 Catalog API and an explicit local FileCatalog publisher. Its 29 focused owning
@@ -240,4 +264,5 @@ before running the new controls or Clippy. Its writer-exclusion fixture borrowed
 a temporary catalog Arc into the prepared rename future (E0716). The scoped
 test-only successor retains that same cloned Arc in `writer_catalog`; the future,
 arguments, exclusion and final assertions are unchanged. The original failed
-compiler log remains retained. New owning tests and configured Clippy are Pending.
+compiler log remains retained. The subsequent owning tests and configured Clippy
+pass within the native-only scope recorded above.
