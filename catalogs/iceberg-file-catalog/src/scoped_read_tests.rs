@@ -147,6 +147,21 @@ async fn existing_empty_unrecognized_and_corrupt_endpoints_never_become_none() -
 #[tokio::test]
 async fn optional_scoped_read_rejects_live_and_dangling_symlink_endpoints_and_metadata(
 ) -> TestResult {
+    fn copy_known_image(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+        let kind = std::fs::symlink_metadata(from)?.file_type();
+        if kind.is_dir() {
+            std::fs::create_dir(to)?;
+            for child in std::fs::read_dir(from)? {
+                let child = child?;
+                copy_known_image(&child.path(), &to.join(child.file_name()))?;
+            }
+        } else if kind.is_file() {
+            std::fs::copy(from, to)?;
+        } else {
+            return Err(std::io::Error::other("fixture image must be regular"));
+        }
+        Ok(())
+    }
     for fault in [
         "endpoint",
         "dangling_endpoint",
@@ -172,24 +187,27 @@ async fn optional_scoped_read_rejects_live_and_dangling_symlink_endpoints_and_me
             "head" => head,
             _ => endpoint.parent().ok_or("namespace")?.to_owned(),
         };
+        let target = outside.join(if fault == "dangling_endpoint" {
+            "missing"
+        } else {
+            "complete-image"
+        });
+        if fault != "dangling_endpoint" {
+            copy_known_image(&path, &target)?;
+        }
         if path.is_dir() {
             std::fs::remove_dir_all(&path)?;
         } else {
             std::fs::remove_file(&path)?;
         }
-        let target = if fault == "dangling_endpoint" {
-            outside.join("missing")
-        } else {
-            outside
-        };
         std::os::unix::fs::symlink(target, &path)?;
         let scope = fixture.catalog.read_scope().await?;
         assert!(
-            scope
-                .load_if_present(fixture.view.identifier())
-                .await
-                .is_err(),
-            "{fault}"
+            matches!(
+                scope.load_if_present(fixture.view.identifier()).await,
+                Err(IcebergError::NotSupported(_))
+            ),
+            "reject redirected complete image before load: {fault}"
         );
         if fault == "namespace" {
             assert!(scope.load_if_present(&fixture.destination).await.is_err());
