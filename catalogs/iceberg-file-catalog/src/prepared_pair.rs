@@ -1211,6 +1211,10 @@ fn checkpoint(hook: &Option<Arc<TestHook>>, stage: TestStage) -> Result<(), Iceb
 #[path = "prepared_pair_tests.rs"]
 mod tests;
 
+#[cfg(test)]
+#[path = "scoped_read_tests.rs"]
+mod scoped_read_tests;
+
 impl NativeRoot {
     fn sync_ancestors(&self, path: &NativePath) -> Result<(), IcebergError> {
         let mut current = canonical_future_path(path)?;
