@@ -13,6 +13,9 @@ use uuid::Uuid;
 #[path = "view_rename.rs"]
 pub mod view_rename;
 
+#[path = "scoped_read.rs"]
+mod scoped_read;
+
 const JOURNAL: &str = ".iceberg-append-pair-v1";
 const WITNESS: &str = ".iceberg-append-pair-required-v1";
 const MAX_METADATA: usize = 1024 * 1024;
@@ -1211,7 +1214,7 @@ fn checkpoint(hook: &Option<Arc<TestHook>>, stage: TestStage) -> Result<(), Iceb
 #[path = "prepared_pair_tests.rs"]
 mod tests;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[path = "scoped_read_tests.rs"]
 mod scoped_read_tests;
 

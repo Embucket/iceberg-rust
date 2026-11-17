@@ -65,6 +65,17 @@ trait method while holding a reader and a writer is queued. This scope is not a
 Rustice SQL/cache/physical lifetime snapshot. The embedding layer must supply a
 separate statement read/publication boundary before enabling INSERT ALL.
 
+`scope.load_if_present` is a separate bounded Unix-filesystem read API. Return
+None only for a positively missing exact plain endpoint below the same actual
+live nonsymlink namespace. Existing endpoint/metadata/head corruption, redirected
+or nonregular paths and unknown parents remain errors. Keep the original reader
+through the physical proof, ordinary full native load and identity rechecks.
+Never map CatalogNotFound to None: native load also uses it for missing metadata.
+Borrowed exists/list preserve their old under-scope helper behavior and are not
+coherent physical absence evidence. No trait reentry, writes, head-selection
+change, new dependency or row conversion belongs in this path. This source is
+uncompiled until its independent native controls/Clippy are actually run.
+
 Retain source-before-implementation controls, real paused blocking-worker
 cancellation/exclusion proof and actual child-process recovery tests. No new
 runtime dependencies, row conversions or successful SQL support claims belong

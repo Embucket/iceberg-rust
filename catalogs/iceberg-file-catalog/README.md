@@ -1,5 +1,31 @@
 # File Catalog
 
+The scoped optional-read successor is **source preparation, uncompiled**. It is
+based on merged `63629472`. Its borrowed exists/list methods already exist in
+the separate `view_rename.rs` impl and remain byte-unchanged. An initial source
+review inspected only the `prepared_pair.rs` impl and incorrectly inferred they
+were absent; that claim was retracted before compilation. A separate suspected
+ordinary-rename lock recursion was also disproved by the full Memory-only gate
+and direct memory lookup dispatch. Ordinary rename is byte-unchanged and no
+native test failure was observed. Historical checks do not qualify this successor.
+
+`FileCatalogReadScope::load_if_present` adds a stronger Unix-filesystem API for
+one exact plain physical endpoint. `None` requires no-follow leaf absence under
+a live nonsymlink namespace with unchanged physical identity. An existing leaf
+must have a regular metadata directory/head and pass the existing native full
+loader. Corrupt/empty/dangling/symlink/file endpoints are errors; head selection
+is unchanged and no CatalogNotFound catch supplies absence. The reader remains
+held through native load and postchecks. Active legacy aliases, non-Unix or
+unsupported names refuse.
+Borrowed exists/list retain their previous metadata-lookup semantics and must not
+replace this proof. No native writer, SQL authorization, cache lifetime, hostile
+filesystem protection, account protocol or row conversion is added.
+
+Seven authored real-file controls cover complete View/Table kind preservation,
+physical absence, bad endpoints/heads/parents, unsafe names, unchanged catalog
+bytes and all three borrowed methods while a writer is queued. They remain
+UNCOMPILED; no test/native/Clippy or embedding-engine acceptance is claimed.
+
 The separate [local view rename](VIEW_RENAME.md) adds a default-Unsupported
 Catalog API and an explicit local FileCatalog publisher. Its 29 focused owning
 controls pass, including actual process-exit recovery and worker cancellation.
