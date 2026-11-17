@@ -40,6 +40,29 @@ async fn optional_scoped_read_keeps_real_table_kind_instead_of_inventing_absence
         return Err("native table kind must remain explicit".into());
     };
     assert_eq!(actual.metadata(), table.metadata());
+    drop(scope);
+    // A private fault image, not a claim that persistent native rename is
+    // supported. Ordinary rename admits Memory only at this exact base.
+    let alias = Identifier::new(&namespace, "T_ALIAS");
+    fixture
+        .catalog
+        .renamed_tables
+        .write()
+        .map_err(|_| "alias lock")?
+        .insert(alias.clone(), table.identifier().clone());
+    let scope = fixture.catalog.read_scope().await?;
+    assert!(
+        scope.tabular_exists(&alias).await?,
+        "existing weak lookup follows alias"
+    );
+    assert!(
+        scope.load_if_present(&alias).await.is_err(),
+        "physical absence must not hide a logical alias"
+    );
+    assert!(
+        scope.load_if_present(&fixture.destination).await.is_err(),
+        "conservative active-alias refusal"
+    );
     Ok(())
 }
 
