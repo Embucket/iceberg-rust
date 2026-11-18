@@ -42,6 +42,9 @@ use self::tabular::Tabular;
 pub mod commit;
 pub mod create;
 pub mod tabular;
+mod view_rename;
+
+pub use view_rename::ExistingViewPropertyReplacement;
 
 /// A trait representing an Iceberg catalog that manages tables, views, and namespaces.
 ///
@@ -240,6 +243,24 @@ pub trait Catalog: Send + Sync + Debug {
         _expected: &ViewMetadata,
     ) -> Result<View, Error> {
         Err(Error::NotSupported("checked view rename".to_string()))
+    }
+    /// Rename the full authorized predecessor and replace one existing property
+    /// in that same durable decision. The successor is computed by the catalog;
+    /// callers cannot supply arbitrary metadata or a mutation callback.
+    ///
+    /// A mismatch must refuse before effects, with no unchecked/location-only
+    /// fallback or later property update. Other catalogs remain Unsupported.
+    /// Property semantics and SQL authorization belong to the embedding owner.
+    async fn rename_view_from_metadata_with_property(
+        self: Arc<Self>,
+        _source: &Identifier,
+        _destination: &Identifier,
+        _expected: &ViewMetadata,
+        _replacement: ExistingViewPropertyReplacement,
+    ) -> Result<View, Error> {
+        Err(Error::NotSupported(
+            "checked view rename with existing property replacement".to_string(),
+        ))
     }
     /// Drops a view from the catalog and deletes its metadata.
     ///

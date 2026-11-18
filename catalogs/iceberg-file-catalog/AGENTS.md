@@ -1,5 +1,14 @@
 # File Catalog Guidance
 
+- The explicit V3 existing-property rename is source-only until its own native
+  qualification. Keep V2 location-only encodings and callers unchanged. A V3
+  successor is derived from the full captured Before, destination and exactly
+  one existing bounded property replacement; never accept a caller-supplied
+  full After, mutation callback or postcommit property write. Decode the exact
+  version/kind and descriptor before recovery effects; unknown records fence.
+  Native property strings supply no SQL rights or marker interpretation. The
+  embedding owner must separately prove its selected key and replacement.
+
 - [Local view rename](VIEW_RENAME.md) is a bounded source candidate.
   Preserve full typed/raw history, UUID and opaque creator markers; never adapt
   the table relocation's UUID-reset/current-snapshot semantics. Its owned

@@ -138,6 +138,12 @@ fn property_replacement_refuses_unbounded_or_ambiguous_descriptions() {
         "after\n\t".into()
     )
     .is_ok());
+    assert!(ExistingViewPropertyReplacement::try_new(
+        "x".repeat(255),
+        "a".repeat(65_536),
+        "b".repeat(65_536)
+    )
+    .is_ok());
 }
 
 #[tokio::test]
@@ -196,6 +202,54 @@ async fn property_preparation_rejects_wrong_full_before_key_and_value_without_ef
 }
 
 #[tokio::test]
+async fn checked_property_rename_rejects_an_actual_intervening_update_from_a_warm_image(
+) -> TestResult {
+    let fixture = Fixture::new().await?;
+    let old = fixture.view.metadata().clone();
+    let peer = fresh(&fixture).await?;
+    let Tabular::View(mut view) = Arc::clone(&peer)
+        .load_tabular(fixture.view.identifier())
+        .await?
+    else {
+        return Err("peer view".into());
+    };
+    view.new_transaction(None)
+        .update_properties(vec![("unrelated".into(), "actual-new-value".into())])
+        .commit()
+        .await?;
+    assert_eq!(view.metadata().view_uuid, old.view_uuid);
+    let original = files(fixture.root.path())?;
+    let catalog: Arc<dyn Catalog> = Arc::clone(&fixture.catalog) as Arc<dyn Catalog>;
+    assert!(matches!(
+        catalog
+            .rename_view_from_metadata_with_property(
+                fixture.view.identifier(),
+                &fixture.destination,
+                &old,
+                replacement()?
+            )
+            .await,
+        Err(IcebergError::CommitConflict(_))
+    ));
+    assert_eq!(files(fixture.root.path())?, original);
+    assert!(fixture.catalog.read_scope().await.is_ok());
+    let memory: Arc<dyn Catalog> =
+        Arc::new(FileCatalog::new("memory://catalog", ObjectStoreBuilder::memory()).await?);
+    assert!(matches!(
+        memory
+            .rename_view_from_metadata_with_property(
+                fixture.view.identifier(),
+                &fixture.destination,
+                &old,
+                replacement()?
+            )
+            .await,
+        Err(IcebergError::NotSupported(_))
+    ));
+    Ok(())
+}
+
+#[tokio::test]
 async fn v3_descriptor_binds_exact_edit_and_rejects_other_successor_changes() -> TestResult {
     let fixture = Fixture::new().await?;
     let p = prepared(&fixture).await?;
@@ -209,7 +263,7 @@ async fn v3_descriptor_binds_exact_edit_and_rejects_other_successor_changes() ->
     );
     assert!(is_record(&original)?);
     assert_eq!(decode(&p.root, &original)?.1.new, expected(&fixture));
-    for change in 0..10 {
+    for change in 0..13 {
         let mut mutated = encoded.clone();
         match change {
             0 => mutated["version"] = json!(4),
@@ -225,12 +279,16 @@ async fn v3_descriptor_binds_exact_edit_and_rejects_other_successor_changes() ->
             }
             6 => mutated["property_replacement"]["extra"] = json!(true),
             7 => mutated["version"] = json!(2),
-            8 | 9 => {
+            8..=12 => {
                 let mut image = expected(&fixture);
-                if change == 8 {
-                    image.view_uuid = Uuid::new_v4();
-                } else {
-                    image.properties.insert("unrelated".into(), "forged".into());
+                match change {
+                    8 => image.view_uuid = Uuid::new_v4(),
+                    9 => {
+                        image.properties.insert("unrelated".into(), "forged".into());
+                    }
+                    10 => image.schemas.clear(),
+                    11 => image.current_version_id += 1,
+                    _ => image.version_log.clear(),
                 }
                 mutated["new_json"] = json!(serde_json::to_string(&image)?);
             }
@@ -286,6 +344,32 @@ async fn v2_default_encoder_and_location_only_semantics_remain_exact() -> TestRe
         view.metadata().properties,
         fixture.view.metadata().properties
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn terminal_v3_allows_a_later_location_only_v2_without_undoing_the_edit() -> TestResult {
+    let fixture = Fixture::new().await?;
+    prepared(&fixture).await?.publish().await?;
+    let next = Identifier::new(fixture.destination.namespace(), "RV3");
+    let p = fixture
+        .catalog
+        .prepare_view_rename(&fixture.destination, &next)
+        .await?;
+    let mut image = expected(&fixture);
+    image.location.truncate(image.location.len() - 1);
+    image.location.push('3');
+    let bytes = p.plan.encode(&p.root, "commit")?;
+    let value: Value = serde_json::from_slice(&bytes)?;
+    assert_eq!(value["version"], 2);
+    assert_eq!(value["kind"], "view-rename");
+    assert!(value.get("property_replacement").is_none());
+    p.publish().await?;
+    let reopened = fresh(&fixture).await?;
+    let Tabular::View(view) = reopened.load_tabular(&next).await? else {
+        return Err("second rename view".into());
+    };
+    assert_eq!(view.metadata(), &image);
     Ok(())
 }
 
@@ -392,5 +476,136 @@ async fn property_waiter_cancellation_retains_actual_worker_and_fences_lost_resp
         .is_err());
     fixture.catalog.recover_append_pair().await?;
     destination(&fixture, &fresh(&fixture).await?).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn pending_property_recovery_refuses_changed_descriptor_or_successor_before_cleanup(
+) -> TestResult {
+    for change in 0..4 {
+        let fixture = Fixture::new().await?;
+        let mut p = prepared(&fixture).await?;
+        let root = fixture.catalog.pair_root()?;
+        let paths = p.plan.places(&root)?;
+        p.hook = Some(fail(TestStage::AfterDecision));
+        assert_eq!(
+            p.publish().await.expect_err("decided fault").outcome,
+            PairOutcome::CommittedNeedsRecovery
+        );
+        let journal = root.read(&root.file(JOURNAL), MAX_JOURNAL)?;
+        let original = files(&root.path)?;
+        let mut value: Value = serde_json::from_slice(&journal)?;
+        match change {
+            0 => value["version"] = json!(4),
+            1 => value["kind"] = json!("unknown"),
+            2 => value["property_replacement"]["replacement"] = json!("forged"),
+            _ => {
+                let mut image = expected(&fixture);
+                image.properties.insert("unrelated".into(), "forged".into());
+                value["new_json"] = json!(serde_json::to_string(&image)?);
+            }
+        }
+        let corrupt = serde_json::to_vec(&value)?;
+        std::fs::write(root.file(JOURNAL), &corrupt)?;
+        let changed = files(&root.path)?;
+        assert!(fixture.catalog.recover_append_pair().await.is_err());
+        assert!(fresh(&fixture).await.is_err());
+        assert_eq!(
+            files(&root.path)?,
+            changed,
+            "no evidence cleanup on refusal"
+        );
+        assert!(missing(&paths.destination)?);
+        assert_eq!(root.read(&root.file(JOURNAL), MAX_JOURNAL)?, corrupt);
+        std::fs::write(root.file(JOURNAL), journal)?;
+        assert_eq!(files(&root.path)?, original);
+        fixture.catalog.recover_append_pair().await?;
+        destination(&fixture, &fresh(&fixture).await?).await?;
+    }
+    Ok(())
+}
+
+// Inert under ordinary discovery. The parent invokes this exact test in a child
+// and terminates only from the actual blocking publisher's fault checkpoint.
+#[tokio::test]
+async fn view_property_crash_helper() -> TestResult {
+    let Some(root) = std::env::var_os("ICEBERG_VIEW_PROPERTY_TEST_ROOT") else {
+        return Ok(());
+    };
+    let catalog = Arc::new(
+        FileCatalog::new(
+            "file:///catalog",
+            ObjectStoreBuilder::filesystem(PathBuf::from(root)),
+        )
+        .await?,
+    );
+    let namespace = Namespace::try_new(&["APP".to_owned()])?;
+    let source = Identifier::new(&namespace, "RV");
+    let destination = Identifier::new(&namespace, "RV2");
+    let Tabular::View(view) = Arc::clone(&catalog).load_tabular(&source).await? else {
+        return Err("child source view".into());
+    };
+    let mut p = catalog
+        .prepare_view_rename_with_property(&source, &destination, view.metadata(), replacement()?)
+        .await?;
+    let stage = match std::env::var("ICEBERG_VIEW_PROPERTY_TEST_STAGE")?.as_str() {
+        "ready" => TestStage::BeforeDecision,
+        "decision" => TestStage::AfterDecision,
+        "destination" => TestStage::AfterFirstHead,
+        "retiring" => TestStage::AfterFirstSourceFile,
+        "retired" => TestStage::AfterSourceRetired,
+        _ => return Err("unknown child stage".into()),
+    };
+    p.hook = Some(Arc::new(TestHook {
+        stage,
+        fail: false,
+        crash: true,
+        pause: StdMutex::new(None),
+    }));
+    p.publish().await?;
+    Err("actual property publisher did not exit".into())
+}
+
+#[tokio::test]
+async fn property_process_exit_recovers_the_same_decision_and_edit_idempotently() -> TestResult {
+    for stage in ["ready", "decision", "destination", "retiring", "retired"] {
+        let fixture = Fixture::new().await?;
+        let mut child = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "prepared_pair::view_rename::property_tests::view_property_crash_helper",
+                "--nocapture",
+            ])
+            .env("ICEBERG_VIEW_PROPERTY_TEST_ROOT", fixture.root.path())
+            .env("ICEBERG_VIEW_PROPERTY_TEST_STAGE", stage)
+            .spawn()?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                child.kill()?;
+                child.wait()?;
+                return Err(format!("property publisher child timeout: {stage}").into());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(status.code(), Some(86), "{stage}");
+        let reopened = fresh(&fixture).await?;
+        for _ in 0..2 {
+            reopened.recover_append_pair().await?;
+            if stage == "ready" {
+                let scope = reopened.read_scope().await?;
+                assert!(!scope.tabular_exists(&fixture.destination).await?);
+                let Tabular::View(view) = scope.load(fixture.view.identifier()).await? else {
+                    return Err("source after ready recovery".into());
+                };
+                assert_eq!(view.metadata(), fixture.view.metadata());
+            } else {
+                destination(&fixture, &reopened).await?;
+            }
+        }
+    }
     Ok(())
 }

@@ -14,3 +14,11 @@ must compare the full typed predecessor under publication exclusion and must not
 fall back to unchecked rename. The bounded local implementation and its separate
 embedding ownership boundary are documented in
 [FileCatalog view rename](../catalogs/iceberg-file-catalog/VIEW_RENAME.md).
+
+The separate default-Unsupported
+`Catalog::rename_view_from_metadata_with_property` accepts the complete expected
+predecessor plus a private-fields, non-Clone `ExistingViewPropertyReplacement`.
+It describes exactly one existing bounded property replacement in the same
+namespace decision; it supplies no arbitrary full successor, callback or SQL
+authorization. The native FileCatalog V3 source candidate and pending checks are
+documented at the same link. Existing location-only callers retain V2 semantics.
