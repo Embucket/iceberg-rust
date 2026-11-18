@@ -999,3 +999,7 @@ impl RenameOwner {
 #[cfg(test)]
 #[path = "view_rename_fault_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "view_rename_property_tests.rs"]
+mod property_tests;
