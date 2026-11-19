@@ -1106,3 +1106,7 @@ mod tests;
 #[cfg(test)]
 #[path = "view_rename_property_tests.rs"]
 mod property_tests;
+
+#[cfg(test)]
+#[path = "view_rename_property_pair_tests.rs"]
+mod property_pair_tests;
