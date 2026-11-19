@@ -64,3 +64,34 @@ impl ExistingViewPropertyReplacement {
         &self.replacement
     }
 }
+
+/// Exactly two existing opaque property replacements in one checked rename.
+///
+/// The fixed array admits no insertion/removal or caller-supplied successor.
+/// Entries retain the single-replacement bounds and are stored in ascending key
+/// order. This description is not Clone, serializable, or an authorization token.
+#[derive(Debug)]
+pub struct ExistingViewPropertyPairReplacement {
+    replacements: [ExistingViewPropertyReplacement; 2],
+}
+
+impl ExistingViewPropertyPairReplacement {
+    /// Consume exactly two bounded descriptions with distinct canonical keys.
+    /// Input order is immaterial; duplicate keys are rejected rather than merged.
+    pub fn try_new(mut replacements: [ExistingViewPropertyReplacement; 2]) -> Result<Self, Error> {
+        if replacements[0].key == replacements[1].key {
+            return Err(Error::InvalidFormat(
+                "view rename requires exactly two distinct existing-property keys".into(),
+            ));
+        }
+        if replacements[0].key > replacements[1].key {
+            replacements.swap(0, 1);
+        }
+        Ok(Self { replacements })
+    }
+
+    /// The two immutable bounded descriptions, in strict ascending key order.
+    pub fn replacements(&self) -> &[ExistingViewPropertyReplacement; 2] {
+        &self.replacements
+    }
+}

@@ -364,7 +364,7 @@ async fn v4_pair_descriptor_refuses_noncanonical_malformed_or_extra_edits() -> T
     );
     assert!(is_record(&original)?);
     assert_eq!(decode(&p.root, &original)?.1.new, expected(&fixture));
-    for change in 0..35 {
+    for change in 0..39 {
         let mut mutated = encoded.clone();
         match change {
             0 => mutated["version"] = json!(5),
@@ -444,11 +444,32 @@ async fn v4_pair_descriptor_refuses_noncanonical_malformed_or_extra_edits() -> T
             31 => mutated["property_replacements"][0]["replacement"] = json!("bad\0value"),
             32 => mutated["property_replacements"][1] = encoded["property_replacements"][0].clone(),
             33 => mutated["property_replacements"][1] = json!("not-an-object"),
-            _ => {
+            34 => {
                 let mut image = expected(&fixture);
                 image.current_version_id += 1;
                 mutated["new_json"] = json!(serde_json::to_string(&image)?);
             }
+            35 => {
+                mutated["version"] = json!(2);
+                mutated["kind"] = json!("view-rename");
+            }
+            36 => {
+                mutated["version"] = json!(3);
+                mutated["kind"] = json!("view-rename-property");
+                mutated["property_replacement"] =
+                    json!({"key":KEY,"expected":BEFORE,"replacement":AFTER});
+            }
+            37 => {
+                let mut image = serde_json::to_value(expected(&fixture))?;
+                image["unexpected-native-field"] = json!(true);
+                mutated["new_json"] = json!(serde_json::to_string(&image)?);
+            }
+            38 => {
+                let mut old = serde_json::to_value(fixture.view.metadata())?;
+                old["unexpected-native-before-field"] = json!(true);
+                mutated["old_hex"] = json!(hex(&serde_json::to_vec(&old)?));
+            }
+            _ => unreachable!(),
         }
         assert_ne!(mutated, encoded, "change {change} must alter the record");
         assert!(
@@ -838,5 +859,62 @@ async fn pair_abandoned_queued_receipt_keeps_exact_two_edit_commit_healthy() -> 
     )
     .await??;
     destination(&fixture, &fresh(&fixture).await?).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn mixed_private_v3_v4_plan_refuses_without_publication() -> TestResult {
+    let fixture = Fixture::new().await?;
+    let original = files(fixture.root.path())?;
+    let mut p = prepared(&fixture).await?;
+    p.plan.property = Some(PropertyReplacement::from(source_edit(KEY, BEFORE, AFTER)?));
+    assert!(p.plan.places(&p.root).is_err());
+    assert!(decode(&p.root, &p.plan.encode(&p.root, "commit")?).is_err());
+    drop(p);
+    assert_eq!(files(fixture.root.path())?, original);
+    assert!(fixture.catalog.read_scope().await.is_ok());
+    Ok(())
+}
+
+#[tokio::test]
+async fn v4_raw_before_refuses_unmodeled_fields_but_accepts_json_whitespace() -> TestResult {
+    for unknown in [false, true] {
+        let fixture = Fixture::new().await?;
+        let original = fixture
+            .catalog
+            .prepare_view_rename(fixture.view.identifier(), &fixture.destination)
+            .await?;
+        let head = original.root.native(&original.plan.old_head)?;
+        let mut value: Value = serde_json::from_slice(&original.plan.old_bytes)?;
+        drop(original);
+        if unknown {
+            value["unexpected-native-before-field"] = json!(true);
+        }
+        let raw = serde_json::to_vec_pretty(&value)?;
+        std::fs::write(&head, &raw)?;
+        let before = files(fixture.root.path())?;
+        let result = fixture
+            .catalog
+            .prepare_view_rename_with_property_pair(
+                fixture.view.identifier(),
+                &fixture.destination,
+                fixture.view.metadata(),
+                replacement()?,
+            )
+            .await;
+        if unknown {
+            assert!(
+                result.is_err(),
+                "unknown Before fields must not disappear in V4 After"
+            );
+        } else {
+            let prepared = result?;
+            assert_eq!(prepared.plan.old_bytes, raw);
+            assert_eq!(prepared.source_metadata(), fixture.view.metadata());
+            drop(prepared);
+        }
+        assert_eq!(files(fixture.root.path())?, before);
+        assert!(fixture.catalog.read_scope().await.is_ok());
+    }
     Ok(())
 }

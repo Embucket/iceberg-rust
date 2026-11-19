@@ -117,3 +117,17 @@ An already-closed receiver fences; a queued receipt abandoned later can leave a
 coherent healthy commit. Do not infer cancel implies a fork fence or hold an
 acknowledgement wait against an idle retained future. Keep a deterministic
 queued-result cancellation control and describe this boundary to embedders.
+
+## Exactly two existing-property rename source
+
+The separate [V4 pair source](VIEW_RENAME_PROPERTY_PAIR.md) is uncompiled and
+unexecuted. Keep its public fixed-two description private, non-Clone and
+nonserialized. Derive the complete After from one captured full Before, location
+and exactly two distinct bounded existing-value replacements under the original
+writer. No callback, insertion/removal or later property commit is authority.
+Preserve V2/V3 encodings, old controls and their already-qualified source claims.
+V4 descriptors require exact length, ascending distinct keys, exact fields and
+full-image revalidation before recovery effects. Native strings interpret no SQL
+or clock: an embedding owner generates its clock once and retains that exact
+value through its own intent/recovery. Existing owner, history, drain, outcome,
+health and delivery boundaries are shared, not reimplemented.

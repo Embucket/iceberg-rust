@@ -275,3 +275,8 @@ test-only successor retains that same cloned Arc in `writer_catalog`; the future
 arguments, exclusion and final assertions are unchanged. The original failed
 compiler log remains retained. The subsequent owning tests and configured Clippy
 pass within the native-only scope recorded above.
+
+The separate [exact-two existing-property V4 source](VIEW_RENAME_PROPERTY_PAIR.md)
+is authored but uncompiled/unexecuted. Its fixed-array description and checked
+predecessor seam reuse the original owned publisher and recovery slot. Native V3
+qualification above does not qualify V4, an engine pin or SQL header/clock behavior.

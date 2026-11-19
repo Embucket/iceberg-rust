@@ -258,3 +258,10 @@ recorded independently on their final source trees.
 The two later peer-load controls are a tests/docs-only addition: all 29 focused
 controls and configured Clippy pass, while the full 82-test package receipt stays
 bound to unchanged production source `4d5a618d`.
+
+## Exactly two existing properties: V4 source only
+
+The separate [fixed-two V4 candidate](VIEW_RENAME_PROPERTY_PAIR.md) derives exactly
+two existing opaque value replacements in the same native rename decision. It is
+uncompiled/unexecuted and does not inherit the V3 qualification above. Old V2/V3
+APIs, journal bytes, controls and qualification records remain unchanged.
