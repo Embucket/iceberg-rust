@@ -1,5 +1,74 @@
 # Local view rename
 
+## One existing property: V3 source candidate
+
+Status: bounded native API qualified at code source `779e2ba9`, based on merged
+native `8ac7e285`. The [configured test job](https://github.com/Embucket/iceberg-rust/actions/runs/44613303413/job/135875252568)
+passes all six package steps. FileCatalog passes **103 tests, zero failures and
+one inherited ignored benchmark**, including all 41 rename test functions and
+all 12 added property test functions. The latter include one child helper that
+is inert in the ordinary root run; its real five-phase exit/recovery parent
+also passes. Nested child test summaries are excluded from the 103 count.
+The [configured lint job](https://github.com/Embucket/iceberg-rust/actions/runs/44613303413/job/135875252059)
+passes Rust 1.95 all-target/all-feature Clippy with warnings denied and workspace
+format checks. These results qualify the native API, not a Rustice consumer.
+
+Test-first checkpoint `607823ea` was authored without an observed RED run.
+The first implementation CI at `d486d72f` retains its 102-pass/one-failure/one-ignored
+result: a negative control cleared an already-empty version log. The test-only
+successor makes that mutation change the image and checks every corruption
+case for nonidentity before testing rejection. Production code is unchanged by
+that correction. Older qualification counts below retain their original scope.
+
+`ExistingViewPropertyReplacement::try_new(key, expected, replacement)` is a
+non-Clone, non-serialized untrusted description with private fields. It admits
+one 1..255-byte ASCII key (initial letter/underscore, then alphanumeric/underscore/
+hyphen/dot), two different nonempty UTF-8 values of at most 64 KiB each, and no
+NUL in either value. Newline/tab remain opaque value bytes. Missing keys, wrong
+old values, insertion/deletion and descriptions outside those bounds refuse.
+The primitive accepts no complete After image and no callback.
+
+The explicit object-safe
+`Catalog::rename_view_from_metadata_with_property(source, destination, expected,
+replacement)` defaults to Unsupported. FileCatalog's
+`prepare_view_rename_with_property` retains the original preparation writer and
+checks the entire actual typed predecessor against `expected` before controls,
+staging, destination or cache effects. It derives the successor from that Before
+by changing only location and the one declared existing value. Publication and
+recovery retain UUID, all schemas/versions/logs/representations and every other
+property. There is no second metadata commit after the name publication.
+
+The same original blocking publisher, root witness, exclusion, artifact history,
+outcome/health, receiver-delivery and exact redo protocol are reused. V3 records
+have exact kind `view-rename-property` and one strict three-string
+`property_replacement` descriptor, alongside the existing full old/new images.
+Decode rechecks the bounds, exact old property and computed full After before
+any recovery effect. Unknown versions/kinds/fields and inconsistent images
+refuse; they cannot be interpreted as absent legacy data. V2 location-only
+records retain their exact old field set, bytes and semantics; V1 pair records
+retain their original decoder. A valid terminal V3 record shares the same one
+required decision slot, and grants no authority over later ordinary writes.
+
+Native controls cover dynamic checked dispatch/full-image and raw
+history preservation/reopen, key/value bounds, full-Before and actual warmed
+predecessor changes, coherent descriptor/After corruption, V2 byte golden,
+five real publisher fault checkpoints, actual blocking cancellation and lost
+response, corrupt pending records with no evidence cleanup, and child process
+exit/repeated recovery at five phases. These controls pass in the source-bound
+run above. Existing default callers, old controls, ordinary update and runtime
+dependencies are unchanged.
+
+This generic metadata primitive interprets no SQL or opaque creator marker and
+grants no embedding rights. A future Rustice ALTER VIEW consumer must separately
+bind **only** its exact captured source-SQL property and prove the bounded
+CREATE-header-to-destination replacement from the actual original statement and
+view image. It must coordinate account, transaction, cache and SQL publication
+lifetimes before activation. ALTER TABLE-on-VIEW continues to select the
+location-only API. No engine pin, marker retirement, SQL support, workflow
+qualification or performance claim is made here.
+
+## Existing location-only qualification
+
 Status: bounded native source candidate; 29 focused owning controls pass.
 The first three owning tests compiled and produced actual RED (zero passes/three
 failures) on the Unsupported stub before implementation. On runtime source

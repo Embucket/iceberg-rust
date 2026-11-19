@@ -1,5 +1,16 @@
 # File Catalog Guidance
 
+- The explicit V3 existing-property rename has source-bound native qualification
+  at `779e2ba9`; see [the evidence](VIEW_RENAME.md#one-existing-property-v3-source-candidate).
+  Embedding SQL/account/cache qualification remains separate. Keep V2 encodings
+  and callers unchanged. A V3
+  successor is derived from the full captured Before, destination and exactly
+  one existing bounded property replacement; never accept a caller-supplied
+  full After, mutation callback or postcommit property write. Decode the exact
+  version/kind and descriptor before recovery effects; unknown records fence.
+  Native property strings supply no SQL rights or marker interpretation. The
+  embedding owner must separately prove its selected key and replacement.
+
 - [Local view rename](VIEW_RENAME.md) is a bounded source candidate.
   Preserve full typed/raw history, UUID and opaque creator markers; never adapt
   the table relocation's UUID-reset/current-snapshot semantics. Its owned

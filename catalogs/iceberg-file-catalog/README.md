@@ -1,5 +1,14 @@
 # File Catalog
 
+The [V3 existing-property view rename](VIEW_RENAME.md#one-existing-property-v3-source-candidate)
+is qualified for the bounded native API at code source `779e2ba9`, based on
+native `8ac7e285`: the owning package passes 103 tests, zero failures and one
+inherited ignored benchmark; configured Clippy, formatting and all six package
+test steps pass. Its evidence and original failed test control are linked in
+the V3 documentation. Rustice pin and SQL activation require separate embedding
+qualification. The original V2 location-only API keeps its exact journal encoding
+and semantics.
+
 The scoped optional-read successor is **qualified for the native file-catalog
 API** on source `3a706411`. Its seven new real-file controls pass; the complete
 owning package passes 91 tests, zero failures and one inherited ignored benchmark.
