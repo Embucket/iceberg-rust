@@ -1,11 +1,13 @@
 # File Catalog
 
 The [V3 existing-property view rename](VIEW_RENAME.md#one-existing-property-v3-source-candidate)
-is a separate **uncompiled source candidate** based on native `8ac7e285`.
-Its authored native controls and property/name atomicity are not qualified by
-the historical test receipts below. No Rustice pin, SQL activation or support
-claim follows from this source preparation. The original V2 location-only API
-keeps its exact journal encoding and semantics.
+is qualified for the bounded native API at code source `779e2ba9`, based on
+native `8ac7e285`: the owning package passes 103 tests, zero failures and one
+inherited ignored benchmark; configured Clippy, formatting and all six package
+test steps pass. Its evidence and original failed test control are linked in
+the V3 documentation. Rustice pin and SQL activation require separate embedding
+qualification. The original V2 location-only API keeps its exact journal encoding
+and semantics.
 
 The scoped optional-read successor is **qualified for the native file-catalog
 API** on source `3a706411`. Its seven new real-file controls pass; the complete

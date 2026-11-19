@@ -1,7 +1,9 @@
 # File Catalog Guidance
 
-- The explicit V3 existing-property rename is source-only until its own native
-  qualification. Keep V2 location-only encodings and callers unchanged. A V3
+- The explicit V3 existing-property rename has source-bound native qualification
+  at `779e2ba9`; see [the evidence](VIEW_RENAME.md#one-existing-property-v3-source-candidate).
+  Embedding SQL/account/cache qualification remains separate. Keep V2 encodings
+  and callers unchanged. A V3
   successor is derived from the full captured Before, destination and exactly
   one existing bounded property replacement; never accept a caller-supplied
   full After, mutation callback or postcommit property write. Decode the exact

@@ -20,5 +20,6 @@ The separate default-Unsupported
 predecessor plus a private-fields, non-Clone `ExistingViewPropertyReplacement`.
 It describes exactly one existing bounded property replacement in the same
 namespace decision; it supplies no arbitrary full successor, callback or SQL
-authorization. The native FileCatalog V3 source candidate and pending checks are
-documented at the same link. Existing location-only callers retain V2 semantics.
+authorization. The bounded native FileCatalog V3 implementation and source-bound
+CI qualification are documented at the same link. Existing location-only callers
+retain V2 semantics; embedding SQL activation requires its own qualification.

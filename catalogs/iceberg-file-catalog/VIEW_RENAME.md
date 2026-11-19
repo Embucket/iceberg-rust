@@ -2,10 +2,23 @@
 
 ## One existing property: V3 source candidate
 
-Status: authored source only, **uncompiled and unexecuted**, based on exact merged
-native `8ac7e285`. Test-first checkpoint `607823ea` precedes the new API. It is not
-an observed RED: no compiler or test process has run on that checkpoint. All
-existing qualification counts below remain bound to their original sources.
+Status: bounded native API qualified at code source `779e2ba9`, based on merged
+native `8ac7e285`. The [configured test job](https://github.com/Embucket/iceberg-rust/actions/runs/44613303413/job/135875252568)
+passes all six package steps. FileCatalog passes **103 tests, zero failures and
+one inherited ignored benchmark**, including all 41 rename test functions and
+all 12 added property test functions. The latter include one child helper that
+is inert in the ordinary root run; its real five-phase exit/recovery parent
+also passes. Nested child test summaries are excluded from the 103 count.
+The [configured lint job](https://github.com/Embucket/iceberg-rust/actions/runs/44613303413/job/135875252059)
+passes Rust 1.95 all-target/all-feature Clippy with warnings denied and workspace
+format checks. These results qualify the native API, not a Rustice consumer.
+
+Test-first checkpoint `607823ea` was authored without an observed RED run.
+The first implementation CI at `d486d72f` retains its 102-pass/one-failure/one-ignored
+result: a negative control cleared an already-empty version log. The test-only
+successor makes that mutation change the image and checks every corruption
+case for nonidentity before testing rejection. Production code is unchanged by
+that correction. Older qualification counts below retain their original scope.
 
 `ExistingViewPropertyReplacement::try_new(key, expected, replacement)` is a
 non-Clone, non-serialized untrusted description with private fields. It admits
@@ -36,14 +49,14 @@ records retain their exact old field set, bytes and semantics; V1 pair records
 retain their original decoder. A valid terminal V3 record shares the same one
 required decision slot, and grants no authority over later ordinary writes.
 
-Authored native controls cover dynamic checked dispatch/full-image and raw
+Native controls cover dynamic checked dispatch/full-image and raw
 history preservation/reopen, key/value bounds, full-Before and actual warmed
 predecessor changes, coherent descriptor/After corruption, V2 byte golden,
 five real publisher fault checkpoints, actual blocking cancellation and lost
 response, corrupt pending records with no evidence cleanup, and child process
-exit/repeated recovery at five phases. They are pending native compilation,
-focused/full owning execution and configured static checks. Existing default
-callers, old controls, ordinary update and runtime dependencies are unchanged.
+exit/repeated recovery at five phases. These controls pass in the source-bound
+run above. Existing default callers, old controls, ordinary update and runtime
+dependencies are unchanged.
 
 This generic metadata primitive interprets no SQL or opaque creator marker and
 grants no embedding rights. A future Rustice ALTER VIEW consumer must separately
