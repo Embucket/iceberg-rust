@@ -111,6 +111,34 @@ fn decode_property_pair(value: &Value) -> Result<PropertyPairReplacement, Iceber
     Ok(ExistingViewPropertyPairReplacement::try_new(replacements)?.into())
 }
 
+// The native wire representation uses arrays for these two ID-keyed maps, but
+// ViewMetadata reconstructs them as HashMaps. Only their member order is
+// immaterial. Keep every complete object and every other array unchanged.
+fn v4_exact_native_json(bytes: &[u8], metadata: &ViewMetadata) -> Result<bool, IcebergError> {
+    let mut actual: Value = serde_json::from_slice(bytes)?;
+    let mut expected = serde_json::to_value(metadata)?;
+    for value in [&mut actual, &mut expected] {
+        for (field, id) in [("versions", "version-id"), ("schemas", "schema-id")] {
+            let entries = value
+                .get_mut(field)
+                .and_then(Value::as_array_mut)
+                .ok_or_else(|| refusal("V4 native ID-keyed array is missing or non-array"))?;
+            let mut indexed = std::collections::BTreeMap::new();
+            for entry in std::mem::take(entries) {
+                let key = entry
+                    .get(id)
+                    .and_then(Value::as_i64)
+                    .ok_or_else(|| refusal("V4 native map entry requires an integral ID"))?;
+                if indexed.insert(key, entry).is_some() {
+                    return Err(refusal("V4 native map contains a duplicate ID"));
+                }
+            }
+            *entries = indexed.into_values().collect();
+        }
+    }
+    Ok(actual == expected)
+}
+
 #[derive(Clone)]
 struct RenamePlan {
     operation: Uuid,
@@ -189,16 +217,12 @@ impl RenamePlan {
         if let Some(pair) = &self.property_pair {
             pair.apply(&mut expected)?;
         }
-        if self.property_pair.is_some()
-            && serde_json::from_slice::<Value>(&self.old_bytes)? != serde_json::to_value(&self.old)?
-        {
+        if self.property_pair.is_some() && !v4_exact_native_json(&self.old_bytes, &self.old)? {
             return Err(refusal(
                 "V4 predecessor JSON must contain exactly the full typed native image",
             ));
         }
-        if self.property_pair.is_some()
-            && serde_json::from_slice::<Value>(&self.new_bytes)? != serde_json::to_value(&expected)?
-        {
+        if self.property_pair.is_some() && !v4_exact_native_json(&self.new_bytes, &expected)? {
             return Err(refusal(
                 "V4 successor JSON must contain exactly the derived full native image",
             ));

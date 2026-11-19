@@ -59,3 +59,26 @@ untouched. V2/V3 retain their previous accepted forms and exact descriptor rules
 A new real-file control requires unknown-raw-Before refusal without effects and
 acceptance of pretty-printed equivalent Before JSON. Actual compilation/results
 remain pending; this scope is documented rather than assumed legacy support.
+
+## Causal source correction: ID-keyed native arrays
+
+The initial `13c1290c` raw-JSON guard missed an existing native representation
+property: `versions` and `schemas` deserialize to HashMaps and serialize using
+unsorted `into_values()`. A fresh native capture can therefore reorder their
+arrays without changing any metadata. The initial source/CI outcome is preserved;
+that source is not eligible for merge even if a particular random ordering passes.
+
+The separate causal source compares these two top-level arrays by integral
+`version-id` and `schema-id` only. Missing, nonintegral or duplicate IDs refuse.
+Whole entries and unknown fields remain in the comparison; there is no general
+JSON sorting or projection. All other arrays, especially chronological
+`version-log`, schema field order and representation order, remain exact. Old
+V2/V3 handling and the fixed-two public API do not change.
+
+Four additional test-first controls build at least three versions, two schemas
+and two chronological log entries. They force all four array-order combinations
+for raw Before and successor JSON, refuse ambiguous IDs without effects, retain
+nested/top-level unknown-field refusals and require a genuine log reversal to
+refuse. They are authored but uncompiled/unexecuted locally. These four extend the
+original fifteen-function source cohort; remote CI and qualification remain
+pending independent review. No native or engine result is inferred here.

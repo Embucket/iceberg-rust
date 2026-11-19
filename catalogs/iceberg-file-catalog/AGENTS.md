@@ -131,3 +131,10 @@ full-image revalidation before recovery effects. Native strings interpret no SQL
 or clock: an embedding owner generates its clock once and retains that exact
 value through its own intent/recovery. Existing owner, history, drain, outcome,
 health and delivery boundaries are shared, not reimplemented.
+
+V4 full raw-image comparisons treat only top-level `versions`/`version-id` and
+`schemas`/`schema-id` as identity-keyed maps. Reject ambiguous IDs, retain complete
+entry objects and unknown fields, and preserve order for every other array. The
+native serde conversions use HashMaps, so reserialized array order is not a
+creator-identity requirement. Keep this exception V4-only; do not change V2/V3 or
+introduce a general normalization of native metadata.
