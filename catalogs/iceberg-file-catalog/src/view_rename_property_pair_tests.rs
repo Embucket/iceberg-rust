@@ -918,3 +918,6 @@ async fn v4_raw_before_refuses_unmodeled_fields_but_accepts_json_whitespace() ->
     }
     Ok(())
 }
+
+#[path = "view_rename_property_pair_order_tests.rs"]
+mod id_order_tests;
