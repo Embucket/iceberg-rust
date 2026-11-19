@@ -288,12 +288,18 @@ async fn v3_descriptor_binds_exact_edit_and_rejects_other_successor_changes() ->
                     }
                     10 => image.schemas.clear(),
                     11 => image.current_version_id += 1,
-                    _ => image.version_log.clear(),
+                    _ => image.version_log.push(
+                        iceberg_rust::spec::view_metadata::VersionLogStruct {
+                            timestamp_ms: 0,
+                            version_id: image.current_version_id,
+                        },
+                    ),
                 }
                 mutated["new_json"] = json!(serde_json::to_string(&image)?);
             }
             _ => unreachable!(),
         }
+        assert_ne!(mutated, encoded, "change {change} must alter the record");
         assert!(
             decode(&p.root, &serde_json::to_vec(&mutated)?).is_err(),
             "change {change}"
