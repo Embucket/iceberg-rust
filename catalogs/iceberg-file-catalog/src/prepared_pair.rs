@@ -316,6 +316,15 @@ pub struct FileCatalogReadScope {
 }
 
 impl FileCatalogReadScope {
+    /// Read-only validation of the base/view pair under this catalog's guard.
+    /// A subsequent publication still resolves and verifies both native heads.
+    pub async fn validate_view_tracking_with_base(
+        &self,
+        change: table_view_tracking::TrackingChange<'_>,
+    ) -> Result<(), IcebergError> {
+        self.catalog.validate_tracking_under_scope(change).await
+    }
+
     pub async fn load(&self, identifier: &Identifier) -> Result<Tabular, IcebergError> {
         self.catalog.check_pair_health()?;
         Arc::clone(&self.catalog)

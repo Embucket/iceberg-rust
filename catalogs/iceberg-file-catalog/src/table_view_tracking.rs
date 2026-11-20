@@ -7,9 +7,9 @@ use iceberg_rust::spec::view_metadata::ViewMetadata;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    control_exists, hex, io, parse_version, refusal, unhex, Arc, Cache, FileCatalog, IcebergError,
-    Identifier, NativeRoot, ObjectStoreBuilder, Ordering, PathBuf, Tabular, Uuid, FENCED, HEALTHY,
-    MAX_JOURNAL, MAX_METADATA, PENDING,
+    Arc, Cache, FENCED, FileCatalog, HEALTHY, IcebergError, Identifier, MAX_JOURNAL, MAX_METADATA,
+    NativeRoot, ObjectStoreBuilder, Ordering, PENDING, PathBuf, Tabular, Uuid, control_exists, hex,
+    io, parse_version, refusal, unhex,
 };
 
 const TRACKING_KEY: &str = "embucket.sql.change-tracking.v1";
@@ -323,13 +323,47 @@ pub(super) fn recover(root: &NativeRoot, cache: &Cache) -> Result<(), IcebergErr
     }
 }
 
+struct PreparedTracking {
+    root: NativeRoot,
+    decision: Decision,
+    table_location: String,
+    table_uuid: Uuid,
+    view_location: String,
+}
+
+impl PreparedTracking {
+    fn require_idle(&self) -> Result<(), IcebergError> {
+        match Control::read(&self.root)? {
+            None => Ok(()),
+            Some(Control {
+                state: TrackingState::Idle,
+                ..
+            }) => witness(&self.root, false),
+            Some(_) => Err(refusal(
+                "Tracking root requires recovery before publication",
+            )),
+        }
+    }
+
+    fn validate_heads(&self) -> Result<(), IcebergError> {
+        self.decision.table.check(
+            &self.root,
+            &self.table_location,
+            Some(self.table_uuid),
+            false,
+        )?;
+        self.decision
+            .view
+            .check(&self.root, &self.view_location, None, false)?;
+        Ok(())
+    }
+}
+
 impl FileCatalog {
-    /// Publish the table tracking flag and one existing view-option edit in one
-    /// durable decision. Recovery completes either acknowledged metadata head.
-    pub async fn enable_view_tracking_with_base(
+    async fn prepare_tracking_under_scope(
         self: &Arc<Self>,
         change: TrackingChange<'_>,
-    ) -> Result<(), IcebergError> {
+    ) -> Result<PreparedTracking, IcebergError> {
         if !matches!(self.object_store, ObjectStoreBuilder::Filesystem(_))
             || change.table_id.namespace().len() != 1
             || change.view_id.namespace().len() != 1
@@ -340,7 +374,6 @@ impl FileCatalog {
                 "Tracking publication requires distinct native objects in one local namespace",
             ));
         }
-        let lock = self.catalog_mutation_lock().write_owned().await;
         self.check_pair_health()?;
         let root = self.pair_root()?;
         let Tabular::Table(table) = Arc::clone(self)
@@ -391,33 +424,45 @@ impl FileCatalog {
             expected_view_options: change.view_edit.expected().to_owned(),
             replacement_view_options: change.view_edit.replacement().to_owned(),
         };
+        Ok(PreparedTracking {
+            root,
+            decision,
+            table_location: table_after.location,
+            table_uuid: table_after.table_uuid,
+            view_location: view_after.location,
+        })
+    }
+
+    pub(super) async fn validate_tracking_under_scope(
+        self: &Arc<Self>,
+        change: TrackingChange<'_>,
+    ) -> Result<(), IcebergError> {
+        let prepared = self.prepare_tracking_under_scope(change).await?;
+        tokio::task::spawn_blocking(move || {
+            prepared.require_idle()?;
+            prepared.validate_heads()
+        })
+        .await
+        .map_err(io)?
+    }
+
+    /// Publish the table tracking flag and one existing view-option edit in one
+    /// durable decision. Recovery completes either acknowledged metadata head.
+    pub async fn enable_view_tracking_with_base(
+        self: &Arc<Self>,
+        change: TrackingChange<'_>,
+    ) -> Result<(), IcebergError> {
+        let lock = self.catalog_mutation_lock().write_owned().await;
+        let prepared = self.prepare_tracking_under_scope(change).await?;
         let catalog = Arc::clone(self);
         tokio::task::spawn_blocking(move || {
             let _lock = lock;
-            let known_idle = match Control::read(&root) {
-                Ok(None) => Ok(()),
-                Ok(Some(Control {
-                    state: TrackingState::Idle,
-                    ..
-                })) => witness(&root, false),
-                Ok(Some(_)) => Err(refusal(
-                    "Tracking root requires recovery before publication",
-                )),
-                Err(error) => Err(error),
-            };
-            if let Err(error) = known_idle {
+            if let Err(error) = prepared.require_idle() {
                 catalog.pair_state.0.store(FENCED, Ordering::Release);
                 return Err(error);
             }
-            decision.table.check(
-                &root,
-                &table_after.location,
-                Some(table_after.table_uuid),
-                false,
-            )?;
-            decision
-                .view
-                .check(&root, &view_after.location, None, false)?;
+            prepared.validate_heads()?;
+            let PreparedTracking { root, decision, .. } = prepared;
             catalog.pair_state.0.store(PENDING, Ordering::Release);
             let result = (|| {
                 let state = TrackingState::Decided {
@@ -445,7 +490,7 @@ impl FileCatalog {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iceberg_rust::catalog::{create::CreateTableBuilder, namespace::Namespace, Catalog};
+    use iceberg_rust::catalog::{Catalog, create::CreateTableBuilder, namespace::Namespace};
     use iceberg_rust::spec::schema::Schema;
     use iceberg_rust::spec::types::{PrimitiveType, StructField, Type};
     use iceberg_rust::spec::view_metadata::{Version, ViewRepresentation};
@@ -560,8 +605,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tracking_publication_preserves_both_native_predecessors_except_expected_properties(
-    ) -> TestResult {
+    async fn tracking_publication_preserves_both_native_predecessors_except_expected_properties()
+    -> TestResult {
         let fixture = Fixture::new().await?;
         let base = fixture.table.metadata().clone();
         let view = fixture.view.metadata().clone();
@@ -575,11 +620,24 @@ mod tests {
             table_altered_at_ms: fixture.clock(),
             view_edit: edit,
         };
-        assert!(fixture
-            .catalog
-            .enable_view_tracking_with_base(operation(Fixture::edit("stale")?))
-            .await
-            .is_err());
+        let reader = fixture.catalog.read_scope().await?;
+        reader
+            .validate_view_tracking_with_base(operation(Fixture::edit(BEFORE)?))
+            .await?;
+        assert!(
+            reader
+                .validate_view_tracking_with_base(operation(Fixture::edit("stale")?))
+                .await
+                .is_err()
+        );
+        drop(reader);
+        assert!(
+            fixture
+                .catalog
+                .enable_view_tracking_with_base(operation(Fixture::edit("stale")?))
+                .await
+                .is_err()
+        );
         assert_eq!(
             Fixture::read(&fixture.catalog, table_id, view_id).await?,
             (base.clone(), view.clone())
