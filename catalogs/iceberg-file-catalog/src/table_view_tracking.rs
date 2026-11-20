@@ -12,6 +12,9 @@ use super::{
     MAX_JOURNAL, MAX_METADATA, PENDING,
 };
 
+#[path = "table_view_tracking_create.rs"]
+pub mod create;
+
 const TRACKING_KEY: &str = "embucket.sql.change-tracking.v1";
 const ALTERED_KEY: &str = "embucket.sql.change-tracking-altered-ms.v1";
 const MAX_HEAD_FILES: usize = 4096;
@@ -223,7 +226,12 @@ struct Decision {
 #[serde(tag = "phase", rename_all = "snake_case", deny_unknown_fields)]
 enum TrackingState {
     Idle {},
-    Decided { decision: Box<Decision> },
+    Decided {
+        decision: Box<Decision>,
+    },
+    Creating {
+        decision: Box<create::CreateDecision>,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -258,6 +266,19 @@ impl Control {
             ));
         }
         Ok(Some(value))
+    }
+
+    fn require_idle(root: &NativeRoot) -> Result<(), IcebergError> {
+        match Self::read(root)? {
+            None => Ok(()),
+            Some(Self {
+                state: TrackingState::Idle {},
+                ..
+            }) => witness(root, false),
+            Some(_) => Err(refusal(
+                "Tracking root requires recovery before publication",
+            )),
+        }
     }
 
     fn write(&self, root: &NativeRoot) -> Result<(), IcebergError> {
@@ -335,6 +356,10 @@ pub(super) fn recover(root: &NativeRoot, cache: &Cache) -> Result<(), IcebergErr
             witness(root, true)?;
             decision.install(root, cache)
         }
+        Some(TrackingState::Creating { decision }) => {
+            witness(root, true)?;
+            decision.install(root, cache)
+        }
     }
 }
 
@@ -347,19 +372,6 @@ struct PreparedTracking {
 }
 
 impl PreparedTracking {
-    fn require_idle(&self) -> Result<(), IcebergError> {
-        match Control::read(&self.root)? {
-            None => Ok(()),
-            Some(Control {
-                state: TrackingState::Idle {},
-                ..
-            }) => witness(&self.root, false),
-            Some(_) => Err(refusal(
-                "Tracking root requires recovery before publication",
-            )),
-        }
-    }
-
     fn validate_heads(&self) -> Result<(), IcebergError> {
         self.decision.table.check(
             &self.root,
@@ -454,7 +466,7 @@ impl FileCatalog {
     ) -> Result<(), IcebergError> {
         let prepared = self.prepare_tracking_under_scope(change).await?;
         tokio::task::spawn_blocking(move || {
-            prepared.require_idle()?;
+            Control::require_idle(&prepared.root)?;
             prepared.validate_heads()
         })
         .await
@@ -472,7 +484,7 @@ impl FileCatalog {
         let catalog = Arc::clone(self);
         tokio::task::spawn_blocking(move || {
             let _lock = lock;
-            if let Err(error) = prepared.require_idle() {
+            if let Err(error) = Control::require_idle(&prepared.root) {
                 catalog.pair_state.0.store(FENCED, Ordering::Release);
                 return Err(error);
             }
