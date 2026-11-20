@@ -822,7 +822,7 @@ mod tests {
                     "SELECT ID FROM APP.BASE",
                     Some("snowflake"),
                 ))
-                .with_default_namespace(vec!["APP".into()])
+                .default_namespace(vec!["APP".into()])
                 .build()?,
             properties: [
                 ("embucket.sql.view-managed.v1".to_owned(), "true".to_owned()),
