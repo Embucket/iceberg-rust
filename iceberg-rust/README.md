@@ -23,3 +23,14 @@ namespace decision; it supplies no arbitrary full successor, callback or SQL
 authorization. The bounded native FileCatalog V3 implementation and source-bound
 CI qualification are documented at the same link. Existing location-only callers
 retain V2 semantics; embedding SQL activation requires its own qualification.
+
+`ExistingViewPropertyPairReplacement::try_new([single_a, single_b])` is the separate
+fixed-two bounded description for `rename_view_from_metadata_with_property_pair`.
+The new object-safe method defaults to Unsupported. Both keys must already exist
+with exact old values under full-predecessor validation; no arbitrary After,
+callback or postcommit metadata update is accepted. The V4 FileCatalog source is
+[documented separately](../catalogs/iceberg-file-catalog/VIEW_RENAME_PROPERTY_PAIR.md)
+with source-bound `9cc1c57d` configured native qualification: all 19 new controls,
+full FileCatalog 122 PASS / 0 FAIL / 1 ignored and configured 1.95 Clippy/fmt PASS.
+The original `13c1290c` guard failures remain retained. V2/V3 behavior and
+qualification stay separate, as do embedding SQL workflows and engine pins.

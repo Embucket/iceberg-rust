@@ -1,7 +1,7 @@
 //! Owned local view namespace publication, sharing the root's versioned decision slot.
 
 use super::*;
-use iceberg_rust::catalog::ExistingViewPropertyReplacement;
+use iceberg_rust::catalog::{ExistingViewPropertyPairReplacement, ExistingViewPropertyReplacement};
 use iceberg_rust::spec::view_metadata::ViewMetadata;
 
 const OWNER_FILE: &str = ".iceberg-view-rename-owner-v1";
@@ -43,6 +43,103 @@ impl PropertyReplacement {
 }
 
 #[derive(Clone)]
+struct PropertyPairReplacement {
+    replacements: [PropertyReplacement; 2],
+}
+
+impl From<ExistingViewPropertyPairReplacement> for PropertyPairReplacement {
+    fn from(value: ExistingViewPropertyPairReplacement) -> Self {
+        Self {
+            replacements: value
+                .replacements()
+                .each_ref()
+                .map(|item| PropertyReplacement {
+                    key: item.key().into(),
+                    expected: item.expected().into(),
+                    replacement: item.replacement().into(),
+                }),
+        }
+    }
+}
+
+impl PropertyPairReplacement {
+    fn apply(&self, metadata: &mut ViewMetadata) -> Result<(), IcebergError> {
+        if self.replacements[0].key >= self.replacements[1].key {
+            return Err(refusal(
+                "view rename property pair keys are not distinct canonical order",
+            ));
+        }
+        for replacement in &self.replacements {
+            replacement.apply(metadata)?;
+        }
+        Ok(())
+    }
+}
+
+fn decode_property_pair(value: &Value) -> Result<PropertyPairReplacement, IcebergError> {
+    let entries = value
+        .as_array()
+        .filter(|entries| entries.len() == 2)
+        .ok_or_else(|| refusal("view rename property pair requires exactly two descriptors"))?;
+    let one = |value: &Value| {
+        if value.as_object().is_none_or(|map| {
+            map.len() != 3
+                || ["key", "expected", "replacement"]
+                    .iter()
+                    .any(|key| !map.contains_key(*key))
+        }) {
+            return Err(refusal("invalid view rename property pair descriptor"));
+        }
+        let text = |key: &str| {
+            value[key]
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| refusal("non-text view rename property pair descriptor"))
+        };
+        ExistingViewPropertyReplacement::try_new(
+            text("key")?,
+            text("expected")?,
+            text("replacement")?,
+        )
+    };
+    let replacements = [one(&entries[0])?, one(&entries[1])?];
+    if replacements[0].key() >= replacements[1].key() {
+        return Err(refusal(
+            "noncanonical or duplicate view rename property pair keys",
+        ));
+    }
+    Ok(ExistingViewPropertyPairReplacement::try_new(replacements)?.into())
+}
+
+// The native wire representation uses arrays for these two ID-keyed maps, but
+// ViewMetadata reconstructs them as HashMaps. Only their member order is
+// immaterial. Keep every complete object and every other array unchanged.
+fn v4_exact_native_json(bytes: &[u8], metadata: &ViewMetadata) -> Result<bool, IcebergError> {
+    let mut actual: Value = serde_json::from_slice(bytes)?;
+    let mut expected = serde_json::to_value(metadata)?;
+    for value in [&mut actual, &mut expected] {
+        for (field, id) in [("versions", "version-id"), ("schemas", "schema-id")] {
+            let entries = value
+                .get_mut(field)
+                .and_then(Value::as_array_mut)
+                .ok_or_else(|| refusal("V4 native ID-keyed array is missing or non-array"))?;
+            let mut indexed = std::collections::BTreeMap::new();
+            for entry in std::mem::take(entries) {
+                let key = entry
+                    .get(id)
+                    .and_then(Value::as_i64)
+                    .ok_or_else(|| refusal("V4 native map entry requires an integral ID"))?;
+                if indexed.insert(key, entry).is_some() {
+                    return Err(refusal("V4 native map contains a duplicate ID"));
+                }
+            }
+            *entries = indexed.into_values().collect();
+        }
+    }
+    Ok(actual == expected)
+}
+
+#[derive(Clone)]
 struct RenamePlan {
     operation: Uuid,
     source: Identifier,
@@ -56,6 +153,7 @@ struct RenamePlan {
     history: Vec<ArtifactReceipt>,
     old_owner: Option<Vec<u8>>,
     property: Option<PropertyReplacement>,
+    property_pair: Option<PropertyPairReplacement>,
 }
 
 struct Places {
@@ -108,10 +206,26 @@ impl RenamePlan {
         {
             return Err(refusal("view rename identity or owned location changed"));
         }
+        if self.property.is_some() && self.property_pair.is_some() {
+            return Err(refusal("view rename cannot combine V3 and V4 descriptors"));
+        }
         let mut expected = self.old.clone();
         expected.location = self.new.location.clone();
         if let Some(property) = &self.property {
             property.apply(&mut expected)?;
+        }
+        if let Some(pair) = &self.property_pair {
+            pair.apply(&mut expected)?;
+        }
+        if self.property_pair.is_some() && !v4_exact_native_json(&self.old_bytes, &self.old)? {
+            return Err(refusal(
+                "V4 predecessor JSON must contain exactly the full typed native image",
+            ));
+        }
+        if self.property_pair.is_some() && !v4_exact_native_json(&self.new_bytes, &expected)? {
+            return Err(refusal(
+                "V4 successor JSON must contain exactly the derived full native image",
+            ));
         }
         if expected != self.new
             || self.old_head.ends_with(".gz.metadata.json")
@@ -122,7 +236,9 @@ impl RenamePlan {
             || self.new_head
                 != new_filesystem_metadata_location(&self.new.location, &self.old_head, false)?
         {
-            return Err(refusal(if self.property.is_some() {
+            return Err(refusal(if self.property_pair.is_some() {
+                "view rename must preserve the exact plain-JSON image except location and exactly two declared properties"
+            } else if self.property.is_some() {
                 "view rename must preserve the exact plain-JSON view image except location and declared property"
             } else {
                 "view rename must preserve the exact plain-JSON view image except location"
@@ -217,6 +333,13 @@ impl RenamePlan {
             value["property_replacement"] = json!({"key":property.key,
                 "expected":property.expected,"replacement":property.replacement});
         }
+        if let Some(pair) = &self.property_pair {
+            value["version"] = json!(4);
+            value["kind"] = json!("view-rename-property-pair");
+            value["property_replacements"] = json!(pair.replacements.iter().map(|property| {
+                json!({"key":property.key,"expected":property.expected,"replacement":property.replacement})
+            }).collect::<Vec<_>>());
+        }
         let bytes = serde_json::to_vec(&value)?;
         if bytes.len() > MAX_JOURNAL {
             return Err(refusal("view rename journal exceeds its byte budget"));
@@ -229,12 +352,15 @@ pub(super) fn is_record(bytes: &[u8]) -> Result<bool, IcebergError> {
     let value: Value = serde_json::from_slice(bytes)?;
     Ok(matches!(
         (value["version"].as_u64(), value["kind"].as_str()),
-        (Some(2), Some("view-rename")) | (Some(3), Some("view-rename-property"))
+        (Some(2), Some("view-rename"))
+            | (Some(3), Some("view-rename-property"))
+            | (Some(4), Some("view-rename-property-pair"))
     ))
 }
 
 fn decode(root: &NativeRoot, bytes: &[u8]) -> Result<(String, RenamePlan), IcebergError> {
     let value: Value = serde_json::from_slice(bytes)?;
+    let mut property_pair = None;
     let property = match (value["version"].as_u64(), value["kind"].as_str()) {
         (Some(2), Some("view-rename")) => None,
         (Some(3), Some("view-rename-property")) => {
@@ -261,6 +387,10 @@ fn decode(root: &NativeRoot, bytes: &[u8]) -> Result<(String, RenamePlan), Icebe
                 )?,
             ))
         }
+        (Some(4), Some("view-rename-property-pair")) => {
+            property_pair = Some(decode_property_pair(&value["property_replacements"])?);
+            None
+        }
         _ => return Err(refusal("unknown view rename journal version or kind")),
     };
     let fields = [
@@ -281,7 +411,8 @@ fn decode(root: &NativeRoot, bytes: &[u8]) -> Result<(String, RenamePlan), Icebe
         "artifact_receipts_fnv1a64",
     ];
     if value.as_object().is_none_or(|map| {
-        map.len() != fields.len() + usize::from(property.is_some())
+        map.len()
+            != fields.len() + usize::from(property.is_some()) + usize::from(property_pair.is_some())
             || fields.iter().any(|key| !map.contains_key(*key))
     }) || value["catalog"] != root.key
     {
@@ -318,6 +449,7 @@ fn decode(root: &NativeRoot, bytes: &[u8]) -> Result<(String, RenamePlan), Icebe
             Some(unhex(text("source_owner_hex")?)?)
         },
         property,
+        property_pair,
     };
     plan.places(root)?;
     Ok((phase, plan))
@@ -424,6 +556,7 @@ impl RenamePlan {
             history: capture_artifacts(root, &paths)?,
             old_owner,
             property: None,
+            property_pair: None,
         };
         plan.places(root)?;
         plan.encode(root, "commit")?;
@@ -817,6 +950,29 @@ impl FileCatalog {
         Ok(prepared)
     }
 
+    /// Derive exactly two existing-value replacements from the captured full
+    /// predecessor while retaining the same native preparation writer. No
+    /// namespace/control/cache effects precede full-image and value validation.
+    pub async fn prepare_view_rename_with_property_pair(
+        self: &Arc<Self>,
+        source: &Identifier,
+        destination: &Identifier,
+        expected: &ViewMetadata,
+        replacements: ExistingViewPropertyPairReplacement,
+    ) -> Result<PreparedViewRename, IcebergError> {
+        let mut prepared = self.prepare_view_rename(source, destination).await?;
+        if prepared.source_metadata() != expected {
+            return Err(IcebergError::CommitConflict(source.to_string()));
+        }
+        let pair = PropertyPairReplacement::from(replacements);
+        pair.apply(&mut prepared.plan.new)?;
+        prepared.plan.new_bytes = serde_json::to_vec(&prepared.plan.new)?;
+        prepared.plan.property_pair = Some(pair);
+        prepared.plan.places(&prepared.root)?;
+        prepared.plan.encode(&prepared.root, "commit")?;
+        Ok(prepared)
+    }
+
     pub(crate) fn is_local_view_location(&self, identifier: &Identifier, location: &str) -> bool {
         let ObjectStoreBuilder::Filesystem(store) = &self.object_store else {
             return false;
@@ -1106,3 +1262,7 @@ mod tests;
 #[cfg(test)]
 #[path = "view_rename_property_tests.rs"]
 mod property_tests;
+
+#[cfg(test)]
+#[path = "view_rename_property_pair_tests.rs"]
+mod property_pair_tests;

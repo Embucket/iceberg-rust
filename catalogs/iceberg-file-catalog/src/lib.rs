@@ -537,6 +537,19 @@ impl Catalog for FileCatalog {
             .await
             .map_err(|error| IcebergError::External(Box::new(error)))
     }
+    async fn rename_view_from_metadata_with_property_pair(
+        self: Arc<Self>,
+        source: &Identifier,
+        destination: &Identifier,
+        expected: &ViewMetadata,
+        replacements: iceberg_rust::catalog::ExistingViewPropertyPairReplacement,
+    ) -> Result<View, IcebergError> {
+        self.prepare_view_rename_with_property_pair(source, destination, expected, replacements)
+            .await?
+            .publish()
+            .await
+            .map_err(|error| IcebergError::External(Box::new(error)))
+    }
     async fn drop_view(&self, identifier: &Identifier) -> Result<(), IcebergError> {
         self.drop_tabular(identifier).await
     }

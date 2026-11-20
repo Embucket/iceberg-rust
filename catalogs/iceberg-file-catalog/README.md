@@ -275,3 +275,11 @@ test-only successor retains that same cloned Arc in `writer_catalog`; the future
 arguments, exclusion and final assertions are unchanged. The original failed
 compiler log remains retained. The subsequent owning tests and configured Clippy
 pass within the native-only scope recorded above.
+
+The separate [exact-two existing-property V4 API](VIEW_RENAME_PROPERTY_PAIR.md)
+has configured native qualification at `9cc1c57d`: all 19 new controls and the
+full FileCatalog root 122 PASS / 0 FAIL / 1 ignored, with configured 1.95
+Clippy/fmt PASS. Its fixed-array description and checked predecessor seam reuse
+the original owned publisher and recovery slot. The original `13c1290c` nine
+guard failures remain retained. This native evidence does not qualify an engine
+pin or SQL header/clock behavior.
