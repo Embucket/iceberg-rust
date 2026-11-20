@@ -30,4 +30,7 @@ The new object-safe method defaults to Unsupported. Both keys must already exist
 with exact old values under full-predecessor validation; no arbitrary After,
 callback or postcommit metadata update is accepted. The V4 FileCatalog source is
 [documented separately](../catalogs/iceberg-file-catalog/VIEW_RENAME_PROPERTY_PAIR.md)
-and remains uncompiled/unexecuted. V2/V3 behavior and qualification stay separate.
+with source-bound `9cc1c57d` configured native qualification: all 19 new controls,
+full FileCatalog 122 PASS / 0 FAIL / 1 ignored and configured 1.95 Clippy/fmt PASS.
+The original `13c1290c` guard failures remain retained. V2/V3 behavior and
+qualification stay separate, as do embedding SQL workflows and engine pins.

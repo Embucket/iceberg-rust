@@ -259,9 +259,12 @@ The two later peer-load controls are a tests/docs-only addition: all 29 focused
 controls and configured Clippy pass, while the full 82-test package receipt stays
 bound to unchanged production source `4d5a618d`.
 
-## Exactly two existing properties: V4 source only
+## Exactly two existing properties: V4 native qualification
 
-The separate [fixed-two V4 candidate](VIEW_RENAME_PROPERTY_PAIR.md) derives exactly
-two existing opaque value replacements in the same native rename decision. It is
-uncompiled/unexecuted and does not inherit the V3 qualification above. Old V2/V3
-APIs, journal bytes, controls and qualification records remain unchanged.
+The separate [fixed-two V4 API](VIEW_RENAME_PROPERTY_PAIR.md) derives exactly
+two existing opaque value replacements in the same native rename decision. Its
+`9cc1c57d` configured run passes all 19 new controls, the full FileCatalog root
+122 PASS / 0 FAIL / 1 ignored and configured 1.95 Clippy/fmt. The initial
+`13c1290c` nine-guard-failure result remains distinct. Old V2/V3 APIs, journal
+bytes, controls and qualification records remain unchanged; engine activation
+and SQL workflows require separate evidence.

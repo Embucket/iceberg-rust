@@ -118,11 +118,14 @@ coherent healthy commit. Do not infer cancel implies a fork fence or hold an
 acknowledgement wait against an idle retained future. Keep a deterministic
 queued-result cancellation control and describe this boundary to embedders.
 
-## Exactly two existing-property rename source
+## Exactly two existing-property rename
 
-The separate [V4 pair source](VIEW_RENAME_PROPERTY_PAIR.md) is uncompiled and
-unexecuted. Keep its public fixed-two description private, non-Clone and
-nonserialized. Derive the complete After from one captured full Before, location
+The separate [V4 pair API](VIEW_RENAME_PROPERTY_PAIR.md) has source-bound
+configured native qualification at `9cc1c57d`: 19 new controls and the full
+FileCatalog root 122 PASS / 0 FAIL / 1 ignored; configured 1.95 Clippy/fmt PASS.
+Preserve the original `13c1290c` nine-guard-failure receipt. Engine pins and SQL
+workflow claims remain separate. Keep its public fixed-two description private,
+non-Clone and nonserialized. Derive the complete After from one captured full Before, location
 and exactly two distinct bounded existing-value replacements under the original
 writer. No callback, insertion/removal or later property commit is authority.
 Preserve V2/V3 encodings, old controls and their already-qualified source claims.
