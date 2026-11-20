@@ -12,6 +12,9 @@ use super::{
     MAX_JOURNAL, MAX_METADATA, PENDING,
 };
 
+#[path = "table_view_tracking_create.rs"]
+pub mod create;
+
 const TRACKING_KEY: &str = "embucket.sql.change-tracking.v1";
 const ALTERED_KEY: &str = "embucket.sql.change-tracking-altered-ms.v1";
 const MAX_HEAD_FILES: usize = 4096;
@@ -36,6 +39,27 @@ pub(super) fn tracking_successors(
             "Change tracking needs distinct native table and view identities",
         ));
     }
+    if view_edit.key() != VIEW_OPTIONS_KEY
+        || view.properties.get(VIEW_OPTIONS_KEY).map(String::as_str) != Some(view_edit.expected())
+    {
+        return Err(refusal("Tracking needs the exact existing view options"));
+    }
+
+    let table_after = tracking_table_after(table, table_altered_at_ms)?;
+    let mut view_after = view.clone();
+    view_after
+        .properties
+        .insert(VIEW_OPTIONS_KEY.into(), view_edit.replacement().into());
+    Ok((table_after, view_after))
+}
+
+fn tracking_table_after(
+    table: &TableMetadata,
+    table_altered_at_ms: i64,
+) -> Result<TableMetadata, IcebergError> {
+    if table.table_uuid.is_nil() {
+        return Err(refusal("An unbound table cannot enable tracking"));
+    }
     if !matches!(
         table.properties.get(TRACKING_KEY).map(String::as_str),
         None | Some("false")
@@ -55,12 +79,6 @@ pub(super) fn tracking_successors(
             "Change tracking must advance the table alteration clock",
         ));
     }
-    if view_edit.key() != VIEW_OPTIONS_KEY
-        || view.properties.get(VIEW_OPTIONS_KEY).map(String::as_str) != Some(view_edit.expected())
-    {
-        return Err(refusal("Tracking needs the exact existing view options"));
-    }
-
     let mut table_after = table.clone();
     table_after
         .properties
@@ -69,11 +87,7 @@ pub(super) fn tracking_successors(
         .properties
         .insert(ALTERED_KEY.into(), table_altered_at_ms.to_string());
 
-    let mut view_after = view.clone();
-    view_after
-        .properties
-        .insert(VIEW_OPTIONS_KEY.into(), view_edit.replacement().into());
-    Ok((table_after, view_after))
+    Ok(table_after)
 }
 
 /// Full expected native inputs to one same-catalog table/view tracking decision.
@@ -212,7 +226,12 @@ struct Decision {
 #[serde(tag = "phase", rename_all = "snake_case", deny_unknown_fields)]
 enum TrackingState {
     Idle {},
-    Decided { decision: Box<Decision> },
+    Decided {
+        decision: Box<Decision>,
+    },
+    Creating {
+        decision: Box<create::CreateDecision>,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -247,6 +266,19 @@ impl Control {
             ));
         }
         Ok(Some(value))
+    }
+
+    fn require_idle(root: &NativeRoot) -> Result<(), IcebergError> {
+        match Self::read(root)? {
+            None => Ok(()),
+            Some(Self {
+                state: TrackingState::Idle {},
+                ..
+            }) => witness(root, false),
+            Some(_) => Err(refusal(
+                "Tracking root requires recovery before publication",
+            )),
+        }
     }
 
     fn write(&self, root: &NativeRoot) -> Result<(), IcebergError> {
@@ -324,6 +356,10 @@ pub(super) fn recover(root: &NativeRoot, cache: &Cache) -> Result<(), IcebergErr
             witness(root, true)?;
             decision.install(root, cache)
         }
+        Some(TrackingState::Creating { decision }) => {
+            witness(root, true)?;
+            decision.install(root, cache)
+        }
     }
 }
 
@@ -336,19 +372,6 @@ struct PreparedTracking {
 }
 
 impl PreparedTracking {
-    fn require_idle(&self) -> Result<(), IcebergError> {
-        match Control::read(&self.root)? {
-            None => Ok(()),
-            Some(Control {
-                state: TrackingState::Idle {},
-                ..
-            }) => witness(&self.root, false),
-            Some(_) => Err(refusal(
-                "Tracking root requires recovery before publication",
-            )),
-        }
-    }
-
     fn validate_heads(&self) -> Result<(), IcebergError> {
         self.decision.table.check(
             &self.root,
@@ -443,7 +466,7 @@ impl FileCatalog {
     ) -> Result<(), IcebergError> {
         let prepared = self.prepare_tracking_under_scope(change).await?;
         tokio::task::spawn_blocking(move || {
-            prepared.require_idle()?;
+            Control::require_idle(&prepared.root)?;
             prepared.validate_heads()
         })
         .await
@@ -461,7 +484,7 @@ impl FileCatalog {
         let catalog = Arc::clone(self);
         tokio::task::spawn_blocking(move || {
             let _lock = lock;
-            if let Err(error) = prepared.require_idle() {
+            if let Err(error) = Control::require_idle(&prepared.root) {
                 catalog.pair_state.0.store(FENCED, Ordering::Release);
                 return Err(error);
             }
@@ -494,7 +517,11 @@ impl FileCatalog {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iceberg_rust::catalog::{create::CreateTableBuilder, namespace::Namespace, Catalog};
+    use iceberg_rust::catalog::{
+        create::{CreateTableBuilder, CreateView},
+        namespace::Namespace,
+        Catalog,
+    };
     use iceberg_rust::spec::schema::Schema;
     use iceberg_rust::spec::types::{PrimitiveType, StructField, Type};
     use iceberg_rust::spec::view_metadata::{Version, ViewRepresentation};
@@ -781,6 +808,177 @@ mod tests {
         assert!(matches!(
             Control::read(&root)?.map(|value| value.state),
             Some(TrackingState::Decided { .. })
+        ));
+        Ok(())
+    }
+
+    fn create_request(fixture: &Fixture, name: &str) -> TestResult<CreateView<Option<()>>> {
+        Ok(CreateView {
+            name: name.to_owned(),
+            location: None,
+            schema: fixture.view.current_schema(None)?.clone(),
+            view_version: Version::builder()
+                .with_representation(ViewRepresentation::sql(
+                    "SELECT ID FROM APP.BASE",
+                    Some("snowflake"),
+                ))
+                .default_namespace(vec!["APP".into()])
+                .build()?,
+            properties: [
+                ("embucket.sql.view-managed.v1".to_owned(), "true".to_owned()),
+                (VIEW_OPTIONS_KEY.to_owned(), AFTER.to_owned()),
+            ]
+            .into_iter()
+            .collect(),
+        })
+    }
+
+    #[tokio::test]
+    async fn tracked_create_publishes_both_exact_images_and_refuses_an_occupied_name() -> TestResult
+    {
+        let fixture = Fixture::new().await?;
+        let table_id = fixture.table.identifier();
+        let existing = fixture.view.identifier();
+        let former = fixture.table.metadata().clone();
+        let occupied = create::TrackingCreate {
+            table_id,
+            table_before: &former,
+            table_altered_at_ms: Some(fixture.clock()),
+            view_id: existing,
+            view: create_request(&fixture, existing.name())?,
+        };
+        assert!(fixture
+            .catalog
+            .create_view_enabling_base_tracking(occupied)
+            .await
+            .is_err());
+        assert_eq!(
+            Fixture::read(&fixture.catalog, table_id, existing).await?,
+            (former.clone(), fixture.view.metadata().clone())
+        );
+
+        let view_id = Identifier::new(existing.namespace(), "TRACKED");
+        let created = fixture
+            .catalog
+            .create_view_enabling_base_tracking(create::TrackingCreate {
+                table_id,
+                table_before: &former,
+                table_altered_at_ms: Some(fixture.clock()),
+                view_id: &view_id,
+                view: create_request(&fixture, "TRACKED")?,
+            })
+            .await?;
+        let reopened = Fixture::open(&fixture.root).await?;
+        let (base, view) = Fixture::read(&reopened, table_id, &view_id).await?;
+        assert_eq!(base, tracking_table_after(&former, fixture.clock())?);
+        assert_eq!(&view, created.metadata());
+        assert_eq!(
+            view.properties.get(VIEW_OPTIONS_KEY).map(String::as_str),
+            Some(AFTER)
+        );
+        assert_eq!(
+            Fixture::read(&reopened, table_id, existing).await?.1,
+            *fixture.view.metadata()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tracked_create_on_an_already_tracked_base_keeps_its_exact_head() -> TestResult {
+        // Snowflake 10.42.103, second CREATE 01c88802-010a-0377-0004-d66e05f3a0da.
+        let fixture = Fixture::new().await?;
+        let table_id = fixture.table.identifier();
+        let ns = fixture.view.identifier().namespace();
+        let first = Identifier::new(ns, "TRACKED_FIRST");
+        let second = Identifier::new(ns, "TRACKED_SECOND");
+        let original_table = fixture.table.metadata().clone();
+        let clock = fixture.clock();
+        fixture
+            .catalog
+            .create_view_enabling_base_tracking(create::TrackingCreate {
+                table_id,
+                table_before: &original_table,
+                table_altered_at_ms: Some(clock),
+                view_id: &first,
+                view: create_request(&fixture, first.name())?,
+            })
+            .await?;
+        let (tracked_table, first_view) = Fixture::read(&fixture.catalog, table_id, &first).await?;
+        let previous = fixture.catalog.metadata_location(table_id).await?;
+        let root = fixture.catalog.pair_root()?;
+        let bytes = root.read(&root.native(&previous)?, MAX_METADATA)?;
+
+        let second_view = fixture
+            .catalog
+            .create_view_enabling_base_tracking(create::TrackingCreate {
+                table_id,
+                table_before: &tracked_table,
+                table_altered_at_ms: None,
+                view_id: &second,
+                view: create_request(&fixture, second.name())?,
+            })
+            .await?;
+
+        let reopened = Fixture::open(&fixture.root).await?;
+        assert_eq!(reopened.metadata_location(table_id).await?, previous);
+        assert_eq!(root.read(&root.native(&previous)?, MAX_METADATA)?, bytes);
+        assert_eq!(
+            Fixture::read(&reopened, table_id, &first).await?,
+            (tracked_table.clone(), first_view)
+        );
+        assert_eq!(
+            Fixture::read(&reopened, table_id, &second).await?,
+            (tracked_table, second_view.metadata().clone())
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tracked_create_recovers_after_the_table_head_and_partial_view_directory() -> TestResult
+    {
+        let fixture = Fixture::new().await?;
+        let table_id = fixture.table.identifier();
+        let view_id = Identifier::new(fixture.view.identifier().namespace(), "TRACKED");
+        let before = fixture.table.metadata();
+        let prepared = fixture
+            .catalog
+            .prepare_tracked_create_under_scope(create::TrackingCreate {
+                table_id,
+                table_before: before,
+                table_altered_at_ms: Some(fixture.clock()),
+                view_id: &view_id,
+                view: create_request(&fixture, "TRACKED")?,
+            })
+            .await?;
+        let expected_table = tracking_table_after(before, fixture.clock())?;
+        let expected_view = prepared.view.clone();
+        let root = prepared.root;
+        let next_table = root.native(&format!("{}/metadata/v1.metadata.json", before.location))?;
+        let partial_view = root.native(&expected_view.location)?;
+        Control::new(
+            &root,
+            TrackingState::Creating {
+                decision: Box::new(prepared.decision),
+            },
+        )
+        .write(&root)?;
+        witness(&root, true)?;
+        let saved = Control::read(&root)?.ok_or("tracking CREATE decision")?;
+        let TrackingState::Creating { decision } = saved.state else {
+            return Err("wrong tracking phase".into());
+        };
+        let expected_table_raw = decision.table_after_bytes()?;
+        root.install_head(&expected_table_raw, &next_table)?;
+        std::fs::create_dir(&partial_view)?;
+        std::fs::create_dir(partial_view.join("metadata"))?;
+        let reopened = Fixture::open(&fixture.root).await?;
+        assert_eq!(
+            Fixture::read(&reopened, table_id, &view_id).await?,
+            (expected_table, expected_view)
+        );
+        assert!(matches!(
+            Control::read(&root)?.map(|value| value.state),
+            Some(TrackingState::Idle {})
         ));
         Ok(())
     }

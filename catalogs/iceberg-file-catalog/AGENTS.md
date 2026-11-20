@@ -141,3 +141,9 @@ entry objects and unknown fields, and preserve order for every other array. The
 native serde conversions use HashMaps, so reserialized array order is not a
 creator-identity requirement. Keep this exception V4-only; do not change V2/V3 or
 introduce a general normalization of native metadata.
+
+For tracked local CREATE VIEW, preserve the original absence proof and the exact
+base head under native writer ownership. An already-tracked base uses a view-only
+decision and produces no new table head. On recovery, accept only the exact
+staged view image and known partial directories. Keep validation and durability
+under the owned native job and leave SQL privilege checks to the embedding engine.

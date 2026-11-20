@@ -283,3 +283,15 @@ Clippy/fmt PASS. Its fixed-array description and checked predecessor seam reuse
 the original owned publisher and recovery slot. The original `13c1290c` nine
 guard failures remain retained. This native evidence does not qualify an engine
 pin or SQL header/clock behavior.
+
+## Creating a tracked local view
+
+The filesystem catalog accepts an absent managed view and the complete expected
+image of its permanent base table in the same namespace. First enablement
+records one native decision for the new view and the table tracking properties.
+Creating a view over an already-tracked base checks the existing head and
+installs only the view. Recovery validates the selected before image and the
+view destination before installing either head. It can finish a partially
+created destination directory, including after the first table head was
+installed. The embedding engine supplies SQL parsing, role authority and
+its account and cache publication boundary.
