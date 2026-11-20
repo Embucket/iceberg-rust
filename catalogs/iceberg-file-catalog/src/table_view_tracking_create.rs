@@ -127,9 +127,9 @@ impl CreateDecision {
             .get(VIEW_OPTIONS_KEY)
             .ok_or_else(|| refusal("Tracked CREATE requires the original managed VIEW options"))?;
         if options.len() > 65_536
-            || !serde_json::from_str::<serde_json::Value>(options)?
+            || serde_json::from_str::<serde_json::Value>(options)?
                 .get("change_tracking")
-                .is_some_and(|value| value.as_bool() == Some(true))
+                .is_none_or(|value| value.as_bool() != Some(true))
             || properties.get(MANAGED_VIEW_KEY).map(String::as_str) != Some("true")
             || view.location != location
             || view.view_uuid.is_nil()
