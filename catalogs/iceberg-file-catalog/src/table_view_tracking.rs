@@ -207,7 +207,7 @@ struct Decision {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "phase", rename_all = "snake_case", deny_unknown_fields)]
 enum TrackingState {
-    Idle,
+    Idle {},
     Decided { decision: Box<Decision> },
 }
 
@@ -291,12 +291,12 @@ impl Decision {
         cache.remove(&self.table.identifier());
         cache.remove(&self.view.identifier());
         drop(cache);
-        Control::new(root, TrackingState::Idle).write(root)
+        Control::new(root, TrackingState::Idle {}).write(root)
     }
 }
 
 fn witness(root: &NativeRoot, allow_create: bool) -> Result<(), IcebergError> {
-    let bytes = serde_json::to_vec(&Control::new(root, TrackingState::Idle))?;
+    let bytes = serde_json::to_vec(&Control::new(root, TrackingState::Idle {}))?;
     let path = root.file(WITNESS);
     if control_exists(&path)? {
         if root.read(&path, 4096)? != bytes {
@@ -315,7 +315,7 @@ fn witness(root: &NativeRoot, allow_create: bool) -> Result<(), IcebergError> {
 pub(super) fn recover(root: &NativeRoot, cache: &Cache) -> Result<(), IcebergError> {
     match Control::read(root)?.map(|control| control.state) {
         None => Ok(()),
-        Some(TrackingState::Idle) => witness(root, false),
+        Some(TrackingState::Idle {}) => witness(root, false),
         Some(TrackingState::Decided { decision }) => {
             witness(root, true)?;
             decision.install(root, cache)
@@ -336,7 +336,7 @@ impl PreparedTracking {
         match Control::read(&self.root)? {
             None => Ok(()),
             Some(Control {
-                state: TrackingState::Idle,
+                state: TrackingState::Idle {},
                 ..
             }) => witness(&self.root, false),
             Some(_) => Err(refusal(
@@ -735,7 +735,7 @@ mod tests {
         );
         assert!(matches!(
             Control::read(&root)?.map(|control| control.state),
-            Some(TrackingState::Idle)
+            Some(TrackingState::Idle {})
         ));
         Ok(())
     }
