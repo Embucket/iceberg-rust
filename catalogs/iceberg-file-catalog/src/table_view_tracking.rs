@@ -517,7 +517,11 @@ impl FileCatalog {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iceberg_rust::catalog::{create::CreateTableBuilder, namespace::Namespace, Catalog};
+    use iceberg_rust::catalog::{
+        create::{CreateTableBuilder, CreateView},
+        namespace::Namespace,
+        Catalog,
+    };
     use iceberg_rust::spec::schema::Schema;
     use iceberg_rust::spec::types::{PrimitiveType, StructField, Type};
     use iceberg_rust::spec::view_metadata::{Version, ViewRepresentation};
@@ -805,6 +809,77 @@ mod tests {
             Control::read(&root)?.map(|value| value.state),
             Some(TrackingState::Decided { .. })
         ));
+        Ok(())
+    }
+
+    fn create_request(fixture: &Fixture, name: &str) -> TestResult<CreateView<Option<()>>> {
+        Ok(CreateView {
+            name: name.to_owned(),
+            location: None,
+            schema: fixture.view.current_schema(None)?.clone(),
+            view_version: Version::builder()
+                .with_representation(ViewRepresentation::sql(
+                    "SELECT ID FROM APP.BASE",
+                    Some("snowflake"),
+                ))
+                .with_default_namespace(vec!["APP".into()])
+                .build()?,
+            properties: [
+                ("embucket.sql.view-managed.v1".to_owned(), "true".to_owned()),
+                (VIEW_OPTIONS_KEY.to_owned(), AFTER.to_owned()),
+            ]
+            .into_iter()
+            .collect(),
+        })
+    }
+
+    #[tokio::test]
+    async fn tracked_create_publishes_both_exact_images_and_refuses_an_occupied_name() -> TestResult
+    {
+        let fixture = Fixture::new().await?;
+        let table_id = fixture.table.identifier();
+        let existing = fixture.view.identifier();
+        let former = fixture.table.metadata().clone();
+        let occupied = create::TrackingCreate {
+            table_id,
+            table_before: &former,
+            table_altered_at_ms: fixture.clock(),
+            view_id: existing,
+            view: create_request(&fixture, existing.name())?,
+        };
+        assert!(fixture
+            .catalog
+            .create_view_enabling_base_tracking(occupied)
+            .await
+            .is_err());
+        assert_eq!(
+            Fixture::read(&fixture.catalog, table_id, existing).await?,
+            (former.clone(), fixture.view.metadata().clone())
+        );
+
+        let view_id = Identifier::new(existing.namespace(), "TRACKED");
+        let created = fixture
+            .catalog
+            .create_view_enabling_base_tracking(create::TrackingCreate {
+                table_id,
+                table_before: &former,
+                table_altered_at_ms: fixture.clock(),
+                view_id: &view_id,
+                view: create_request(&fixture, "TRACKED")?,
+            })
+            .await?;
+        let reopened = Fixture::open(&fixture.root).await?;
+        let (base, view) = Fixture::read(&reopened, table_id, &view_id).await?;
+        assert_eq!(base, tracking_table_after(&former, fixture.clock())?);
+        assert_eq!(&view, created.metadata());
+        assert_eq!(
+            view.properties.get(VIEW_OPTIONS_KEY).map(String::as_str),
+            Some(AFTER)
+        );
+        assert_eq!(
+            Fixture::read(&reopened, table_id, existing).await?.1,
+            *fixture.view.metadata()
+        );
         Ok(())
     }
 }
