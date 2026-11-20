@@ -843,7 +843,7 @@ mod tests {
         let occupied = create::TrackingCreate {
             table_id,
             table_before: &former,
-            table_altered_at_ms: fixture.clock(),
+            table_altered_at_ms: Some(fixture.clock()),
             view_id: existing,
             view: create_request(&fixture, existing.name())?,
         };
@@ -863,7 +863,7 @@ mod tests {
             .create_view_enabling_base_tracking(create::TrackingCreate {
                 table_id,
                 table_before: &former,
-                table_altered_at_ms: fixture.clock(),
+                table_altered_at_ms: Some(fixture.clock()),
                 view_id: &view_id,
                 view: create_request(&fixture, "TRACKED")?,
             })
@@ -945,7 +945,7 @@ mod tests {
             .prepare_tracked_create_under_scope(create::TrackingCreate {
                 table_id,
                 table_before: before,
-                table_altered_at_ms: fixture.clock(),
+                table_altered_at_ms: Some(fixture.clock()),
                 view_id: &view_id,
                 view: create_request(&fixture, "TRACKED")?,
             })

@@ -12,7 +12,8 @@ const VIEW_HEAD: &str = "v0.metadata.json";
 pub struct TrackingCreate<'a> {
     pub table_id: &'a Identifier,
     pub table_before: &'a TableMetadata,
-    pub table_altered_at_ms: i64,
+    /// First enablement advances this clock. A tracked base keeps its exact head.
+    pub table_altered_at_ms: Option<i64>,
     pub view_id: &'a Identifier,
     pub view: CreateView<Option<()>>,
 }
@@ -22,10 +23,41 @@ pub struct TrackingCreate<'a> {
 pub(super) struct CreateDecision {
     operation_id: Uuid,
     table: Head,
-    table_altered_at_ms: i64,
+    base: CreateBase,
     namespace: String,
     name: String,
     view_after: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum CreateBase {
+    Advance { altered_at_ms: i64 },
+    PreserveTracked {},
+}
+
+impl CreateBase {
+    const fn advances(&self) -> bool {
+        matches!(self, Self::Advance { .. })
+    }
+
+    fn successor(&self, before: &TableMetadata) -> Result<TableMetadata, IcebergError> {
+        match self {
+            Self::Advance { altered_at_ms } => tracking_table_after(before, *altered_at_ms),
+            Self::PreserveTracked {} => {
+                if before.table_uuid.is_nil()
+                    || before.properties.get(TRACKING_KEY).map(String::as_str) != Some("true")
+                    || !before
+                        .properties
+                        .get(ALTERED_KEY)
+                        .is_some_and(|value| value.parse::<i64>().is_ok_and(|clock| clock > 0))
+                {
+                    return Err(refusal("Tracking CREATE cannot preserve an untracked base"));
+                }
+                Ok(before.clone())
+            }
+        }
+    }
 }
 
 fn absent(path: &Path) -> Result<bool, IcebergError> {
@@ -81,7 +113,7 @@ impl CreateDecision {
             ));
         }
         let before: TableMetadata = serde_json::from_slice(&unhex(&self.table.before)?)?;
-        let table = tracking_table_after(&before, self.table_altered_at_ms)?;
+        let table = self.base.successor(&before)?;
         let view: ViewMetadata = serde_json::from_slice(&unhex(&self.view_after)?)?;
         let location = format!(
             "{}/{}/{}",
@@ -109,6 +141,7 @@ impl CreateDecision {
             || !matches!(version.representations.as_slice(),
                 [ViewRepresentation::Sql { dialect, .. }] if dialect.eq_ignore_ascii_case("snowflake"))
             || serde_json::from_slice::<TableMetadata>(&unhex(&self.table.after)?)? != table
+            || (!self.base.advances() && self.table.before != self.table.after)
         {
             return Err(refusal(
                 "Tracked CREATE successor does not match its original objects and options",
@@ -193,20 +226,27 @@ impl CreateDecision {
 
     pub(super) fn install(&self, root: &NativeRoot, cache: &Cache) -> Result<(), IcebergError> {
         let (table, _, destination) = self.successor(root)?;
-        let table_after = self
-            .table
-            .check(root, &table.location, Some(table.table_uuid), true)?;
+        let table_after = self.table.check(
+            root,
+            &table.location,
+            Some(table.table_uuid),
+            self.base.advances(),
+        )?;
         self.check_destination(root, &destination, true)?;
         let stage = root.file(&self.stage_name());
         if !absent(&stage)? && root.read(&stage, MAX_METADATA)? != unhex(&self.view_after)? {
             return Err(refusal("The tracked CREATE staged metadata changed"));
         }
-        root.install_head(&unhex(&self.table.after)?, &table_after)?;
+        if self.base.advances() {
+            root.install_head(&unhex(&self.table.after)?, &table_after)?;
+        }
         self.install_view(root, &destination)?;
         let mut cache = cache
             .write()
             .map_err(|_| refusal("Tracking publication cache is poisoned"))?;
-        cache.remove(&self.table.identifier());
+        if self.base.advances() {
+            cache.remove(&self.table.identifier());
+        }
         cache.remove(&self.view_id());
         drop(cache);
         Control::new(root, TrackingState::Idle {}).write(root)
@@ -251,13 +291,20 @@ impl FileCatalog {
         if table.metadata() != change.table_before {
             return Err(IcebergError::CommitConflict(change.table_id.to_string()));
         }
-        let table_after = tracking_table_after(change.table_before, change.table_altered_at_ms)?;
-        let table_head = Head::capture(
+        let base = match change.table_altered_at_ms {
+            Some(altered_at_ms) => CreateBase::Advance { altered_at_ms },
+            None => CreateBase::PreserveTracked {},
+        };
+        let table_after = base.successor(change.table_before)?;
+        let mut table_head = Head::capture(
             &root,
             change.table_id,
             self.metadata_location(change.table_id).await?,
             &serde_json::to_vec(&table_after)?,
         )?;
+        if !base.advances() {
+            table_head.after = table_head.before.clone();
+        }
         if serde_json::from_slice::<TableMetadata>(&unhex(&table_head.before)?)?
             != *change.table_before
         {
@@ -276,7 +323,7 @@ impl FileCatalog {
         let decision = CreateDecision {
             operation_id: Uuid::new_v4(),
             table: table_head,
-            table_altered_at_ms: change.table_altered_at_ms,
+            base,
             namespace,
             name: change.view_id.name().to_owned(),
             view_after: hex(&view_bytes),
@@ -288,7 +335,8 @@ impl FileCatalog {
         })
     }
 
-    /// Create an absent managed view and enable tracking on its exact untracked base.
+    /// Create an absent managed view and enable tracking on its exact native base.
+    /// If the base is already tracked, write only the view and preserve the table head.
     /// The native worker retains writer exclusion through recovery or acknowledgement.
     pub async fn create_view_enabling_base_tracking(
         self: &Arc<Self>,
