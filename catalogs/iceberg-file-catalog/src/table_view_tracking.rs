@@ -14,6 +14,7 @@ use super::{
 
 const TRACKING_KEY: &str = "embucket.sql.change-tracking.v1";
 const ALTERED_KEY: &str = "embucket.sql.change-tracking-altered-ms.v1";
+const MAX_HEAD_FILES: usize = 4096;
 const VIEW_OPTIONS_KEY: &str = "embucket.sql.view-options.v1";
 pub(super) const JOURNAL: &str = ".iceberg-table-view-tracking-v1";
 pub(super) const WITNESS: &str = ".iceberg-table-view-tracking-required-v1";
@@ -172,7 +173,10 @@ impl Head {
         root.regular(&old)?.sync_all().map_err(io)?;
         root.sync_ancestors(parent)?;
         let version = parse_version(&self.previous)?;
-        for item in std::fs::read_dir(parent).map_err(io)? {
+        for (index, item) in std::fs::read_dir(parent).map_err(io)?.enumerate() {
+            if index >= MAX_HEAD_FILES {
+                return Err(refusal("Tracking metadata history exceeds its entry bound"));
+            }
             let path = item.map_err(io)?.path();
             let version_at_path = path.to_str().and_then(|path| parse_version(path).ok());
             if version_at_path.is_some_and(|current| current > version)
@@ -736,6 +740,51 @@ mod tests {
         assert!(matches!(
             Control::read(&root)?.map(|control| control.state),
             Some(TrackingState::Idle {})
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tracking_recovery_keeps_both_objects_fenced_on_a_third_head() -> TestResult {
+        let fixture = Fixture::new().await?;
+        let prepared = fixture
+            .catalog
+            .prepare_tracking_under_scope(TrackingChange {
+                table_id: fixture.table.identifier(),
+                view_id: fixture.view.identifier(),
+                table_before: fixture.table.metadata(),
+                view_before: fixture.view.metadata(),
+                table_altered_at_ms: fixture.clock(),
+                view_edit: Fixture::edit(BEFORE)?,
+            })
+            .await?;
+        let table_after = prepared.decision.table.check(
+            &prepared.root,
+            &prepared.table_location,
+            Some(prepared.table_uuid),
+            false,
+        )?;
+        let view_after =
+            prepared
+                .decision
+                .view
+                .check(&prepared.root, &prepared.view_location, None, false)?;
+        let root = prepared.root;
+        Control::new(
+            &root,
+            TrackingState::Decided {
+                decision: Box::new(prepared.decision),
+            },
+        )
+        .write(&root)?;
+        witness(&root, true)?;
+        root.install_head(b"unexpected head", &view_after)?;
+        assert!(Fixture::open(&fixture.root).await.is_err());
+        assert!(!table_after.exists());
+        assert_eq!(root.read(&view_after, MAX_METADATA)?, b"unexpected head");
+        assert!(matches!(
+            Control::read(&root)?.map(|value| value.state),
+            Some(TrackingState::Decided { .. })
         ));
         Ok(())
     }
