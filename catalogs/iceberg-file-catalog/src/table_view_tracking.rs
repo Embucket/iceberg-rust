@@ -36,6 +36,27 @@ pub(super) fn tracking_successors(
             "Change tracking needs distinct native table and view identities",
         ));
     }
+    if view_edit.key() != VIEW_OPTIONS_KEY
+        || view.properties.get(VIEW_OPTIONS_KEY).map(String::as_str) != Some(view_edit.expected())
+    {
+        return Err(refusal("Tracking needs the exact existing view options"));
+    }
+
+    let table_after = tracking_table_after(table, table_altered_at_ms)?;
+    let mut view_after = view.clone();
+    view_after
+        .properties
+        .insert(VIEW_OPTIONS_KEY.into(), view_edit.replacement().into());
+    Ok((table_after, view_after))
+}
+
+fn tracking_table_after(
+    table: &TableMetadata,
+    table_altered_at_ms: i64,
+) -> Result<TableMetadata, IcebergError> {
+    if table.table_uuid.is_nil() {
+        return Err(refusal("An unbound table cannot enable tracking"));
+    }
     if !matches!(
         table.properties.get(TRACKING_KEY).map(String::as_str),
         None | Some("false")
@@ -55,12 +76,6 @@ pub(super) fn tracking_successors(
             "Change tracking must advance the table alteration clock",
         ));
     }
-    if view_edit.key() != VIEW_OPTIONS_KEY
-        || view.properties.get(VIEW_OPTIONS_KEY).map(String::as_str) != Some(view_edit.expected())
-    {
-        return Err(refusal("Tracking needs the exact existing view options"));
-    }
-
     let mut table_after = table.clone();
     table_after
         .properties
@@ -69,11 +84,7 @@ pub(super) fn tracking_successors(
         .properties
         .insert(ALTERED_KEY.into(), table_altered_at_ms.to_string());
 
-    let mut view_after = view.clone();
-    view_after
-        .properties
-        .insert(VIEW_OPTIONS_KEY.into(), view_edit.replacement().into());
-    Ok((table_after, view_after))
+    Ok(table_after)
 }
 
 /// Full expected native inputs to one same-catalog table/view tracking decision.
