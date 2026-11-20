@@ -3371,6 +3371,7 @@ dependencies = [
  "iceberg-rust",
  "object_store",
  "percent-encoding",
+ "serde",
  "serde_json",
  "tempfile",
  "testcontainers",

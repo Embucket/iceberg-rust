@@ -16,6 +16,9 @@ pub mod view_rename;
 #[path = "scoped_read.rs"]
 mod scoped_read;
 
+#[path = "table_view_tracking.rs"]
+pub mod table_view_tracking;
+
 const JOURNAL: &str = ".iceberg-append-pair-v1";
 const WITNESS: &str = ".iceberg-append-pair-required-v1";
 const MAX_METADATA: usize = 1024 * 1024;
@@ -257,9 +260,9 @@ impl NativeRoot {
         self.sync_directory(&self.path)
     }
 
-    fn install_head(&self, entry: &Entry, path: &NativePath) -> Result<(), IcebergError> {
+    fn install_head(&self, bytes: &[u8], path: &NativePath) -> Result<(), IcebergError> {
         if path.try_exists().map_err(io)? {
-            if self.read(path, MAX_METADATA)? == entry.new_bytes {
+            if self.read(path, MAX_METADATA)? == bytes {
                 self.regular(path)?.sync_all().map_err(io)?;
                 return self.sync_directory(
                     path.parent()
@@ -271,7 +274,7 @@ impl NativeRoot {
         let parent = path
             .parent()
             .ok_or_else(|| refusal("missing head parent"))?;
-        let temporary = self.temporary(parent, &entry.new_bytes)?;
+        let temporary = self.temporary(parent, bytes)?;
         let linked = std::fs::hard_link(&temporary, path);
         let cleanup = std::fs::remove_file(&temporary);
         if let Err(error) = linked {
@@ -313,6 +316,15 @@ pub struct FileCatalogReadScope {
 }
 
 impl FileCatalogReadScope {
+    /// Read-only validation of the base/view pair under this catalog's guard.
+    /// A subsequent publication still resolves and verifies both native heads.
+    pub async fn validate_view_tracking_with_base(
+        &self,
+        change: table_view_tracking::TrackingChange<'_>,
+    ) -> Result<(), IcebergError> {
+        self.catalog.validate_tracking_under_scope(change).await
+    }
+
     pub async fn load(&self, identifier: &Identifier) -> Result<Tabular, IcebergError> {
         self.catalog.check_pair_health()?;
         Arc::clone(&self.catalog)
@@ -374,7 +386,12 @@ impl FileCatalog {
                 let path = store
                     .path_to_filesystem(&self.catalog_root_path())
                     .map_err(IcebergError::from)?;
-                for name in [WITNESS, JOURNAL] {
+                for name in [
+                    WITNESS,
+                    JOURNAL,
+                    table_view_tracking::WITNESS,
+                    table_view_tracking::JOURNAL,
+                ] {
                     match std::fs::symlink_metadata(path.join(name)) {
                         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                         _ => {
@@ -596,7 +613,8 @@ impl FileCatalog {
         state.0.store(PENDING, Ordering::Release);
         tokio::task::spawn_blocking(move || {
             let _guard = guard;
-            let result = recover(&root, &cache);
+            let result =
+                recover(&root, &cache).and_then(|()| table_view_tracking::recover(&root, &cache));
             state.0.store(
                 if result.is_ok() { HEALTHY } else { FENCED },
                 Ordering::Release,
@@ -733,7 +751,7 @@ impl PublishOwner {
             checkpoint(&prepared.hook, TestStage::AfterDecision)?;
             for (index, entry) in prepared.entries.iter().enumerate() {
                 let path = prepared.catalog.pair_native(&entry.new_location)?;
-                root.install_head(entry, &path)?;
+                root.install_head(&entry.new_bytes, &path)?;
                 #[cfg(test)]
                 if index == 0 {
                     checkpoint(&prepared.hook, TestStage::AfterFirstHead)?;
@@ -1148,7 +1166,7 @@ fn recover(root: &NativeRoot, cache: &Cache) -> Result<(), IcebergError> {
             validate_artifacts(root, &artifacts, true)?;
             validate_entries(root, &entries, true)?;
             for entry in &entries {
-                root.install_head(entry, &root.native(&entry.new_location)?)?;
+                root.install_head(&entry.new_bytes, &root.native(&entry.new_location)?)?;
             }
             root.replace_control(
                 JOURNAL,
