@@ -57,6 +57,11 @@ fn directory(root: &NativeRoot, path: &Path) -> Result<(), IcebergError> {
 }
 
 impl CreateDecision {
+    #[cfg(test)]
+    pub(super) fn table_after_bytes(&self) -> Result<Vec<u8>, IcebergError> {
+        unhex(&self.table.after)
+    }
+
     fn view_id(&self) -> Identifier {
         Identifier::new(std::slice::from_ref(&self.namespace), &self.name)
     }
@@ -208,13 +213,17 @@ impl CreateDecision {
     }
 }
 
+pub(super) struct PreparedCreate {
+    pub(super) root: NativeRoot,
+    pub(super) decision: CreateDecision,
+    pub(super) view: ViewMetadata,
+}
+
 impl FileCatalog {
-    /// Create an absent managed view and enable tracking on its exact untracked base.
-    /// The native worker retains writer exclusion through recovery or acknowledgement.
-    pub async fn create_view_enabling_base_tracking(
+    pub(super) async fn prepare_tracked_create_under_scope(
         self: &Arc<Self>,
         change: TrackingCreate<'_>,
-    ) -> Result<View, IcebergError> {
+    ) -> Result<PreparedCreate, IcebergError> {
         if !matches!(self.object_store, ObjectStoreBuilder::Filesystem(_))
             || change.table_id.namespace().len() != 1
             || change.table_id.namespace() != change.view_id.namespace()
@@ -226,7 +235,6 @@ impl FileCatalog {
                 "Tracked CREATE is limited to one absent native view with a local base",
             ));
         }
-        let lock = self.catalog_mutation_lock().write_owned().await;
         self.check_pair_health()?;
         let root = self.pair_root()?;
         if self.tabular_exists_under_scope(change.view_id).await? {
@@ -273,6 +281,26 @@ impl FileCatalog {
             name: change.view_id.name().to_owned(),
             view_after: hex(&view_bytes),
         };
+        Ok(PreparedCreate {
+            root,
+            decision,
+            view,
+        })
+    }
+
+    /// Create an absent managed view and enable tracking on its exact untracked base.
+    /// The native worker retains writer exclusion through recovery or acknowledgement.
+    pub async fn create_view_enabling_base_tracking(
+        self: &Arc<Self>,
+        change: TrackingCreate<'_>,
+    ) -> Result<View, IcebergError> {
+        let view_id = change.view_id.clone();
+        let lock = self.catalog_mutation_lock().write_owned().await;
+        let PreparedCreate {
+            root,
+            decision,
+            view,
+        } = self.prepare_tracked_create_under_scope(change).await?;
         let catalog = Arc::clone(self);
         tokio::task::spawn_blocking(move || {
             let _lock = lock;
@@ -309,7 +337,7 @@ impl FileCatalog {
         .await
         .map_err(io)??;
         View::new(
-            change.view_id.clone(),
+            view_id,
             Arc::clone(self) as Arc<dyn iceberg_rust::catalog::Catalog>,
             view,
         )

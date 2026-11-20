@@ -882,4 +882,54 @@ mod tests {
         );
         Ok(())
     }
+
+    #[tokio::test]
+    async fn tracked_create_recovers_after_the_table_head_and_partial_view_directory() -> TestResult
+    {
+        let fixture = Fixture::new().await?;
+        let table_id = fixture.table.identifier();
+        let view_id = Identifier::new(fixture.view.identifier().namespace(), "TRACKED");
+        let before = fixture.table.metadata();
+        let prepared = fixture
+            .catalog
+            .prepare_tracked_create_under_scope(create::TrackingCreate {
+                table_id,
+                table_before: before,
+                table_altered_at_ms: fixture.clock(),
+                view_id: &view_id,
+                view: create_request(&fixture, "TRACKED")?,
+            })
+            .await?;
+        let expected_table = tracking_table_after(before, fixture.clock())?;
+        let expected_view = prepared.view.clone();
+        let root = prepared.root;
+        let next_table = root.native(&format!("{}/metadata/v1.metadata.json", before.location))?;
+        let partial_view = root.native(&expected_view.location)?;
+        Control::new(
+            &root,
+            TrackingState::Creating {
+                decision: Box::new(prepared.decision),
+            },
+        )
+        .write(&root)?;
+        witness(&root, true)?;
+        let saved = Control::read(&root)?.ok_or("tracking CREATE decision")?;
+        let TrackingState::Creating { decision } = saved.state else {
+            return Err("wrong tracking phase".into());
+        };
+        let expected_table_raw = decision.table_after_bytes()?;
+        root.install_head(&expected_table_raw, &next_table)?;
+        std::fs::create_dir(&partial_view)?;
+        std::fs::create_dir(partial_view.join("metadata"))?;
+        let reopened = Fixture::open(&fixture.root).await?;
+        assert_eq!(
+            Fixture::read(&reopened, table_id, &view_id).await?,
+            (expected_table, expected_view)
+        );
+        assert!(matches!(
+            Control::read(&root)?.map(|value| value.state),
+            Some(TrackingState::Idle {})
+        ));
+        Ok(())
+    }
 }
