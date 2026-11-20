@@ -884,6 +884,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tracked_create_on_an_already_tracked_base_keeps_its_exact_head() -> TestResult {
+        // Snowflake 10.42.103, second CREATE 01c88802-010a-0377-0004-d66e05f3a0da.
+        let fixture = Fixture::new().await?;
+        let table_id = fixture.table.identifier();
+        let ns = fixture.view.identifier().namespace();
+        let first = Identifier::new(ns, "TRACKED_FIRST");
+        let second = Identifier::new(ns, "TRACKED_SECOND");
+        let original_table = fixture.table.metadata().clone();
+        let clock = fixture.clock();
+        fixture
+            .catalog
+            .create_view_enabling_base_tracking(create::TrackingCreate {
+                table_id,
+                table_before: &original_table,
+                table_altered_at_ms: Some(clock),
+                view_id: &first,
+                view: create_request(&fixture, first.name())?,
+            })
+            .await?;
+        let (tracked_table, first_view) = Fixture::read(&fixture.catalog, table_id, &first).await?;
+        let previous = fixture.catalog.metadata_location(table_id).await?;
+        let root = fixture.catalog.pair_root()?;
+        let bytes = root.read(&root.native(&previous)?, MAX_METADATA)?;
+
+        let second_view = fixture
+            .catalog
+            .create_view_enabling_base_tracking(create::TrackingCreate {
+                table_id,
+                table_before: &tracked_table,
+                table_altered_at_ms: None,
+                view_id: &second,
+                view: create_request(&fixture, second.name())?,
+            })
+            .await?;
+
+        let reopened = Fixture::open(&fixture.root).await?;
+        assert_eq!(reopened.metadata_location(table_id).await?, previous);
+        assert_eq!(root.read(&root.native(&previous)?, MAX_METADATA)?, bytes);
+        assert_eq!(
+            Fixture::read(&reopened, table_id, &first).await?,
+            (tracked_table.clone(), first_view)
+        );
+        assert_eq!(
+            Fixture::read(&reopened, table_id, &second).await?,
+            (tracked_table, second_view.metadata().clone())
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn tracked_create_recovers_after_the_table_head_and_partial_view_directory() -> TestResult
     {
         let fixture = Fixture::new().await?;
