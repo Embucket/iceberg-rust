@@ -7,9 +7,9 @@ use iceberg_rust::spec::view_metadata::ViewMetadata;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    Arc, Cache, FENCED, FileCatalog, HEALTHY, IcebergError, Identifier, MAX_JOURNAL, MAX_METADATA,
-    NativeRoot, ObjectStoreBuilder, Ordering, PENDING, PathBuf, Tabular, Uuid, control_exists, hex,
-    io, parse_version, refusal, unhex,
+    control_exists, hex, io, parse_version, refusal, unhex, Arc, Cache, FileCatalog, IcebergError,
+    Identifier, NativeRoot, ObjectStoreBuilder, Ordering, PathBuf, Tabular, Uuid, FENCED, HEALTHY,
+    MAX_JOURNAL, MAX_METADATA, PENDING,
 };
 
 const TRACKING_KEY: &str = "embucket.sql.change-tracking.v1";
@@ -193,7 +193,7 @@ impl Head {
     }
 
     fn identifier(&self) -> Identifier {
-        Identifier::new(&[self.namespace.clone()], &self.name)
+        Identifier::new(std::slice::from_ref(&self.namespace), &self.name)
     }
 }
 
@@ -494,7 +494,7 @@ impl FileCatalog {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iceberg_rust::catalog::{Catalog, create::CreateTableBuilder, namespace::Namespace};
+    use iceberg_rust::catalog::{create::CreateTableBuilder, namespace::Namespace, Catalog};
     use iceberg_rust::spec::schema::Schema;
     use iceberg_rust::spec::types::{PrimitiveType, StructField, Type};
     use iceberg_rust::spec::view_metadata::{Version, ViewRepresentation};
@@ -609,8 +609,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tracking_publication_preserves_both_native_predecessors_except_expected_properties()
-    -> TestResult {
+    async fn tracking_publication_preserves_both_native_predecessors_except_expected_properties(
+    ) -> TestResult {
         let fixture = Fixture::new().await?;
         let base = fixture.table.metadata().clone();
         let view = fixture.view.metadata().clone();
@@ -628,20 +628,16 @@ mod tests {
         reader
             .validate_view_tracking_with_base(operation(Fixture::edit(BEFORE)?))
             .await?;
-        assert!(
-            reader
-                .validate_view_tracking_with_base(operation(Fixture::edit("stale")?))
-                .await
-                .is_err()
-        );
+        assert!(reader
+            .validate_view_tracking_with_base(operation(Fixture::edit("stale")?))
+            .await
+            .is_err());
         drop(reader);
-        assert!(
-            fixture
-                .catalog
-                .enable_view_tracking_with_base(operation(Fixture::edit("stale")?))
-                .await
-                .is_err()
-        );
+        assert!(fixture
+            .catalog
+            .enable_view_tracking_with_base(operation(Fixture::edit("stale")?))
+            .await
+            .is_err());
         assert_eq!(
             Fixture::read(&fixture.catalog, table_id, view_id).await?,
             (base.clone(), view.clone())
